@@ -22,13 +22,14 @@ import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePath
 from typing import cast
 from uuid import uuid4
 
 from conductor.exceptions import ConfigurationError
 from conductor.execution.docker_agent import InterruptOutcome, stream_agent
+from conductor.execution.docker_mcp import ContainerOwner, join_before
 from conductor.execution.docker_paths import map_agent_paths
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
@@ -38,6 +39,8 @@ from conductor.execution.types import (
     BundleRef,
     CommandResult,
     CommandSpec,
+    McpServerSpec,
+    McpStdioTarget,
     ResolvedExecutionSpec,
     RunnerCapabilities,
     RunOutcome,
@@ -87,6 +90,25 @@ class _LeaseState:
     attached: bool = False
     staged: bool = False
     expect_staged: bool = False
+    mcp: _McpLeaseState | None = None
+
+
+@dataclass(slots=True)
+class _McpLeaseState:
+    """Mutable release ownership retained even when preparation never returns."""
+
+    guard: ContainerOwner
+    preparation: asyncio.Task[None] | None = None
+    operations: list[asyncio.Task[tuple[int, str, str]]] = field(default_factory=list)
+    targets: list[ContainerOwner] = field(default_factory=list)
+    target_cleanups: list[asyncio.Task[None]] = field(default_factory=list)
+    probes: list[asyncio.Task[str | None]] = field(default_factory=list)
+    scratch: list[ContainerOwner] = field(default_factory=list)
+    release: asyncio.Task[None] | None = None
+    finalization: asyncio.Task[None] | None = None
+    deadline: float | None = None
+    sealed: bool = False
+    uncertain: bool = False
 
 
 @dataclass(frozen=True)
@@ -342,7 +364,157 @@ class DockerRunnerBackend:
             agent=True,
             interrupt=interrupt,
             retained_workspace=True,
+            mcp_stdio=True,
         )
+
+    def _check_mcp_admission(self, lease: WorkspaceLease) -> None:
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is None:
+            raise ExecutionSpecError("Docker lease was not prepared by this backend")
+        if state.mcp is not None:
+            if (
+                state.mcp.sealed
+                or state.mcp.uncertain
+                or state.mcp.guard.uncertain
+                or state.mcp.guard.released
+            ):
+                raise ExecutionSpecError("Docker MCP admission is sealed")
+            if state.run.check_mcp_admission is not None:
+                state.run.check_mcp_admission()
+
+    async def _workspace_docker(
+        self, lease: WorkspaceLease, argv: Sequence[str]
+    ) -> tuple[int, str, str]:
+        """Keep daemon mutations owned through cancellation and late completion."""
+        self._check_mcp_admission(lease)
+        mcp = self._lease_states[self._lease_key(lease)].mcp
+        if mcp is None:
+            return await self._run_docker(argv)
+        task = asyncio.create_task(self._run_docker(argv))
+        mcp.operations.append(task)
+        result = await asyncio.shield(task)
+        mutating = argv[0] in {"create", "start"} or tuple(argv[:2]) in {
+            ("volume", "create"),
+            ("volume", "rm"),
+            ("cp", "-a"),
+        }
+        if result[0] == _CLI_TIMEOUT_RC or (mutating and result[0] != 0):
+            mcp.uncertain = True
+        self._check_mcp_admission(lease)
+        return result
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        """Allocate an owned Docker run target without starting its transport."""
+        if lease is None or lease.backend != "docker":
+            raise ExecutionSpecError("Docker MCP requires a Docker workspace lease")
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is None or state.run.bundle is None or state.mcp is None:
+            raise ExecutionSpecError("Docker MCP requires a prepared fenced bundle lease")
+        if spec.execution is None or not spec.execution.image:
+            raise ExecutionSpecError("Docker MCP requires an execution specification")
+        if not spec.argv or not spec.argv[0] or any("\0" in arg for arg in spec.argv):
+            raise ExecutionSpecError("Docker MCP requires a valid server argv")
+        self._check_mcp_admission(lease)
+        cwd = _map_working_dir(spec.working_dir, state.run.bundle.root)
+        binary = self._resolved_binary()
+        if binary is None:
+            raise ExecutionSpecError("Docker MCP CLI is unavailable")
+        await state.mcp.guard.verify(created=True)
+        self._check_mcp_admission(lease)
+        await self._ensure_staged(lease, spec.execution, None)
+        self._check_mcp_admission(lease)
+        await self._ensure_image(spec.execution, None)
+        self._check_mcp_admission(lease)
+        mcp = state.mcp
+        name = f"conductor-mcp-{lease.lease_id[:8]}-{uuid4().hex}"
+        labels = self._labels(lease, "mcp")
+        owner = ContainerOwner(self._run_docker, name, labels)
+        close_task: asyncio.Task[None] | None = None
+        close_deadline: float | None = None
+        env = self._create_environment(spec, self._cli_env)
+        stack = contextlib.ExitStack()
+        try:
+            env_file = stack.enter_context(self._container_env_file(env, strict=True))
+            args = (
+                "run",
+                "--rm",
+                "-i",
+                "--name",
+                name,
+                *self._label_args(labels),
+                *_container_options(spec.execution),
+                "--env-file",
+                env_file,
+                "-v",
+                f"{self._volume_name(lease)}:/workspace",
+                "-w",
+                cwd,
+                "--entrypoint",
+                spec.argv[0],
+                spec.execution.image,
+                *spec.argv[1:],
+            )
+
+            def mark_launch_attempted() -> None:
+                self._check_mcp_admission(lease)
+                if owner.attempted or close_task is not None:
+                    raise ExecutionSpecError("Docker MCP launch attempt is already consumed")
+                owner.attempted = True
+
+            async def validate_started() -> None:
+                self._check_mcp_admission(lease)
+                if not owner.attempted or close_task is not None:
+                    raise ExecutionSpecError("Docker MCP launch is not active")
+                await owner.verify()
+                self._check_mcp_admission(lease)
+                await self._verify_created_volume(lease)
+                self._check_mcp_admission(lease)
+
+            async def aclose() -> None:
+                nonlocal close_task, close_deadline
+                if close_task is None:
+                    close_deadline = asyncio.get_running_loop().time() + 30.0
+                    if mcp.deadline is not None:
+                        close_deadline = min(close_deadline, mcp.deadline)
+                    close_task = asyncio.create_task(owner.remove())
+                    mcp.target_cleanups.append(close_task)
+                assert close_deadline is not None
+                try:
+                    cancelled = await join_before(close_task, close_deadline)
+                    close_task.result()
+                    if owner.uncertain:
+                        raise ExecutionSpecError("Docker MCP cleanup remains unconfirmed")
+                except (ExecutionSpecError, OSError, asyncio.CancelledError):
+                    owner.uncertain = mcp.uncertain = True
+                    raise ExecutionSpecError("Docker MCP cleanup unconfirmed") from None
+                finally:
+                    # Even a pending daemon request must not retain payload on the host.
+                    try:
+                        stack.close()
+                    except OSError:
+                        owner.uncertain = mcp.uncertain = True
+                        raise ExecutionSpecError(
+                            "Docker MCP env-file cleanup unconfirmed"
+                        ) from None
+                if cancelled:
+                    raise asyncio.CancelledError
+
+            target = McpStdioTarget(
+                binary,
+                args,
+                dict(self._cli_env),
+                name,
+                aclose,
+                mark_launch_attempted,
+                validate_started,
+            )
+        except (ExecutionSpecError, OSError, ValueError):
+            stack.close()
+            raise
+        mcp.targets.append(owner)
+        return target
 
     async def run_agent(
         self,
@@ -419,6 +591,7 @@ class DockerRunnerBackend:
     ) -> _RunnerState:
         await self._ensure_staged(lease, execution, None)
         await self._ensure_image(execution, None)
+        self._check_mcp_admission(lease)
         name = f"conductor-{lease.lease_id[:8]}-runner-{uuid4().hex[:8]}"
         argv = [
             "create",
@@ -446,11 +619,11 @@ class DockerRunnerBackend:
         )
         created = False
         try:
-            rc, _stdout, stderr = await self._run_docker(argv)
+            rc, _stdout, stderr = await self._workspace_docker(lease, argv)
             if rc != 0:
                 raise ConfigurationError(f"Docker runner create failed: {_bounded(stderr)}")
             created = True
-            rc, _stdout, stderr = await self._run_docker(("start", name))
+            rc, _stdout, stderr = await self._workspace_docker(lease, ("start", name))
             if rc != 0:
                 raise ConfigurationError(f"Docker runner start failed: {_bounded(stderr)}")
             health = await self._bridge_health(name, execution.image)
@@ -576,6 +749,7 @@ class DockerRunnerBackend:
         ):
             logger.warning("Docker runner does not advertise interrupt; stopping the stream only")
             self._warned_missing_interrupt.add(runner.name)
+        self._check_mcp_admission(lease)
         if on_dispatch is not None:
             on_dispatch()
         return await stream_agent(
@@ -596,7 +770,11 @@ class DockerRunnerBackend:
             backend="docker",
             incarnation=uuid4().hex[:12],
         )
-        self._lease_states[self._lease_key(lease)] = _LeaseState(run=run)
+        state = _LeaseState(run=run)
+        self._lease_states[self._lease_key(lease)] = state
+        if run.mcp_fence_execution is not None:
+            await self._prepare_fenced(lease, state)
+            return lease
         if run.workspace_persistence is not None:
             try:
                 await self._ensure_volume(lease, self._lease_states[self._lease_key(lease)])
@@ -604,6 +782,139 @@ class DockerRunnerBackend:
                 self._lease_states.pop(self._lease_key(lease), None)
                 raise
         return lease
+
+    async def _prepare_fenced(self, lease: WorkspaceLease, state: _LeaseState) -> None:
+        """Register provisional ownership synchronously before the first acquisition await."""
+        execution = state.run.mcp_fence_execution
+        assert execution is not None
+        name = (
+            "conductor-mcp-fence-"
+            + hashlib.sha256(self._volume_name(lease).encode()).hexdigest()[:24]
+        )
+        labels = self._labels(lease, "mcp-fence") | {"io.conductor.owner": uuid4().hex}
+        mcp = _McpLeaseState(ContainerOwner(self._run_docker, name, labels))
+        state.mcp = mcp
+
+        async def abort_release(deadline: float) -> None:
+            await self._release_mcp(lease, deadline, abort=True)
+
+        if state.run.on_prepare_attempt is not None:
+            state.run.on_prepare_attempt(lease, abort_release)
+
+        async def prepare() -> None:
+            self._check_mcp_admission(lease)
+            await self._ensure_image(execution, None)
+            self._check_mcp_admission(lease)
+            mcp.guard.attempted = True
+            rc, stdout, _stderr = await self._run_docker(
+                (
+                    "create",
+                    "--name",
+                    name,
+                    *self._label_args(labels),
+                    "--entrypoint",
+                    "/conductor-fence-never-started",
+                    execution.image,
+                )
+            )
+            try:
+                self._check_mcp_admission(lease)
+            finally:
+                # Preserve failed allocation uncertainty even when admission has closed.
+                if rc != 0:
+                    mcp.uncertain = True
+            if rc != 0:
+                raise WorkspaceAttachError("Docker MCP fence acquisition refused or unconfirmed")
+            try:
+                metadata = await mcp.guard.verify(created=True)
+            except ExecutionSpecError:
+                raise WorkspaceAttachError("Docker MCP fence ownership unconfirmed") from None
+            if stdout.strip() != metadata.identifier:
+                mcp.uncertain = True
+                raise WorkspaceAttachError("Docker MCP fence allocation ID unconfirmed")
+            self._check_mcp_admission(lease)
+            await self._ensure_volume(lease, state)
+            self._check_mcp_admission(lease)
+            if state.attached:
+                await self._refuse_orphaned_executions(lease)
+                self._check_mcp_admission(lease)
+
+        mcp.preparation = asyncio.create_task(prepare())
+        await asyncio.shield(mcp.preparation)
+        self._check_mcp_admission(lease)
+
+    def seal_mcp_cleanup(
+        self, lease: WorkspaceLease, deadline: float, *, uncertain: bool = False
+    ) -> None:
+        """Adopt the root budget before SDK joins or finalization can suspend."""
+        state = self._lease_states[self._lease_key(lease)]
+        mcp = state.mcp
+        if mcp is not None:
+            mcp.sealed = True
+            mcp.deadline = deadline if mcp.deadline is None else min(deadline, mcp.deadline)
+            mcp.uncertain = mcp.uncertain or uncertain
+
+    async def _release_mcp(
+        self, lease: WorkspaceLease, deadline: float, *, abort: bool = False
+    ) -> None:
+        state = self._lease_states[self._lease_key(lease)]
+        mcp = state.mcp
+        assert mcp is not None
+        mcp.sealed = True
+        mcp.deadline = deadline if mcp.deadline is None else min(deadline, mcp.deadline)
+
+        async def release() -> None:
+            assert mcp.deadline is not None
+            tasks = [
+                task
+                for task in (mcp.preparation, self._staged.get(self._lease_key(lease)))
+                if task is not None
+            ]
+            for task in tasks:
+                await join_before(task, mcp.deadline)
+                if task.cancelled():
+                    mcp.uncertain = True
+                else:
+                    task.exception()
+            for operation in mcp.operations:
+                await join_before(operation, mcp.deadline)
+                if (
+                    operation.cancelled()
+                    or operation.exception() is not None
+                    or operation.result()[0] == _CLI_TIMEOUT_RC
+                ):
+                    mcp.uncertain = True
+            for cleanup in mcp.target_cleanups:
+                await join_before(cleanup, mcp.deadline)
+                if cleanup.cancelled() or cleanup.exception() is not None:
+                    mcp.uncertain = True
+            for probe in mcp.probes:
+                await join_before(probe, mcp.deadline)
+                if probe.cancelled():
+                    mcp.uncertain = True
+                else:
+                    probe.exception()
+            if (
+                mcp.uncertain
+                or any(t.uncertain or not t.released for t in mcp.targets)
+                or any(t.uncertain or (t.attempted and not t.released) for t in mcp.scratch)
+            ):
+                raise ExecutionSpecError("Docker MCP owners remain unconfirmed")
+            if abort:
+                await mcp.guard.remove(deadline=mcp.deadline)
+
+        if mcp.release is None:
+            mcp.release = asyncio.create_task(release())
+        try:
+            cancelled = await join_before(mcp.release, mcp.deadline)
+            mcp.release.result()
+        except (ExecutionSpecError, OSError, asyncio.CancelledError):
+            mcp.uncertain = True
+            mcp.guard.uncertain = True
+            self._warn_cleanup(lease, "MCP release unconfirmed")
+            raise ExecutionSpecError("Docker MCP release unconfirmed") from None
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _lease_key(lease: WorkspaceLease) -> tuple[str, str]:
@@ -632,7 +943,7 @@ class DockerRunnerBackend:
 
     def _volume_labels(self, lease: WorkspaceLease, state: _LeaseState) -> dict[str, str]:
         labels = self._labels(lease, "workspace")
-        if state.attached:
+        if state.attached and state.mcp is None:
             del labels["io.conductor.workspace"]
             return labels
         if state.run.workspace_persistence is not None:
@@ -641,9 +952,11 @@ class DockerRunnerBackend:
 
     async def _ensure_volume(self, lease: WorkspaceLease, state: _LeaseState) -> bool:
         """Return whether our volume already existed; attached leases never mutate it."""
+        self._check_mcp_admission(lease)
         volume = self._volume_name(lease)
         try:
             existing = await self._inspect_labels("volume", volume)
+            self._check_mcp_admission(lease)
         except (OSError, _DockerFailure) as exc:
             if state.attached:
                 raise WorkspaceAttachError(
@@ -653,15 +966,20 @@ class DockerRunnerBackend:
         expected = self._volume_labels(lease, state)
         if existing is not None and all(existing.get(k) == v for k, v in expected.items()):
             return True
-        if state.attached or (existing is not None and state.run.workspace_persistence is not None):
+        if state.attached or (
+            existing is not None
+            and (state.run.workspace_persistence is not None or state.mcp is not None)
+        ):
             reason = "missing" if existing is None else "label mismatch"
             raise WorkspaceAttachError(f"Docker workspace {volume} {reason}")
         if existing is not None:
-            rc, _stdout, stderr = await self._run_docker(("volume", "rm", "-f", volume))
+            rc, _stdout, stderr = await self._workspace_docker(
+                lease, ("volume", "rm", "-f", volume)
+            )
             if rc != 0:
                 raise _DockerFailure(f"could not replace stale Docker volume: {_bounded(stderr)}")
         create = ["volume", "create", *self._label_args(expected), volume]
-        rc, _stdout, stderr = await self._run_docker(create)
+        rc, _stdout, stderr = await self._workspace_docker(lease, create)
         if rc != 0:
             raise _DockerFailure(f"docker volume create failed: {_bounded(stderr)}")
         return False
@@ -745,6 +1063,7 @@ class DockerRunnerBackend:
         execution: ResolvedExecutionSpec,
         diagnostics: Callable[[str], None] | None,
     ) -> None:
+        self._check_mcp_admission(lease)
         key = self._lease_key(lease)
         if key in self._closed_leases:
             raise ExecutionSpecError("backend is finalizing")
@@ -753,6 +1072,7 @@ class DockerRunnerBackend:
             await self._verify_created_volume(lease)
             if state.run.bundle is not None:
                 await self._ensure_image(execution, diagnostics)
+                self._check_mcp_admission(lease)
                 marker = await self._probe_marker(lease, execution)
                 if marker != state.run.bundle.digest:
                     reason = "missing" if marker is None else "digest mismatch"
@@ -761,6 +1081,7 @@ class DockerRunnerBackend:
         bundle = state.run.bundle
         if state.attached and bundle is not None:
             await self._ensure_image(execution, diagnostics)
+            self._check_mcp_admission(lease)
             marker = await self._probe_marker(lease, execution)
             if marker is not None and marker != bundle.digest:
                 raise WorkspaceAttachError("Docker workspace marker digest mismatch")
@@ -782,6 +1103,7 @@ class DockerRunnerBackend:
             self._staged[key] = task
         try:
             await asyncio.shield(task)
+            self._check_mcp_admission(lease)
         finally:
             if (
                 task.done()
@@ -839,20 +1161,44 @@ class DockerRunnerBackend:
     async def _probe_marker(
         self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
     ) -> str | None:
+        """Keep marker-probe scratch ownership reachable through root teardown."""
+        self._check_mcp_admission(lease)
+        mcp = self._lease_states[self._lease_key(lease)].mcp
+        if mcp is None:
+            return await self._probe_marker_owned(lease, execution)
+        task = asyncio.create_task(self._probe_marker_owned(lease, execution))
+        mcp.probes.append(task)
+        result = await asyncio.shield(task)
+        self._check_mcp_admission(lease)
+        return result
+
+    async def _probe_marker_owned(
+        self, lease: WorkspaceLease, execution: ResolvedExecutionSpec
+    ) -> str | None:
         """Read the committed marker via a stopped scratch container, not labels."""
+        self._check_mcp_admission(lease)
         scratch = f"conductor-stage-{lease.lease_id[:8]}-{uuid4().hex[:6]}"
+        mcp = self._lease_states[self._lease_key(lease)].mcp
+        owner = ContainerOwner(self._run_docker, scratch, self._labels(lease, "scratch"))
+        if mcp is not None:
+            mcp.scratch.append(owner)
         destination = Path(tempfile.mkdtemp(prefix="conductor-probe-"))
         created = False
         try:
-            rc, _stdout, stderr = await self._run_docker(
-                self._scratch_argv(lease, execution, scratch)
+            owner.attempted = True
+            rc, _stdout, stderr = await self._workspace_docker(
+                lease, self._scratch_argv(lease, execution, scratch)
             )
             if rc != 0:
                 raise WorkspaceAttachError(f"Docker marker probe create failed: {_bounded(stderr)}")
             created = True
+            if mcp is not None:
+                await owner.verify(created=True)
+                self._check_mcp_admission(lease)
             await self._verify_created_volume(lease)
-            rc, _stdout, stderr = await self._run_docker(
-                ("cp", f"{scratch}:/workspace/.conductor-staged", str(destination / "marker"))
+            rc, _stdout, stderr = await self._workspace_docker(
+                lease,
+                ("cp", f"{scratch}:/workspace/.conductor-staged", str(destination / "marker")),
             )
             if rc != 0:
                 error = stderr.strip().lower()
@@ -869,9 +1215,17 @@ class DockerRunnerBackend:
         except OSError as exc:
             raise WorkspaceAttachError(f"Docker marker probe failed: {exc}") from exc
         finally:
-            if created:
-                await self._run_docker(("rm", "-f", scratch))
-            _remove_tree_with_retry(destination)
+            try:
+                if mcp is not None and owner.attempted:
+                    try:
+                        await owner.remove()
+                    except ExecutionSpecError:
+                        mcp.uncertain = True
+                        raise
+                elif created:
+                    await self._run_docker(("rm", "-f", scratch))
+            finally:
+                _remove_tree_with_retry(destination)
 
     async def _verify_attached_volume(self, lease: WorkspaceLease) -> None:
         state = self._lease_states[self._lease_key(lease)]
@@ -881,10 +1235,12 @@ class DockerRunnerBackend:
     async def _verify_created_volume(self, lease: WorkspaceLease) -> None:
         # Docker can silently auto-create an unlabeled volume between inspection
         # and container creation. This detects that race; it cannot prevent it.
+        self._check_mcp_admission(lease)
         volume = self._volume_name(lease)
         state = self._lease_states[self._lease_key(lease)]
         try:
             labels = await self._inspect_labels("volume", volume)
+            self._check_mcp_admission(lease)
         except (OSError, _DockerFailure) as exc:
             raise WorkspaceAttachError(
                 f"could not verify Docker workspace {volume}: {exc}"
@@ -900,6 +1256,7 @@ class DockerRunnerBackend:
         execution: ResolvedExecutionSpec,
         diagnostics: Callable[[str], None] | None,
     ) -> None:
+        self._check_mcp_admission(lease)
         key = self._lease_key(lease)
         if key in self._closed_leases:
             raise ExecutionSpecError("backend is finalizing")
@@ -907,12 +1264,14 @@ class DockerRunnerBackend:
         if state is None:
             raise ExecutionSpecError("Docker lease was not prepared by this backend")
         existing = await self._ensure_volume(lease, state)
+        self._check_mcp_admission(lease)
         bundle = state.run.bundle
         if bundle is None:
             state.staged = True
             return
         if not state.attached:
             await self._ensure_image(execution, diagnostics)
+            self._check_mcp_admission(lease)
         if existing and not state.attached:
             marker = await self._probe_marker(lease, execution)
             if marker is not None and marker != bundle.digest:
@@ -921,27 +1280,34 @@ class DockerRunnerBackend:
                 state.staged = True
                 return
         scratch = f"conductor-stage-{lease.lease_id[:8]}-{uuid4().hex[:6]}"
+        owner = ContainerOwner(self._run_docker, scratch, self._labels(lease, "scratch"))
+        if state.mcp is not None:
+            state.mcp.scratch.append(owner)
         create_scratch = self._scratch_argv(lease, execution, scratch)
         staging = Path(tempfile.mkdtemp(prefix=f"conductor-stage-{lease.lease_id[:8]}-"))
         try:
             self._build_staging_tree(bundle, staging)
-            rc, _stdout, stderr = await self._run_docker(create_scratch)
+            owner.attempted = True
+            rc, _stdout, stderr = await self._workspace_docker(lease, create_scratch)
             if rc != 0:
                 raise _DockerFailure(
                     self._version_hint(stderr)
                     or f"docker staging create failed: {_bounded(stderr)}"
                 )
+            if state.mcp is not None:
+                await owner.verify(created=True)
+                self._check_mcp_admission(lease)
             await self._verify_created_volume(lease)
             source = PurePath(staging).as_posix().rstrip("/") + "/."
-            rc, _stdout, stderr = await self._run_docker(
-                ("cp", "-a", source, f"{scratch}:/workspace")
+            rc, _stdout, stderr = await self._workspace_docker(
+                lease, ("cp", "-a", source, f"{scratch}:/workspace")
             )
             if rc != 0:
                 raise _DockerFailure(f"docker cp staging failed: {_bounded(stderr)}")
             marker = staging / ".conductor-staged"
             marker.write_text(bundle.digest, encoding="utf-8")
-            rc, _stdout, stderr = await self._run_docker(
-                ("cp", "-a", str(marker), f"{scratch}:/workspace/.conductor-staged")
+            rc, _stdout, stderr = await self._workspace_docker(
+                lease, ("cp", "-a", str(marker), f"{scratch}:/workspace/.conductor-staged")
             )
             if rc != 0:
                 raise _DockerFailure(f"docker cp marker failed: {_bounded(stderr)}")
@@ -950,8 +1316,15 @@ class DockerRunnerBackend:
 
             async def cleanup_staging() -> None:
                 try:
-                    with contextlib.suppress(Exception):
-                        await self._run_docker(("rm", "-f", scratch))
+                    if state.mcp is not None and owner.attempted:
+                        try:
+                            await owner.remove()
+                        except ExecutionSpecError:
+                            state.mcp.uncertain = True
+                            raise
+                    else:
+                        with contextlib.suppress(Exception):
+                            await self._run_docker(("rm", "-f", scratch))
                 finally:
                     try:
                         _remove_tree_with_retry(staging)
@@ -986,7 +1359,9 @@ class DockerRunnerBackend:
         return attempt
 
     @staticmethod
-    def _create_environment(spec: CommandSpec, snapshot: Mapping[str, str]) -> dict[str, str]:
+    def _create_environment(
+        spec: CommandSpec | McpServerSpec, snapshot: Mapping[str, str]
+    ) -> dict[str, str]:
         # On Windows the host env is case-insensitive while the container's
         # Linux env is case-sensitive; a spec.env key differing from a host
         # variable only by case replaces it here (see the Windows environment
@@ -1000,7 +1375,7 @@ class DockerRunnerBackend:
 
     @staticmethod
     @contextlib.contextmanager
-    def _container_env_file(env: Mapping[str, str]) -> Iterator[str]:
+    def _container_env_file(env: Mapping[str, str], *, strict: bool = False) -> Iterator[str]:
         for name, value in env.items():
             if not name or name.startswith("#") or _ENV_NAME_FORBIDDEN.search(name) is not None:
                 raise ExecutionSpecError(f"invalid container environment variable name: {name}")
@@ -1020,6 +1395,8 @@ class DockerRunnerBackend:
                 try:
                     _unlink_with_retry(Path(path))
                 except OSError as exc:
+                    if strict:
+                        raise
                     logger.warning("Could not remove Docker container env file %s: %s", path, exc)
 
     def _create_argv(
@@ -1091,12 +1468,13 @@ class DockerRunnerBackend:
                 await self._verify_attached_volume(lease)
                 await self._ensure_staged(lease, execution, diagnostics)
                 await self._ensure_image(execution, diagnostics)
+                self._check_mcp_admission(lease)
                 create_env = self._create_environment(spec, self._cli_env)
                 with self._container_env_file(create_env) as env_file:
                     create_argv = self._create_argv(spec, lease, execution, name, attempt, env_file)
                     if on_dispatch is not None:
                         on_dispatch()
-                    rc, _stdout, stderr = await self._run_docker(create_argv)
+                    rc, _stdout, stderr = await self._workspace_docker(lease, create_argv)
                 if rc != 0:
                     return self._start_failed(
                         name, self._version_hint(stderr) or _bounded(stderr), started_at
@@ -1109,6 +1487,7 @@ class DockerRunnerBackend:
                 if spec.stdin is not None:
                     start_argv.append("--interactive")
                 start_argv.append(name)
+                self._check_mcp_admission(lease)
                 start_rc, stdout, stderr = await self._run_docker(
                     start_argv,
                     stdin_bytes=spec.stdin,
@@ -1233,7 +1612,7 @@ class DockerRunnerBackend:
     async def attach_run(
         self, run: RunSpec, identity: WorkspaceIdentity, *, expect_staged: bool = False
     ) -> WorkspaceLease:
-        """Verify the existing volume without creating, staging, or removing resources."""
+        """Verify the existing volume; fenced attachment also creates a stopped guard."""
         if identity.backend != "docker" or identity.lease_id != run.run_id:
             raise WorkspaceAttachError("Docker workspace identity does not match the run")
         lease = WorkspaceLease(
@@ -1243,6 +1622,17 @@ class DockerRunnerBackend:
             location=identity.location,
         )
         state = _LeaseState(run=run, attached=True, expect_staged=expect_staged)
+        if run.mcp_fence_execution is not None:
+            self._lease_states[self._lease_key(lease)] = state
+            try:
+                await self._prepare_fenced(lease, state)
+            except (WorkspaceAttachError, _DockerFailure, OSError):
+                raise WorkspaceAttachError(
+                    "Docker MCP fenced workspace ownership verification refused"
+                ) from None
+            return lease
+        # Non-fenced attach keeps its existing verification-only behavior.
+        self._lease_states[self._lease_key(lease)] = state
         await self._ensure_volume(lease, state)
         await self._refuse_orphaned_executions(lease)
         self._lease_states[self._lease_key(lease)] = state
@@ -1310,11 +1700,58 @@ class DockerRunnerBackend:
             raise WorkspaceAttachError(
                 f"could not verify Docker execution containers: {exc}"
             ) from exc
+        await self._refuse_orphaned_mcp(lease)
+
+    async def _refuse_orphaned_mcp(self, lease: WorkspaceLease) -> None:
+        """A surviving or unverifiable MCP target forbids workspace attachment."""
+        try:
+            rc, stdout, _stderr = await self._run_docker(
+                (
+                    "ps",
+                    "-aq",
+                    "--no-trunc",
+                    "--filter",
+                    "label=io.conductor.managed=true",
+                    "--filter",
+                    f"label=io.conductor.run_id={lease.lease_id}",
+                    "--filter",
+                    "label=io.conductor.resource=mcp",
+                )
+            )
+            if rc != 0:
+                raise WorkspaceAttachError("Docker MCP orphan inventory unconfirmed")
+            for candidate in stdout.split():
+                owner = ContainerOwner(self._run_docker, "", self._labels(lease, "mcp"))
+                metadata = await owner.inspect(candidate)
+                if metadata is None:
+                    continue
+                if not self._mcp_name_matches(lease, metadata.name) or any(
+                    metadata.labels.get(k) != v for k, v in owner.labels.items()
+                ):
+                    raise WorkspaceAttachError("Docker MCP orphan ownership unconfirmed")
+                raise WorkspaceAttachError("Docker workspace has surviving MCP containers")
+        except WorkspaceAttachError:
+            raise
+        except (ExecutionSpecError, OSError):
+            raise WorkspaceAttachError("Docker MCP orphan verification unconfirmed") from None
+
+    @staticmethod
+    def _mcp_name_matches(lease: WorkspaceLease, name: str) -> bool:
+        return (
+            re.fullmatch(
+                r"/conductor-mcp-" + re.escape(lease.lease_id[:8]) + r"-[0-9a-f]{32}", name
+            )
+            is not None
+        )
 
     async def finalize_run(
         self, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool = False
     ) -> None:
         """Clean up containers and remove the workspace only when not retained."""
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is not None and state.mcp is not None:
+            await self._finalize_mcp_lease(lease, retain=retain)
+            return
         del outcome
         key = self._lease_key(lease)
         self._closed_leases.add(key)
@@ -1350,6 +1787,80 @@ class DockerRunnerBackend:
         if cancelled:
             raise asyncio.CancelledError
 
+    async def _finalize_mcp_lease(self, lease: WorkspaceLease, *, retain: bool) -> None:
+        """Release a fenced workspace only after every retained owner has terminal proof."""
+        key = self._lease_key(lease)
+        mcp = self._lease_states[key].mcp
+        assert mcp is not None
+        if mcp.guard.released:
+            return
+        deadline = mcp.deadline or (asyncio.get_running_loop().time() + 30.0)
+        self._closed_leases.add(key)
+        try:
+            await self._release_mcp(lease, deadline)
+        except ExecutionSpecError:
+            self._warn_cleanup(lease, "MCP owners remain unconfirmed")
+            raise
+
+        async def finalize() -> None:
+            for runner_key, tasks in tuple(self._runners.items()):
+                if runner_key[0] == key:
+                    for runner in tuple(tasks):
+                        cleanup = self._retire_runner(lease, runner_key, runner)
+                        await join_before(cleanup, deadline)
+                        cleanup.result()
+            for cleanup in self._runner_cleanup.get(key, set()):
+                await join_before(cleanup, deadline)
+                cleanup.result()
+            rc, stdout, _stderr = await self._run_docker(
+                (
+                    "ps",
+                    "-aq",
+                    "--no-trunc",
+                    "--filter",
+                    f"label=io.conductor.run_id={lease.lease_id}",
+                )
+            )
+            guard_id = mcp.guard.identifier
+            if rc != 0:
+                raise ExecutionSpecError("Docker MCP resource inventory unconfirmed")
+            for candidate in stdout.split():
+                if candidate != guard_id and not await self._finalize_container(lease, candidate):
+                    raise ExecutionSpecError("Docker MCP resource cleanup unconfirmed")
+            if mcp.uncertain or asyncio.get_running_loop().time() >= deadline:
+                raise ExecutionSpecError("Docker MCP finalization admission expired")
+            if not retain:
+                labels = await self._inspect_labels("volume", self._volume_name(lease))
+                expected = self._labels(lease, "workspace")
+                if mcp.uncertain or asyncio.get_running_loop().time() >= deadline:
+                    raise ExecutionSpecError("Docker MCP finalization admission expired")
+                if labels is not None:
+                    if not all(labels.get(k) == v for k, v in expected.items()):
+                        raise ExecutionSpecError("Docker MCP volume ownership unconfirmed")
+                    rc, _stdout, _stderr = await self._run_docker(
+                        ("volume", "rm", "-f", self._volume_name(lease))
+                    )
+                    if rc != 0:
+                        raise ExecutionSpecError("Docker MCP volume removal unconfirmed")
+            if mcp.uncertain:
+                raise ExecutionSpecError("Docker MCP finalization remains unconfirmed")
+            await mcp.guard.remove(deadline=deadline)
+
+        if mcp.finalization is None:
+            mcp.finalization = asyncio.create_task(finalize())
+        task = mcp.finalization
+        # Keep terminal finalization reachable if the observation deadline expires.
+        try:
+            cancelled = await join_before(task, deadline)
+            task.result()
+        except (ExecutionSpecError, _DockerFailure, OSError, asyncio.CancelledError):
+            mcp.uncertain = True
+            mcp.guard.uncertain = True
+            self._warn_cleanup(lease, "MCP finalization unconfirmed")
+            raise ExecutionSpecError("Docker MCP finalization unconfirmed") from None
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def _finalize_resources(self, lease: WorkspaceLease, *, retain: bool = False) -> None:
         try:
             rc, stdout, stderr = await self._run_docker(
@@ -1372,7 +1883,7 @@ class DockerRunnerBackend:
         except Exception as exc:
             self._warn_cleanup(lease, str(exc))
 
-    async def _finalize_container(self, lease: WorkspaceLease, candidate: str) -> None:
+    async def _finalize_container(self, lease: WorkspaceLease, candidate: str) -> bool:
         rc, stdout, stderr = await self._run_docker(
             ("inspect", "--format", "{{json .}}", candidate)
         )
@@ -1381,25 +1892,58 @@ class DockerRunnerBackend:
                 self._warn_cleanup(
                     lease, f"could not inspect container {candidate}: {_bounded(stderr)}"
                 )
-            return
+            return (
+                rc != _CLI_TIMEOUT_RC
+                and re.fullmatch(
+                    r"(?:[Ee]rror response from daemon: |[Ee]rror: )?[Nn]o such "
+                    r"(?:container|object): " + re.escape(candidate),
+                    stderr.strip(),
+                )
+                is not None
+            )
         try:
             data = json.loads(stdout)
             labels = (
                 data[0]["Config"]["Labels"] if isinstance(data, list) else data["Config"]["Labels"]
             )
             name = data[0]["Name"] if isinstance(data, list) else data["Name"]
-        except (KeyError, TypeError, json.JSONDecodeError):
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError):
             self._warn_cleanup(lease, f"container {candidate} returned unverifiable metadata")
-            return
+            return False
+        if not isinstance(labels, dict):
+            self._warn_cleanup(lease, "container returned unverifiable labels")
+            return False
+        resource = labels.get("io.conductor.resource")
+        if resource == "mcp-fence":
+            # Only the original lease owner may release its guard, after the root barrier.
+            return False
+        if resource == "mcp":
+            try:
+                if not isinstance(name, str) or not self._mcp_name_matches(lease, name):
+                    raise ExecutionSpecError("Docker MCP orphan name unconfirmed")
+                owner = ContainerOwner(
+                    self._run_docker, name.removeprefix("/"), self._labels(lease, "mcp")
+                )
+                metadata = await owner.inspect(candidate)
+                if metadata is None:
+                    return True
+                owner._accept(metadata)
+                await owner.remove()
+            except (ExecutionSpecError, OSError):
+                self._warn_cleanup(lease, "MCP orphan cleanup unconfirmed")
+                return False
+            return True
         expected = self._labels(lease, cast(str, labels.get("io.conductor.resource")))
         valid_resource = labels.get("io.conductor.resource") in {"exec", "scratch", "runner"}
         valid_labels = valid_resource and all(labels.get(k) == v for k, v in expected.items())
         if not valid_labels or not isinstance(name, str) or _CONTAINER_NAME.match(name) is None:
             self._warn_cleanup(lease, f"container {candidate} failed label/name verification")
-            return
+            return False
         rc, _stdout, stderr = await self._run_docker(("rm", "-f", candidate))
         if rc != 0 and "no such container" not in stderr.lower():
             self._warn_cleanup(lease, f"could not remove container {candidate}: {_bounded(stderr)}")
+            return False
+        return True
 
     async def _finalize_volume(self, lease: WorkspaceLease) -> None:
         volume = self._volume_name(lease)
@@ -1418,8 +1962,18 @@ class DockerRunnerBackend:
         if rc != 0 and "no such volume" not in stderr.lower():
             self._warn_cleanup(lease, f"could not remove volume {volume}: {_bounded(stderr)}")
 
-    @staticmethod
-    def _warn_cleanup(lease: WorkspaceLease, reason: str) -> None:
+    def _warn_cleanup(self, lease: WorkspaceLease, reason: str) -> None:
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is not None and state.mcp is not None:
+            logger.warning(
+                "Docker MCP cleanup unconfirmed for run_id=%s; workspace and fence disposition "
+                "is unconfirmed and requires independent verification. "
+                "Before manual recovery, stop original controllers and independently confirm "
+                "terminal staging and SDK owners, plus native owners; then independently verify "
+                "exact labels and immutable IDs. Recover only verified owned resources.",
+                lease.lease_id,
+            )
+            return
         logger.warning(
             "Docker cleanup failed for run_id=%s: %s. Manual cleanup: "
             "docker ps -aq --filter label=io.conductor.run_id=%s | xargs docker rm -f; "

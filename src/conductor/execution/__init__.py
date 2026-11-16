@@ -7,9 +7,12 @@ own modules) and nothing from the rest of Conductor, so any layer may depend
 on it.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from conductor.execution.backend import RunnerBackend
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
-from conductor.execution.local import LocalRunnerBackend
 from conductor.execution.types import (
     AgentEventSink,
     AgentResult,
@@ -49,3 +52,21 @@ __all__ = [
     "WorkspaceIdentity",
     "WorkspaceAttachError",
 ]
+
+if TYPE_CHECKING:
+    from conductor.execution.local import LocalRunnerBackend
+
+
+def __getattr__(name: str) -> type[LocalRunnerBackend]:
+    """Initialize the workspace backend only when its public export is requested."""
+    if name != "LocalRunnerBackend":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from conductor.execution.local import LocalRunnerBackend
+
+    globals()[name] = LocalRunnerBackend
+    return LocalRunnerBackend
+
+
+def __dir__() -> list[str]:
+    """Keep public exports discoverable without initializing them."""
+    return sorted(globals().keys() | set(__all__))

@@ -44,6 +44,7 @@ from conductor.engine.execution_resolution import ExecutionResolver, ExecutionRe
 from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.local_workspace import LocalWorkspacePathMapper
+from conductor.engine.mcp_entry import McpStepEntry
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.realm_credentials import resolve_realm_credentials
 from conductor.engine.router import Router, RouteResult
@@ -84,7 +85,7 @@ from conductor.execution import (
     WorkspaceLease,
 )
 from conductor.execution.local import LocalRunnerBackend
-from conductor.execution.types import LocalWorkspaceBinding, ManagedWorkspaceContext
+from conductor.execution.types import LocalWorkspaceBinding, ManagedWorkspaceContext, McpServerSpec
 from conductor.executor import questions as questions_mod
 from conductor.executor.agent import AgentExecutor
 from conductor.executor.linkify import linkify_markdown
@@ -125,7 +126,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_McpStepPoolKey = tuple[str, str] | tuple[str, str, str, str]
+_McpStepPoolKey = tuple[str, ...]
 
 
 def _release_workspace_claim(claim: WorkspaceClaim) -> None:
@@ -767,7 +768,7 @@ class WorkflowEngine:
         # only ever covers dict mutation and the admission reservation, never
         # I/O, so distinct servers connect concurrently; the per-server slot
         # lock is held across the lazy connect + call by _run_mcp_step.
-        self._mcp_step_managers: dict[_McpStepPoolKey, MCPManager] = {}
+        self._mcp_step_managers: dict[_McpStepPoolKey, MCPManager | McpStepEntry] = {}
         # Keep failed/cancelled startup independently of successful pool insertion.
         # MCPManager itself registers its lifetime owner in the root controller.
         self._managed_mcp_step_managers: dict[MCPManager, LocalWorkspaceBinding] = {}
@@ -1003,7 +1004,9 @@ class WorkflowEngine:
                 self._mcp_step_locks[server_name] = lock
             return lock
 
-    async def _get_mcp_step_manager(self, server_name: str, resolved_cwd: str) -> MCPManager:
+    async def _get_mcp_step_manager(
+        self, server_name: str, resolved_cwd: str | None, *, step_key: str | None = None
+    ) -> MCPManager:
         """Return the pooled MCPManager for ``(server_name, resolved_cwd)``, connecting lazily.
 
         Call only under the per-server slot lock from :meth:`_mcp_step_slot`.
@@ -1029,19 +1032,61 @@ class WorkflowEngine:
         # this module is imported by cli/app.py on every conductor invocation.
         from conductor.mcp.manager import MCPManager
 
-        binding = self._local_workspace_binding()
-        key: _McpStepPoolKey = (
-            (server_name, resolved_cwd, binding.workspace_root, binding.incarnation)
-            if binding is not None
-            else (server_name, resolved_cwd)
-        )
+        placement = self._execution_resolver.manifest.profiles[step_key] if step_key else None
+        docker = placement is not None and placement.backend == "docker"
+        if docker:
+            self._execution_session.mcp_lifecycle.check_admission()
+        binding = None if docker else self._local_workspace_binding()
+        entry: McpStepEntry | None = None
+        lease = self._execution_session.lease_for_backend("docker") if docker else None
+        execution = None
+        dispatch_key = step_key
+        if docker:
+            from conductor.engine.execution_resolution import _spec_to_contract
+            from conductor.execution.docker import _map_working_dir
+
+            assert placement is not None and placement.execution is not None and lease is not None
+            execution = _spec_to_contract(placement.execution)
+            bundle = self._execution_session.run_bundle
+            assert bundle is not None
+            if self._subworkflow_depth and self.workflow_path is not None:
+                workflow = Path(os.path.abspath(self.workflow_path))
+                for source, namespace in bundle.source_roots:
+                    source_path = Path(os.path.abspath(source))
+                    if workflow.is_relative_to(source_path):
+                        child = workflow.relative_to(source_path).as_posix()
+                        dispatch_key = f"{namespace}/{child}::{step_key}"
+                        break
+            key: _McpStepPoolKey = (
+                server_name,
+                "docker",
+                placement.profile,
+                placement.model_dump_json(),
+                lease.lease_id,
+                lease.incarnation,
+                _map_working_dir(resolved_cwd, bundle.root),
+            )
+        else:
+            assert resolved_cwd is not None
+            key = (
+                (server_name, resolved_cwd, binding.workspace_root, binding.incarnation)
+                if binding is not None
+                else (server_name, resolved_cwd)
+            )
 
         while True:
             async with self._mcp_step_pool_guard:
+                if docker:
+                    self._execution_session.mcp_lifecycle.check_admission()
                 if binding is not None:
                     binding.runtime_context.process_scopes.check_admission()
                 manager = self._mcp_step_managers.get(key)
                 if manager is not None:
+                    if isinstance(manager, McpStepEntry):
+                        self._execution_session.record_backend_execution(
+                            "docker", step=dispatch_key
+                        )
+                        return manager.manager
                     return manager
                 if len(self._mcp_step_managers) + self._mcp_step_pending < _MCP_STEP_POOL_MAX:
                     self._mcp_step_pending += 1
@@ -1080,14 +1125,13 @@ class WorkflowEngine:
         # DRIFT HAZARD: secret delivery must mirror cli/run.py::_build_mcp_servers
         # (the provider connection path) — a declared binding must not connect
         # here with env=None while it was resolved and audited.
-        resolved = await resolve_mcp_server_config(
-            server_name,
-            server_config,
-            secret_uses=self._execution_resolver.secret_uses,
-        )
-
         connected: MCPManager | None = None
         try:
+            resolved = await resolve_mcp_server_config(
+                server_name,
+                server_config,
+                secret_uses=self._execution_resolver.secret_uses,
+            )
             if binding is None:
                 manager = MCPManager(tool_output=self.config.workflow.runtime.tool_output)
             else:
@@ -1100,14 +1144,43 @@ class WorkflowEngine:
                     manager, lambda: manager.close(strict=True)
                 )
                 self._mark_local_workspace_dispatch()
+            command = resolved["command"]
+            args = resolved.get("args")
+            env = resolved.get("env")
+            host_cwd = resolved_cwd
+            if docker:
+                assert lease is not None and execution is not None and step_key is not None
+                assert placement is not None
+                entry = McpStepEntry(manager)
+                backend = self._execution_session.backends["docker"]
+                self._execution_session.mcp_lifecycle.register_entry(backend, lease, entry)
+                spec = McpServerSpec(
+                    server_name,
+                    (command, *(args or [])),
+                    env or {},
+                    working_dir=resolved_cwd,
+                    inherit_control_environment=placement.inherit_control_environment,
+                    execution=execution,
+                )
+                target = await entry.allocate(lambda: backend.open_mcp_stdio(spec, lease))
+                self._execution_session.mcp_lifecycle.check_admission()
+                command, args, env, host_cwd = (
+                    target.command,
+                    list(target.args),
+                    dict(target.env),
+                    target.cwd,
+                )
+                self._execution_session.record_backend_execution("docker", step=dispatch_key)
+                target.mark_launch_attempted()
             await self._execution_session.invoke(
                 manager.connect_server(
                     name=server_name,
-                    command=resolved["command"],
-                    args=resolved.get("args"),
-                    env=resolved.get("env"),
+                    command=command,
+                    args=args,
+                    env=env,
                     timeout=resolved.get("timeout"),
-                    cwd=resolved_cwd,
+                    cwd=host_cwd,
+                    **({"safe_transport_diagnostics": True} if docker else {}),
                     # Deterministic mcp-step connections take the redacted logging
                     # path: a stdio failure's exception can embed server-supplied
                     # stderr (values the step's no-values policy excludes), so the
@@ -1115,21 +1188,36 @@ class WorkflowEngine:
                     # chains into the RuntimeError below, and _run_mcp_step's
                     # diagnostic sink is the only place the full traceback lands.
                     redact_errors=True,
-                )
+                ),
+                mcp=docker,
             )
             connected = manager
+            if entry is not None:
+                assert entry.target is not None
+                await entry.target.validate_started()
             async with self._mcp_step_pool_guard:
+                if docker:
+                    self._execution_session.mcp_lifecycle.check_admission()
                 if binding is not None:
                     binding.runtime_context.process_scopes.check_admission()
                 self._mcp_step_pending -= 1
-                self._mcp_step_managers[key] = manager
+                self._mcp_step_managers[key] = entry if entry is not None else manager
             return manager
-        except BaseException:
+        except BaseException as failure:
             # Release the reservation on failure AND cancellation — a leak
             # here would shrink the effective pool capacity for the rest of
             # the run.
+            if docker and isinstance(failure, asyncio.CancelledError):
+                root = self._execution_session.root_task
+                if root is None or root.cancelling():
+                    self._execution_session.begin_teardown("cancelled", retain=True)
             async with self._mcp_step_pool_guard:
                 self._mcp_step_pending -= 1
+            if entry is not None:
+                try:
+                    await entry.aclose()
+                except (Exception, asyncio.CancelledError):
+                    logger.warning("Docker MCP startup cleanup is unconfirmed")
             if connected is not None and binding is not None:
                 # Native close bounded-observes its registered owners before
                 # re-raising cancellation; retain the primary admission failure.
@@ -1168,7 +1256,7 @@ class WorkflowEngine:
         return target
 
     async def _close_evicted_mcp_step_manager(
-        self, evicted_key: _McpStepPoolKey, evicted: MCPManager
+        self, evicted_key: _McpStepPoolKey, evicted: MCPManager | McpStepEntry
     ) -> None:
         """Close an evicted pool manager without swallowing task cancellation.
 
@@ -1183,6 +1271,12 @@ class WorkflowEngine:
         on to connect or invoke anything. The close itself stays best-effort:
         a failing close is logged and never fails the run.
         """
+        if isinstance(evicted, McpStepEntry):
+            try:
+                await evicted.aclose()
+            except Exception:
+                logger.warning("Docker MCP cleanup is unconfirmed for server '%s'", evicted_key[0])
+            return
         binding = self._managed_mcp_step_managers.get(evicted)
         if binding is not None:
             try:
@@ -1224,6 +1318,9 @@ class WorkflowEngine:
         for manager in managed:
             await self._close_evicted_mcp_step_manager(("<managed>", ""), manager)
         for key, manager in managers:
+            if isinstance(manager, McpStepEntry):
+                await self._close_evicted_mcp_step_manager(key, manager)
+                continue
             if manager in managed:
                 continue
             try:
@@ -1386,14 +1483,16 @@ class WorkflowEngine:
             data: Event-specific payload data.
         """
         if not self._terminal_write:
-            if self._execution_session.sealed:
-                return
             if (
                 self._subworkflow_depth == 0
-                and self._execution_session.managed
+                and (
+                    self._execution_session.managed or self._execution_session.mcp_lifecycle.active
+                )
                 and event_type in ("workflow_completed", "workflow_failed")
             ):
                 self._pending_terminal_event = (event_type, data)
+                return
+            if self._execution_session.sealed:
                 return
         if self._event_emitter is None:
             return
@@ -2382,6 +2481,7 @@ class WorkflowEngine:
         *,
         event_fields: Mapping[str, Any] | None = None,
         allow_interrupt: bool = False,
+        for_each_group: str | None = None,
     ) -> dict[str, Any]:
         """Execute an mcp step end-to-end with events and output validation.
 
@@ -2439,6 +2539,8 @@ class WorkflowEngine:
         server = agent.server
         tool = agent.tool
         extra = dict(event_fields or {})
+        key = executable_step_identity(agent.name, for_each_group=for_each_group)
+        docker = self._execution_resolver.manifest.profiles[key].backend == "docker"
 
         iteration = self.limits.get_agent_execution_count(agent.name) + 1
         start = _time.time()
@@ -2491,8 +2593,12 @@ class WorkflowEngine:
             # check). Per-step working_dir is forbidden by the schema, so
             # only the runtime-level value renders.
             raw_cwd = self.config.workflow.runtime.working_dir
-            binding = self._local_workspace_binding()
-            if binding is not None:
+            binding = None if docker else self._local_workspace_binding()
+            if docker:
+                resolved_cwd = (
+                    self.renderer.render(raw_cwd, agent_context) if raw_cwd is not None else None
+                )
+            elif binding is not None:
                 rendered_cwd = (
                     self.renderer.render(raw_cwd, agent_context) if raw_cwd is not None else None
                 )
@@ -2533,7 +2639,11 @@ class WorkflowEngine:
                 async with await self._mcp_step_slot(server):
                     if binding is not None:
                         self._mark_local_workspace_dispatch(agent.name)
-                    manager = await self._get_mcp_step_manager(server, resolved_cwd)
+                    manager = (
+                        await self._get_mcp_step_manager(server, resolved_cwd, step_key=key)
+                        if docker
+                        else await self._get_mcp_step_manager(server, resolved_cwd)
+                    )
                     # The static validator cannot check this: the tool must
                     # actually exist on the connected server.
                     server_tools = {
@@ -2548,9 +2658,29 @@ class WorkflowEngine:
                         )
                     if binding is not None:
                         self._mark_local_workspace_dispatch()
-                    return await self._execution_session.invoke(
-                        self.mcp_step_executor.execute(agent, agent_context, manager)
-                    )
+                    from conductor.executor.mcp_step import _McpToolTransportFailure
+
+                    try:
+                        return await self._execution_session.invoke(
+                            self.mcp_step_executor.execute(agent, agent_context, manager),
+                            mcp=docker,
+                        )
+                    except _McpToolTransportFailure:
+                        if docker:
+                            for pool_key, pooled in tuple(self._mcp_step_managers.items()):
+                                if isinstance(pooled, McpStepEntry) and pooled.manager is manager:
+                                    self._mcp_step_managers.pop(pool_key)
+                                    try:
+                                        await pooled.aclose()
+                                    except (Exception, asyncio.CancelledError):
+                                        logger.warning(
+                                            "Docker MCP invalidation cleanup unconfirmed"
+                                        )
+                                    if pooled.cleanup_unconfirmed:
+                                        self._execution_session.begin_teardown(
+                                            "failed", retain=True
+                                        )
+                        raise
 
             if allow_interrupt and self._interrupt_event is not None:
                 envelope = await self._invoke_mcp_interruptible(agent, _invoke_under_slot())
@@ -2595,7 +2725,7 @@ class WorkflowEngine:
         except BaseException as exc:
             elapsed = _time.time() - start
             diag = self._write_mcp_diagnostic(
-                agent_name=agent.name, server=server, tool=tool, exc=exc
+                agent_name=agent.name, server=server, tool=tool, exc=exc, metadata_only=docker
             )
             self._emit(
                 "mcp_failed",
@@ -2605,7 +2735,10 @@ class WorkflowEngine:
                     "server": server,
                     "tool": tool,
                     "error_type": type(exc).__name__,
-                    "message": (f"MCP step '{agent.name}' failed{self._diagnostic_suffix(diag)}"),
+                    "message": (
+                        f"MCP step '{agent.name}' failed"
+                        f"{self._diagnostic_suffix(diag, metadata_only=docker)}"
+                    ),
                     **extra,
                 },
             )
@@ -2613,7 +2746,8 @@ class WorkflowEngine:
             # failure events stay value-free. The full exception (including
             # the connect-time cause chain) is in the diagnostic file.
             raise ExecutionError(
-                f"MCP step '{agent.name}' failed{self._diagnostic_suffix(diag)}",
+                f"MCP step '{agent.name}' failed"
+                f"{self._diagnostic_suffix(diag, metadata_only=docker)}",
                 agent_name=agent.name,
             ) from None
         elapsed = _time.time() - start
@@ -2663,10 +2797,15 @@ class WorkflowEngine:
         return Path(tempfile.gettempdir()) / "conductor" / f"{run_id}.mcp-diagnostics.log"
 
     @staticmethod
-    def _diagnostic_suffix(path: Path | None) -> str:
+    def _diagnostic_suffix(path: Path | None, *, metadata_only: bool = False) -> str:
         """Render the redacted-message pointer to the diagnostic file."""
         if path is None:
-            return "; diagnostic file could not be written (see stderr warning)"
+            suffix = "; diagnostic file could not be written (see stderr warning)"
+            if metadata_only:
+                suffix += "; Docker MCP stderr suppressed for secrets"
+            return suffix
+        if metadata_only:
+            return f"; diagnostic metadata: {path}; Docker MCP stderr suppressed for secrets"
         return f"; full diagnostic: {path}"
 
     def _write_mcp_diagnostic(
@@ -2677,6 +2816,7 @@ class WorkflowEngine:
         tool: str,
         exc: BaseException | None = None,
         detail: str | None = None,
+        metadata_only: bool = False,
     ) -> Path | None:
         """Append the full diagnostic for an mcp step failure to the private sink.
 
@@ -2702,7 +2842,9 @@ class WorkflowEngine:
                 f"=== {_time.strftime('%Y-%m-%d %H:%M:%S')} step={agent_name!r} "
                 f"server={server!r} tool={tool!r} ===\n"
             )
-            if exc is not None:
+            if metadata_only:
+                diagnostic += f"category=mcp_failure exception_type={type(exc).__name__}\n"
+            elif exc is not None:
                 diagnostic += "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             elif detail is not None:
                 diagnostic += detail
@@ -2713,9 +2855,16 @@ class WorkflowEngine:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(diagnostic)
         except OSError as write_exc:
-            logger.warning(
-                "Failed to write MCP step diagnostic for '%s': %s", agent_name, write_exc
-            )
+            if metadata_only:
+                logger.warning(
+                    "Failed to write Docker MCP diagnostic metadata for '%s' (%s)",
+                    agent_name,
+                    type(write_exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "Failed to write MCP step diagnostic for '%s': %s", agent_name, write_exc
+                )
             return None
         return path
 
@@ -3973,6 +4122,9 @@ class WorkflowEngine:
                         workflow_name=self.config.workflow.name,
                         bundle=bundle,
                         workspace_persistence=persistence,
+                        mcp_fence_execution=self._execution_session.mcp_fence_execution(
+                            self.config, self._execution_resolver.manifest
+                        ),
                     ),
                     workflow_path=self.workflow_path,
                     claim_active=claim is not None,
@@ -3998,6 +4150,10 @@ class WorkflowEngine:
             # The backend finalization sits in an inner finally: a cancellation
             # landing mid-close must not skip the realm cleanup below.
             try:
+                if self._subworkflow_depth == 0 and self._execution_session.mcp_lifecycle.active:
+                    self._execution_session.begin_teardown(
+                        outcome, retain=self._compute_workspace_retain(outcome)
+                    )
                 if not self._execution_session.managed:
                     await self._close_mcp_step_managers()
                 # The pricing verdict belongs to the run ending, not to anyone
@@ -4223,6 +4379,9 @@ class WorkflowEngine:
                         workflow_name=self.config.workflow.name,
                         bundle=bundle,
                         workspace_persistence=persistence,
+                        mcp_fence_execution=self._execution_session.mcp_fence_execution(
+                            self.config, self._execution_resolver.manifest
+                        ),
                     ),
                     workflow_path=self.workflow_path,
                     resume_identities=resume_identities,
@@ -4250,6 +4409,10 @@ class WorkflowEngine:
             # Same inner-finally reasoning as :meth:`run` -- a cancellation
             # landing mid-close must not skip the backend finalization.
             try:
+                if self._subworkflow_depth == 0 and self._execution_session.mcp_lifecycle.active:
+                    self._execution_session.begin_teardown(
+                        outcome, retain=self._compute_workspace_retain(outcome)
+                    )
                 if not self._execution_session.managed:
                     await self._close_mcp_step_managers()
                 # Same reasoning as :meth:`run` -- a resumed run that dies part way
@@ -4282,7 +4445,7 @@ class WorkflowEngine:
         except asyncio.CancelledError:
             if primary is None:
                 raise
-        if not session.managed:
+        if not session.managed and not session.mcp_lifecycle.active:
             return
         cleanup_error = (
             ExecutionError(
@@ -4316,7 +4479,7 @@ class WorkflowEngine:
                 self._emit(*pending)
         finally:
             self._terminal_write = False
-            if session.owns_secrets and self._registry is None:
+            if session.owns_secrets and (self._registry is None or not session.managed):
                 session.reset_secrets()
         if primary is None and error is not None:
             raise error
@@ -4375,15 +4538,15 @@ class WorkflowEngine:
             Path to the saved checkpoint, or ``None`` when no ``workflow_path``
             is set or saving failed.
         """
-        if not self._terminal_write and self._execution_session.sealed:
-            return None
         if (
-            self._execution_session.managed
+            (self._execution_session.managed or self._execution_session.mcp_lifecycle.active)
             and trigger == "failure"
             and self._subworkflow_depth == 0
             and not self._terminal_write
         ):
             self._pending_checkpoint_error = error
+            return None
+        if not self._terminal_write and self._execution_session.sealed:
             return None
         if self.workflow_path is None:
             logger.debug("No workflow_path set; skipping checkpoint save")
@@ -7518,7 +7681,9 @@ class WorkflowEngine:
                 # renders a calm "Workflow Stopped" banner, matching the
                 # hard-Kill path handled by ``handle_dashboard_stop``. #245.
                 fail_data["stopped_by_user"] = True
-            if self._subworkflow_depth == 0 and self._execution_session.managed:
+            if self._subworkflow_depth == 0 and (
+                self._execution_session.managed or self._execution_session.mcp_lifecycle.active
+            ):
                 # Root orchestration owns this intent even if its timeout sealed admission.
                 # Resource callbacks still pass through the sealed event/checkpoint guards.
                 self._pending_terminal_event = ("workflow_failed", fail_data)
@@ -8981,6 +9146,7 @@ class WorkflowEngine:
                     mcp_envelope = await self._run_mcp_step(
                         for_each_group.agent,
                         agent_context,
+                        for_each_group=for_each_group.name,
                         event_fields={
                             "group_name": for_each_group.name,
                             "item_key": key,

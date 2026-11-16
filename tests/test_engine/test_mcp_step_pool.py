@@ -9,7 +9,8 @@ Covers:
 - The per-server slot lock is a stable object per server name and distinct
   across server names
 
-All MCP interaction is mocked — no real MCP servers are spawned.
+Legacy cases use MCP doubles. Docker placement cases run real SDK peers
+through an executable fake Docker CLI.
 """
 
 from __future__ import annotations
@@ -32,6 +33,14 @@ from conductor.config.schema import (
 )
 from conductor.engine.workflow import _MCP_STEP_POOL_MAX, WorkflowEngine
 from conductor.exceptions import ExecutionError
+from tests.test_engine.mcp_placement import owned_opening, placement_config, placement_engine
+
+
+@pytest.fixture
+def realm(tmp_path, monkeypatch):
+    from tests.test_mcp.fixtures.docker_realm import create_realm
+
+    return create_realm(tmp_path, monkeypatch)
 
 
 def _make_engine(mcp_servers: dict[str, MCPServerDef] | None = None) -> WorkflowEngine:
@@ -73,6 +82,230 @@ def _manager_factory(**_kwargs: Any) -> MagicMock:
     manager.connect_server = AsyncMock(return_value=[])
     manager.close = AsyncMock()
     return manager
+
+
+@pytest.mark.parametrize("cleanup_error", [False, True])
+async def test_owned_opening_releases_and_joins_after_readiness_failure(
+    cleanup_error: bool,
+) -> None:
+    # Requirement: failed readiness releases and joins its owner without hiding either failure.
+    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    primary = TimeoutError("readiness failed")
+    secondary = RuntimeError("opening cleanup failed")
+    owners: list[asyncio.Task[None]] = []
+
+    async def open_until_released() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            closed.set()
+            if cleanup_error:
+                raise secondary
+
+    with pytest.raises(TimeoutError) as caught:
+        async with owned_opening(open_until_released(), release) as opening:
+            owners.append(opening)
+            await asyncio.wait_for(entered.wait(), 5)
+            raise primary
+
+    assert caught.value is primary
+    assert release.is_set() and closed.is_set()
+    assert [owner.done() for owner in owners] == [True]
+    assert primary.__cause__ is (secondary if cleanup_error else None)
+
+
+async def test_docker_profile_full_execution_identity_and_reuse(realm) -> None:
+    # Requirement: full profile/execution identity splits targets; identical keys reuse a peer.
+    config = placement_config()
+    async with placement_engine(config, realm) as engine:
+        first = await engine._run_mcp_step(config.agents[0], {})
+        entry = next(iter(engine._mcp_step_managers.values()))
+        await engine._run_mcp_step(config.agents[1], {})
+        assert next(iter(engine._mcp_step_managers.values())) is entry
+        assert len(engine._mcp_step_managers) == 1
+        profile = engine._execution_resolver.manifest.profiles["again"]
+        assert profile.execution is not None
+        manifest = engine._execution_resolver.manifest
+        engine._execution_resolver._manifest = manifest.model_copy(
+            update={
+                "profiles": {
+                    **manifest.profiles,
+                    "again": profile.model_copy(
+                        update={
+                            "execution": profile.execution.model_copy(update={"network": "none"})
+                        }
+                    ),
+                }
+            }
+        )
+        await engine._run_mcp_step(config.agents[1], {})
+        assert len(engine._mcp_step_managers) == 2
+        assert first["is_error"] is False
+        assert len(list(realm.root.glob("*.launcher.json"))) == 2
+
+
+async def test_docker_cwd_mapped_key_and_single_render(realm, monkeypatch) -> None:
+    # Requirement: mapped cwd determines reuse without a host probe or a second template render.
+    config = placement_config(cwd="{{ directory }}")
+    async with placement_engine(config, realm) as engine:
+        render = engine.renderer.render
+        rendered = []
+
+        def witness(template, context):
+            if template == "{{ directory }}":
+                rendered.append(context["directory"])
+            return render(template, context)
+
+        monkeypatch.setattr(engine.renderer, "render", witness)
+        from pathlib import Path
+
+        probe = Path.is_dir
+
+        def host_probe(path):
+            assert not str(path).startswith("/workspace")
+            return probe(path)
+
+        monkeypatch.setattr(Path, "is_dir", host_probe)
+        for directory in ("new/{{ literal }}", "./new/{{ literal }}", "other"):
+            await engine._run_mcp_step(config.agents[0], {"directory": directory})
+        assert rendered == ["new/{{ literal }}", "./new/{{ literal }}", "other"]
+        assert len(engine._mcp_step_managers) == 2
+        import json
+
+        workdirs = []
+        for path in realm.root.glob("*.launcher.json"):
+            argv = json.loads(path.read_text())["argv"]
+            workdirs.append(argv[argv.index("-w") + 1])
+        assert sorted(workdirs) == ["/workspace/main/new/{{ literal }}", "/workspace/main/other"]
+
+
+async def test_docker_incarnation_replaces_stale_pool_identity(realm) -> None:
+    # Requirement: a fresh backend-issued incarnation never reuses the previous SDK session.
+    config = placement_config()
+    async with placement_engine(config, realm) as engine:
+        await engine._run_mcp_step(config.agents[0], {})
+        old_entry = next(iter(engine._mcp_step_managers.values()))
+        old_lease = engine._execution_session.leases["docker"]
+        await old_entry.aclose()
+        await realm.backend.finalize_run(old_lease, "succeeded")
+        new_lease = await realm.backend.prepare_run(realm.run)
+        assert old_lease.lease_id == new_lease.lease_id
+        assert old_lease.incarnation != new_lease.incarnation
+        engine._execution_session.leases["docker"] = new_lease
+        try:
+            await engine._run_mcp_step(config.agents[0], {})
+            assert len(engine._mcp_step_managers) == 2
+            assert len(list(realm.root.glob("*.launcher.json"))) == 2
+        finally:
+            await engine._close_mcp_step_managers()
+            await realm.backend.finalize_run(new_lease, "succeeded")
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_allocation_docker_only_root_owns_late_target(realm, monkeypatch, expired) -> None:
+    # Requirement: pending allocation is not empty cleanup; late targets never publish or launch.
+    from dataclasses import replace
+
+    from conductor.execution.errors import ExecutionSpecError
+    from conductor.mcp.manager import MCPManager
+
+    config = placement_config()
+    allocated, release = asyncio.Event(), asyncio.Event()
+    order = []
+    original_open = realm.backend.open_mcp_stdio
+    original_finalize = realm.backend.finalize_run
+    original_close = MCPManager.close
+
+    async def held_open(spec, lease):
+        target = await original_open(spec, lease)
+
+        async def close_target():
+            order.append("target")
+            await target.aclose()
+
+        allocated.set()
+        await release.wait()
+        return replace(target, aclose=close_target)
+
+    async def close_manager(manager, *, strict=False):
+        assert strict
+        await original_close(manager, strict=strict)
+        order.append("manager")
+
+    async def finalize(lease, outcome, *, retain=False):
+        order.append("finalize")
+        await original_finalize(lease, outcome, retain=retain)
+
+    monkeypatch.setattr(realm.backend, "open_mcp_stdio", held_open)
+    monkeypatch.setattr(realm.backend, "finalize_run", finalize)
+    monkeypatch.setattr(MCPManager, "close", close_manager)
+    async with placement_engine(config, realm) as engine:
+        session = engine._execution_session
+        # Staging is a prerequisite, outside the held allocation readiness budget.
+        execution = engine._execution_resolver.manifest.profiles["call"].execution
+        assert execution is not None
+        await realm.backend._ensure_staged(session.leases["docker"], execution, None)
+        async with owned_opening(
+            engine._get_mcp_step_manager("srv", None, step_key="call"), release
+        ) as opening:
+            await asyncio.wait_for(allocated.wait(), 5)
+            session.begin_teardown("cancelled", retain=expired)
+            deadline = session.cleanup_deadline
+            assert session.sealed and deadline is not None
+            assert order == []
+            if expired:
+                opening.cancel()
+                loop = asyncio.get_running_loop()
+                clock = loop.time
+                monkeypatch.setattr(loop, "time", lambda: clock() + 31)
+                await session.finalize_leases("cancelled", retain=True)
+                assert session.cleanup_uncertain
+                assert "finalize" not in order
+            release.set()
+            if expired:
+                with pytest.raises(asyncio.CancelledError):
+                    await opening
+            else:
+                with pytest.raises(ExecutionSpecError, match="sealed"):
+                    await opening
+            await session.finalize_leases("cancelled", retain=expired)
+            entry = session.mcp_lifecycle.attempts[0].entries[0]
+            assert entry._cleanup is not None
+            await asyncio.wait_for(asyncio.shield(entry._cleanup), 5)
+            assert engine._mcp_step_managers == {}
+            assert order == (
+                ["manager", "target"] if expired else ["manager", "target", "finalize"]
+            )
+            assert session.cleanup_deadline == deadline
+            assert not list(realm.root.glob("*.launcher.json"))
+
+
+async def test_docker_eviction_retains_cleanup_proof_until_root_finalize(realm, monkeypatch):
+    # Requirement: evicted SDK entries remain owned and root finalization joins every target.
+    import json
+
+    import conductor.engine.workflow as workflow
+
+    monkeypatch.setattr(workflow, "_MCP_STEP_POOL_MAX", 2)
+    config = placement_config(cwd="{{ cwd }}")
+    async with placement_engine(config, realm) as engine:
+        for cwd in ("one", "two", "three"):
+            await engine._run_mcp_step(config.agents[0], {"cwd": cwd})
+        entries = engine._execution_session.mcp_lifecycle.attempts[0].entries
+        assert len(entries) == 3 and len(engine._mcp_step_managers) == 2
+        first = entries[0]
+        assert first.target is not None and first._cleanup is not None
+        assert first._cleanup.done() and not first.cleanup_unconfirmed
+        launch = json.loads((realm.root / f"{first.target.identity}.launcher.json").read_text())
+        peer = json.loads((realm.root / f"{first.target.identity}.json").read_text())
+        assert launch["joined"] and peer["closed"]
+        state = json.loads((realm.root / "state.json").read_text())
+        assert first.target.identity not in state["containers"]
+        await engine._execution_session.finalize_leases("succeeded")
+        assert not engine._execution_session.quarantined
+        state = json.loads((realm.root / "state.json").read_text())
+        assert state["containers"] == {} and state["volumes"] == {}
 
 
 class TestLazyConnectAndReuse:

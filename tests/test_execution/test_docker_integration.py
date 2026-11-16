@@ -36,32 +36,44 @@ import contextlib
 import hashlib
 import json
 import os
+import socket
 import subprocess
+import sys
 import textwrap
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 from unittest import mock
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+import anyio
+import httpx
+import psutil
 import pytest
+from anyio.abc import ByteReceiveStream
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
 from conductor.config.environment import resolve_environment
 from conductor.config.loader import load_config
 from conductor.engine import workflow as workflow_module
-from conductor.engine.checkpoint import CheckpointManager
+from conductor.engine.checkpoint import CheckpointManager, CheckpointTrigger
 from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ExecutionError
-from conductor.execution.docker import _STAGING_COPY_MODE, DockerRunnerBackend
+from conductor.execution.docker import (
+    _AUXILIARY_TIMEOUT_SECONDS,
+    _STAGING_COPY_MODE,
+    DockerRunnerBackend,
+)
 from conductor.execution.types import (
     AgentSpec,
     BundleRef,
     CommandSpec,
     ResolvedExecutionSpec,
+    RunOutcome,
     RunSpec,
 )
 
@@ -79,11 +91,16 @@ _CLI_TIMEOUT_SECONDS = 180.0
 
 
 @pytest.fixture(scope="module")
-def runner_image(docker_daemon: str) -> Generator[str, None, None]:
+def runner_image(
+    docker_daemon: str, tmp_path_factory: pytest.TempPathFactory
+) -> Generator[str, None, None]:
     """Build the test-only provider layer over the CI's SHA-pinned runner."""
     del docker_daemon
     base = os.environ.get("CONDUCTOR_TEST_RUNNER_IMAGE")
     image = _unique("agent-fixture")
+    receipt_path = tmp_path_factory.getbasetemp() / "runner-image.json"
+    receipt: dict[str, JsonValue] = {"tag": image, "registered": True}
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     fixture_dir = Path(__file__).parent / "fixtures" / "runner_image"
     if base:
         command = [
@@ -112,13 +129,34 @@ def runner_image(docker_daemon: str) -> Generator[str, None, None]:
         timeout=300,
         check=False,
     )
+    receipt["build_exit"] = result.returncode
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     assert result.returncode == 0, (
         f"build test runner from {base or 'local context'}: {result.stderr}"
     )
+    inspected = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert inspected.returncode == 0, inspected.stderr
+    receipt["metadata"] = json.loads(inspected.stdout)
     try:
         yield image
     finally:
-        subprocess.run(["docker", "image", "rm", "-f", image], capture_output=True, check=False)
+        removed = subprocess.run(
+            ["docker", "image", "rm", image],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        receipt["remove_exit"] = removed.returncode
+        receipt["removal_output"] = removed.stdout
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        assert removed.returncode == 0, removed.stderr
 
 
 @pytest.fixture(scope="module")
@@ -1033,3 +1071,1124 @@ async def test_retained_failure_then_resumed_success_removes_volume(
         assert rc != 0 and "no such volume" in stderr.lower()
     finally:
         await _remove_volume(volume)
+
+
+class _LiveConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    Labels: dict[str, str]
+
+
+class _LiveMount(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    Name: str | None = None
+    Destination: str
+    Type: str
+
+
+class _LiveContainer(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    Id: str
+    Name: str
+    Config: _LiveConfig
+    State: dict[str, JsonValue]
+    Mounts: list[_LiveMount]
+
+
+class _LiveVolume(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    Name: str
+    Labels: dict[str, str] | None
+    CreatedAt: str
+
+
+class _LiveMcpCli:
+    """Own one CLI scenario, its private homes, and exact daemon resource receipts."""
+
+    def __init__(self, root: Path, image: str) -> None:
+        self.root = root
+        self.image = image
+        self.run_id = _unique("mcp")
+        self.volume = f"conductor-ws-{self.run_id}"
+        self.workflow = root / "live.yaml"
+        self.environment = root / "environment.yaml"
+        self.commands: list[dict[str, str | int]] = []
+        self.dispositions: list[dict[str, str | int]] = []
+        self.hooks: dict[str, tuple[str, int]] = {}
+        self.owned_containers: dict[str, _LiveContainer] = {}
+        self.workspace_proof: _LiveVolume | None = None
+        self.qa_replacement: tuple[_LiveVolume, str] | None = None
+
+    def configure(
+        self, mode: str = "cooperative", *, resume: bool = False, mcp_only: bool = False
+    ) -> None:
+        """Author a real workflow without changing product admission or transport code."""
+        self.environment.write_text(
+            json.dumps(
+                {
+                    "default": "container",
+                    "profiles": {
+                        "container": {
+                            "backend": "docker",
+                            "docker": {"image": self.image, "network": "none"},
+                        }
+                    },
+                    "secrets": {"token": {"source": {"env": "TASK8_CANARY"}, "allow": ["mcp"]}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        agents: list[dict[str, JsonValue]] = [
+            {
+                "name": "setup",
+                "type": "script",
+                "working_dir": ".",
+                "command": "sh",
+                "args": ["-c", "mkdir generated; printf 'seed\\n' > generated/value.txt"],
+                "routes": [{"to": "first"}],
+            },
+            *[
+                {
+                    "name": name,
+                    "type": "mcp",
+                    "server": "peer",
+                    "tool": "mutate",
+                    "arguments": {"path": "value.txt"},
+                    "timeout": 2 if mode in {"timeout", "uncooperative"} else 30,
+                    "routes": [{"to": target}],
+                }
+                for name, target in (("first", "second"), ("second", "observe"))
+            ],
+            {
+                "name": "observe",
+                "type": "script",
+                "working_dir": "generated",
+                "command": "python",
+                "args": [
+                    "-S",
+                    "-c",
+                    "from pathlib import Path; print(Path('value.txt').read_text(), end='')",
+                ],
+                "routes": [{"to": "$end"}],
+            },
+        ]
+        if resume:
+            agents[2]["routes"] = [{"to": "retry"}]
+            agents.insert(
+                3,
+                {
+                    "name": "retry",
+                    "type": "mcp",
+                    "server": "peer",
+                    "tool": "mutate",
+                    "arguments": {"path": "value.txt", "fail_once": True},
+                    "routes": [{"to": "observe"}],
+                },
+            )
+        if mcp_only:
+            agents = agents[1:2]
+            agents[0]["routes"] = [{"to": "$end"}]
+            # This file exists even in a silently auto-created replacement.
+            # Omitting post-spawn volume validation would therefore complete
+            # the tool exchange, rather than fail incidentally on a missing file.
+            agents[0]["arguments"] = {"path": "/workspace/peer-history.jsonl"}
+        self.workflow.write_text(
+            json.dumps(
+                {
+                    "workflow": {
+                        "name": "live-mcp",
+                        "entry_point": "first" if mcp_only else "setup",
+                        "workspace": {"persistence": "durable"},
+                        "runtime": {
+                            "working_dir": "." if mcp_only else "generated",
+                            "mcp_servers": {
+                                "peer": {
+                                    "command": "python",
+                                    "args": [
+                                        "-S",
+                                        "-c",
+                                        (
+                                            Path(__file__).parents[1]
+                                            / "test_mcp/fixtures/live_docker_stdio.py"
+                                        ).read_text(encoding="utf-8"),
+                                    ],
+                                    "env": {"PEER_MODE": mode},
+                                    "secrets": [
+                                        {
+                                            "ref": "token",
+                                            "scope": "mcp",
+                                            "delivery": {"env": "PAYLOAD_TOKEN"},
+                                        }
+                                    ],
+                                }
+                            },
+                        },
+                    },
+                    "agents": agents,
+                    "output": {"result": "{{ observe.output.stdout }}"},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    async def cli(self, arguments: list[str], *, home: str = "controller-a") -> int:
+        """Execute the operator CLI in a fresh isolated home, preserving Docker context."""
+        directory = self.root / home
+        directory.mkdir(exist_ok=True)
+        temp = directory / "tmp"
+        temp.mkdir(exist_ok=True)
+        environment = {
+            **os.environ,
+            "HOME": str(directory),
+            "USERPROFILE": str(directory),
+            "CONDUCTOR_HOME": str(directory / ".conductor"),
+            "TMPDIR": str(temp),
+            "TEMP": str(temp),
+            "TMP": str(temp),
+            "CONDUCTOR_RUN_ID": self.run_id,
+            "TASK8_CANARY": "task8-private-canary-94623",
+        }
+        entrypoint = ["-m", "conductor"]
+        if home in self.hooks:
+            hook, port = self.hooks[home]
+            environment["TASK8_QA_HOOK"] = hook
+            environment["TASK8_QA_PORT"] = str(port)
+            environment["TASK8_QA_RECEIPT"] = str(directory / "qa-hooks.jsonl")
+            entrypoint = [
+                "-c",
+                f"import runpy; runpy.run_path({str(Path(__file__))!r})['_mcp_qa_controller']()",
+            ]
+        command = [
+            sys.executable,
+            "-P",
+            *entrypoint,
+            *arguments,
+            "--environment",
+            str(self.environment),
+            "--no-interactive",
+            "--skip-gates",
+            "--log-file",
+            str(directory / "operator.log"),
+        ]
+        index = len(self.commands)
+        receipt: dict[str, str | int] = {
+            "command": " ".join(command),
+            "exit": "pending",
+            "home": home,
+            "run_id": self.run_id,
+            "expected_volume": self.volume,
+            "image": self.image,
+        }
+        self.commands.append(receipt)
+        (self.root / "commands.json").write_text(json.dumps(self.commands), encoding="utf-8")
+
+        async def drain(stream: ByteReceiveStream, suffix: str) -> None:
+            with (self.root / f"cli-{index}.{suffix}").open("wb") as sink:
+                async for chunk in stream:
+                    sink.write(chunk)
+
+        with anyio.fail_after(180):
+            process = await anyio.open_process(
+                command, env=environment, cwd=self.root, stdin=subprocess.DEVNULL
+            )
+            try:
+                async with process:
+                    receipt["pid"] = process.pid
+                    (self.root / "commands.json").write_text(
+                        json.dumps(self.commands), encoding="utf-8"
+                    )
+                    assert process.stdout is not None and process.stderr is not None
+                    async with anyio.create_task_group() as group:
+                        group.start_soon(drain, process.stdout, "stdout")
+                        group.start_soon(drain, process.stderr, "stderr")
+                        result = await process.wait()
+            finally:
+                assert process.returncode is not None
+                receipt["exit"] = process.returncode
+                (self.root / "commands.json").write_text(
+                    json.dumps(self.commands), encoding="utf-8"
+                )
+        return result
+
+    async def containers(self) -> list[_LiveContainer]:
+        """Inspect this run's resources; label filtering alone never authorizes disposal."""
+        rc, output, error = await _docker(
+            "ps", "-aq", "--filter", f"label=io.conductor.run_id={self.run_id}"
+        )
+        assert rc == 0, error
+        if not output.strip():
+            return []
+        rc, output, error = await _docker("inspect", *output.split())
+        assert rc == 0, error
+        containers = TypeAdapter(list[_LiveContainer]).validate_json(output)
+        proof = self.workspace_proof
+        if proof is None:
+            rc, volume_json, error = await _docker("volume", "inspect", self.volume)
+            assert rc == 0, error
+            proof = TypeAdapter(list[_LiveVolume]).validate_json(volume_json)[0]
+            self.workspace_proof = proof
+        assert proof.Labels is not None
+        for item in containers:
+            labels = item.Config.Labels
+            assert labels["io.conductor.managed"] == "true"
+            assert labels["io.conductor.run_id"] == self.run_id
+            assert labels["io.conductor.workspace"] == self.run_id
+            assert labels["io.conductor.incarnation"] == (proof.Labels["io.conductor.incarnation"])
+            assert labels["io.conductor.resource"] in {
+                "mcp-fence",
+                "mcp",
+                "scratch",
+                "exec",
+                "runner",
+            }
+            for registered in self.owned_containers.values():
+                if registered.Name == item.Name:
+                    assert registered.Id == item.Id
+                    assert registered.Config.Labels == labels
+            self.owned_containers[item.Id] = item
+        return containers
+
+    def checkpoint(self) -> Path:
+        """Locate a real failure checkpoint rather than fabricating resume metadata."""
+        return next(
+            path
+            for path in (self.root / "controller-a").rglob("*.json")
+            if "current_agent" in json.loads(path.read_text())
+        )
+
+    async def read_volume(self, path: str) -> str:
+        """Read through a separately registered QA reader, without starting the guard."""
+        return await self.volume_command(("cat", path))
+
+    async def volume_command(self, argv: tuple[str, ...]) -> str:
+        """Run a QA command only over an already verified, owned volume."""
+        rc, output, error = await _docker("volume", "inspect", self.volume)
+        assert rc == 0, error
+        volume = TypeAdapter(list[_LiveVolume]).validate_json(output)[0]
+        assert volume.Labels is not None
+        assert volume.Labels["io.conductor.run_id"] == self.run_id
+        if self.workspace_proof is None:
+            self.workspace_proof = volume
+        assert volume == self.workspace_proof
+        name = _unique("qa-reader")
+        allocation_path = self.root / "qa-reader-allocations.jsonl"
+        with allocation_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "name": name,
+                        "volume": self.volume,
+                        "image": self.image,
+                        "phase": "registered",
+                    }
+                )
+                + "\n"
+            )
+        rc, identifier, error = await _docker(
+            "create",
+            "--name",
+            name,
+            "-v",
+            f"{self.volume}:/workspace",
+            "--entrypoint",
+            argv[0],
+            self.image,
+            *argv[1:],
+        )
+        assert rc == 0, error
+        identifier = identifier.strip()
+        with allocation_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"name": name, "id": identifier, "phase": "created"}) + "\n")
+        try:
+            rc, output, error = await _docker("start", "-a", identifier)
+            assert rc == 0, error
+            return output
+        finally:
+            rc, _output, error = await _docker("rm", "-f", identifier)
+            assert rc == 0, error
+            self.dispositions.append({"kind": "qa-reader", "id": identifier, "remove_exit": rc})
+            (self.root / "qa-reader-receipts.json").write_text(
+                json.dumps(self.dispositions), encoding="utf-8"
+            )
+
+    async def dispose(self) -> None:
+        """Dispose QA resources separately, after every CLI process has been joined."""
+        native: list[int] = []
+        qa_controllers = {os.getpid(), *(parent.pid for parent in psutil.Process().parents())}
+        for process in psutil.process_iter(["pid", "cmdline"]):
+            argv = process.info["cmdline"] or []
+            if process.pid not in qa_controllers and any(
+                str(self.root) in argument or argument == f"io.conductor.run_id={self.run_id}"
+                for argument in argv
+            ):
+                native.append(process.pid)
+        (self.root / "qa-native-terminal.json").write_text(
+            json.dumps(
+                {
+                    "live_owned_pids": native,
+                    "commands": self.commands,
+                    "qa_launcher_pids": sorted(qa_controllers),
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert native == [], "QA disposal requires terminal CLI/native/SDK/staging owners"
+        inventory = await self.containers()
+        (self.root / "qa-before-disposal.json").write_text(
+            json.dumps([item.model_dump() for item in inventory]), encoding="utf-8"
+        )
+        for metadata in inventory:
+            registered = self.owned_containers[metadata.Id]
+            assert metadata.Config.Labels == registered.Config.Labels
+            assert metadata.Config.Labels["io.conductor.run_id"] == self.run_id
+            assert metadata.Name.startswith("/conductor-")
+            identifier = metadata.Id
+            assert len(identifier) == 64
+            rc, _output, error = await _docker("rm", "-f", identifier)
+            assert rc == 0, error
+            self.dispositions.append({"kind": "container", "id": identifier, "remove_exit": rc})
+        rc, output, error = await _docker("volume", "inspect", self.volume)
+        if rc == 0:
+            metadata = TypeAdapter(list[_LiveVolume]).validate_json(output)[0]
+            if metadata.Labels is None:
+                if self.qa_replacement is None:
+                    self.dispositions.append(
+                        {
+                            "kind": "unverified-volume",
+                            "name": self.volume,
+                            "created": metadata.CreatedAt,
+                            "disposition": "preserved; no adoption or removal",
+                        }
+                    )
+                else:
+                    expected, creator_id = self.qa_replacement
+                    assert metadata == expected and len(creator_id) == 64
+                    rc, _output, error = await _docker("volume", "rm", self.volume)
+                    assert rc == 0, error
+                    self.dispositions.append(
+                        {
+                            "kind": "qa-replacement-disposal",
+                            "name": self.volume,
+                            "created": metadata.CreatedAt,
+                            "creator_id": creator_id,
+                            "product_ownership": "unverified; never adopted",
+                            "remove_exit": rc,
+                        }
+                    )
+            else:
+                assert metadata.Labels["io.conductor.run_id"] == self.run_id
+                rc, _output, error = await _docker("volume", "rm", self.volume)
+                assert rc == 0, error
+                self.dispositions.append(
+                    {
+                        "kind": "volume",
+                        "name": self.volume,
+                        "created": metadata.CreatedAt,
+                        "incarnation": metadata.Labels["io.conductor.incarnation"],
+                        "remove_exit": rc,
+                    }
+                )
+        else:
+            assert "no such volume" in error.lower()
+        (self.root / "qa-disposal.json").write_text(json.dumps(self.dispositions), encoding="utf-8")
+
+
+@pytest.fixture
+def live_mcp(tmp_path: Path, runner_image: str) -> _LiveMcpCli:
+    return _LiveMcpCli(tmp_path, runner_image)
+
+
+async def test_mcp_cli_relative_round_trip_reuse_and_retained_resume(
+    live_mcp: _LiveMcpCli,
+) -> None:
+    # Requirement: real CLI calls share the script-created cwd/volume; resume starts a new peer.
+    live_mcp.configure(resume=True)
+    try:
+        assert await live_mcp.cli(["run", str(live_mcp.workflow)]) == 1
+        history = [
+            json.loads(line)
+            for line in (await live_mcp.read_volume("/workspace/peer-history.jsonl")).splitlines()
+        ]
+        calls = [entry for entry in history if entry["event"] == "call"]
+        assert len(calls) == 3 and len({entry["container"] for entry in calls}) == 1
+        assert all(entry["cwd"] == "/workspace/main/generated" for entry in calls)
+        assert not (live_mcp.root / "generated").exists()
+        assert await live_mcp.containers() == []
+        checkpoints = list((live_mcp.root / "controller-a").rglob("*.json"))
+        checkpoint = next(
+            path
+            for path in checkpoints
+            if json.loads(path.read_text()).get("current_agent") == "retry"
+        )
+        assert await live_mcp.cli(["resume", "--from", str(checkpoint)], home="controller-b") == 0
+        history = [
+            json.loads(line)
+            for line in (await live_mcp.read_volume("/workspace/peer-history.jsonl")).splitlines()
+        ]
+        calls = [entry for entry in history if entry["event"] == "call"]
+        assert len(calls) == 4 and calls[-1]["container"] != calls[0]["container"]
+        assert await live_mcp.read_volume("/workspace/main/generated/value.txt") == (
+            "seed\nmcp\nmcp\nmcp\n"
+        )
+        assert await live_mcp.containers() == []
+        assert json.loads((live_mcp.root / "cli-1.stdout").read_text())["result"] == (
+            "seed\nmcp\nmcp\nmcp\n"
+        )
+    finally:
+        await live_mcp.dispose()
+
+
+class _CliPause:
+    """An event-driven QA controller channel; no time-based synchronization."""
+
+    def __init__(self, root: Path) -> None:
+        self.receipt = root / "qa-ports.jsonl"
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.listener.settimeout(90)
+        self.port = self.listener.getsockname()[1]
+        self.peers: list[socket.socket] = []
+        with self.receipt.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"port": self.port, "disposition": "registered"}) + "\n")
+
+    async def event(self) -> tuple[socket.socket, dict[str, JsonValue]]:
+        with anyio.fail_after(90):
+            peer, _address = await anyio.to_thread.run_sync(self.listener.accept)
+            self.peers.append(peer)
+            peer.settimeout(90)
+            with peer.makefile("rb") as stream:
+                payload = await anyio.to_thread.run_sync(stream.readline)
+        return peer, json.loads(payload)
+
+    def close(self) -> None:
+        for peer in self.peers:
+            peer.close()
+        self.listener.close()
+        with self.receipt.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"port": self.port, "disposition": "closed"}) + "\n")
+
+
+def _mcp_qa_controller() -> None:
+    """Run the real CLI with narrow QA pauses at existing native-owner boundaries."""
+    import mcp.client.stdio as sdk_stdio
+
+    from conductor.cli.app import app
+    from conductor.engine.execution_resolution import ExecutionResolverSession
+    from conductor.engine.mcp_lifecycle import McpRunLifecycle
+
+    mode = os.environ["TASK8_QA_HOOK"]
+    port = int(os.environ["TASK8_QA_PORT"])
+    used = False
+    holding = False
+
+    def record(event: str) -> None:
+        with Path(os.environ["TASK8_QA_RECEIPT"]).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"event": event, "pid": os.getpid()}) + "\n")
+
+    def notify(event: str, deadline: float | None, checkpoint: Path | None = None) -> None:
+        record(event)
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as channel:
+            channel.sendall(
+                json.dumps(
+                    {
+                        "event": event,
+                        "deadline": deadline,
+                        "checkpoint": str(checkpoint) if checkpoint else None,
+                    }
+                ).encode()
+                + b"\n"
+            )
+
+    async def pause(phase: str) -> None:
+        nonlocal used, holding
+        if used:
+            return
+        used = holding = True
+        record(phase)
+        async with await anyio.connect_tcp("127.0.0.1", port) as channel:
+            await channel.send(json.dumps({"event": phase, "pid": os.getpid()}).encode() + b"\n")
+            # Deliberately model an owner that ignores cancellation. The actual
+            # root deadline stays intact and its uncertainty must fence resume.
+            with anyio.CancelScope(shield=True):
+                cancelled = False
+                while True:
+                    try:
+                        assert await channel.receive(1) == b"R"
+                        break
+                    except anyio.get_cancelled_exc_class():
+                        if not cancelled:
+                            record("ignored-cancellation")
+                            cancelled = True
+                        continue
+        record("released")
+        holding = False
+
+    original_run = DockerRunnerBackend._run_docker
+
+    async def run_docker(
+        self: DockerRunnerBackend,
+        argv: Sequence[str],
+        *,
+        stdin_bytes: bytes | None = None,
+        timeout: float | None = _AUXILIARY_TIMEOUT_SECONDS,
+        diagnostics: Callable[[str], None] | None = None,
+    ) -> tuple[int, str, str]:
+        # The QA wrapper must preserve the existing control boundary's complete signature.
+        guard_create = argv[0] == "create" and any(
+            str(item).startswith("conductor-mcp-fence-") for item in argv
+        )
+        if (mode == "stage" and tuple(argv[:2]) == ("cp", "-a")) or (
+            mode == "acquire-before" and guard_create
+        ):
+            await pause(mode)
+        result = await original_run(
+            self, argv, stdin_bytes=stdin_bytes, timeout=timeout, diagnostics=diagnostics
+        )
+        if (
+            mode == "sdk"
+            and argv[0] == "inspect"
+            and result[0] == 0
+            and str(argv[-1]).startswith("conductor-mcp-")
+            and not str(argv[-1]).startswith("conductor-mcp-fence-")
+        ):
+            # Observe the real daemon response without retaining Config.Env,
+            # which contains the deliberately secret-bearing container payload.
+            metadata = _LiveContainer.model_validate_json(result[1])
+            path = Path(os.environ["TASK8_QA_RECEIPT"]).with_name("qa-targets.jsonl")
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(metadata.model_dump_json() + "\n")
+        if mode == "acquire-after" and guard_create:
+            await pause(mode)
+        return result
+
+    DockerRunnerBackend._run_docker = run_docker
+    original_spawn = sdk_stdio._create_platform_compatible_process
+
+    async def spawn(
+        command: str,
+        args: list[str],
+        env: dict[str, str] | None = None,
+        errlog: TextIO = sys.stderr,
+        cwd: Path | str | None = None,
+    ) -> anyio.abc.Process | sdk_stdio.FallbackProcess:
+        # The SDK owns this callback signature; changing it would change the tested launch.
+        if mode == "sdk":
+            await pause("sdk")
+        return await original_spawn(command, args, env, errlog, cwd)
+
+    sdk_stdio._create_platform_compatible_process = spawn
+    original_teardown = ExecutionResolverSession.begin_teardown
+
+    def teardown(self: ExecutionResolverSession, outcome: RunOutcome, *, retain: bool) -> None:
+        original_teardown(self, outcome, retain=retain)
+        if holding:
+            notify("sealed", self.cleanup_deadline)
+
+    ExecutionResolverSession.begin_teardown = teardown
+    original_uncertain = McpRunLifecycle.mark_uncertain
+
+    def uncertain(self: McpRunLifecycle) -> None:
+        first = not self.uncertain
+        original_uncertain(self)
+        if holding and first:
+            notify("uncertain", self.deadline)
+
+    McpRunLifecycle.mark_uncertain = uncertain
+    original_dispatch = ExecutionResolverSession.record_backend_execution
+
+    def dispatch(self: ExecutionResolverSession, name: str, *, step: str | None = None) -> None:
+        original_dispatch(self, name, step=step)
+        path = Path(os.environ["TASK8_QA_RECEIPT"]).with_name("qa-dispatch.jsonl")
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "backends": sorted(self.executed_backends()),
+                        "consumers": sorted(self._file_consumers.get(name, set())),
+                    }
+                )
+                + "\n"
+            )
+
+    ExecutionResolverSession.record_backend_execution = dispatch
+    original_checkpoint = WorkflowEngine._write_checkpoint
+
+    def checkpoint(
+        self: WorkflowEngine, error: BaseException | None, trigger: CheckpointTrigger
+    ) -> Path | None:
+        path = original_checkpoint(self, error, trigger)
+        if path is not None and holding:
+            notify("checkpoint", self._execution_session.cleanup_deadline, path)
+        return path
+
+    WorkflowEngine._write_checkpoint = checkpoint
+    app()
+
+
+@pytest.mark.parametrize("winner", ["first", "second"])
+async def test_mcp_cli_atomic_guard_acquisition_between_independent_homes(
+    live_mcp: _LiveMcpCli,
+    winner: str,
+) -> None:
+    # Requirement: exactly one controller acquires the deterministic daemon guard before dispatch.
+    live_mcp.configure(resume=True)
+    first = _CliPause(live_mcp.root)
+    second = _CliPause(live_mcp.root)
+    results: dict[str, int] = {}
+    done = {"race-a": anyio.Event(), "race-b": anyio.Event()}
+
+    async def resume(home: str) -> None:
+        results[home] = await live_mcp.cli(
+            ["resume", "--from", str(live_mcp.checkpoint())], home=home
+        )
+        done[home].set()
+
+    try:
+        assert await live_mcp.cli(["run", str(live_mcp.workflow)]) == 1
+        live_mcp.hooks["race-a"] = (
+            "acquire-after" if winner == "first" else "acquire-before",
+            first.port,
+        )
+        async with anyio.create_task_group() as group:
+            group.start_soon(resume, "race-a")
+            held_a, event = await first.event()
+            assert event["event"] == live_mcp.hooks["race-a"][0]
+            if winner == "first":
+                await resume("race-b")
+                assert results["race-b"] == 1
+                guards = await live_mcp.containers()
+                held_a.sendall(b"R")
+            else:
+                live_mcp.hooks["race-b"] = ("sdk", second.port)
+                group.start_soon(resume, "race-b")
+                held_b, event = await second.event()
+                assert event["event"] == "sdk"
+                guards = await live_mcp.containers()
+                held_a.sendall(b"R")
+                # The loser must reach its terminal CLI result while the
+                # winner still holds the guard, before releasing its SDK.
+                with anyio.fail_after(30):
+                    await done["race-a"].wait()
+                assert results["race-a"] == 1
+                held_b.sendall(b"R")
+        assert len(guards) == 1
+        assert guards[0].Config.Labels["io.conductor.resource"] == "mcp-fence"
+        assert guards[0].State["Status"] == "created" and guards[0].Mounts == []
+        assert results == {
+            "race-a": 0 if winner == "first" else 1,
+            "race-b": 1 if winner == "first" else 0,
+        }
+        assert await live_mcp.containers() == []
+        (live_mcp.root / "product-race.json").write_text(
+            json.dumps({"winner": winner, "outcomes": results, "guard": guards[0].model_dump()}),
+            encoding="utf-8",
+        )
+    finally:
+        first.close()
+        second.close()
+        await live_mcp.dispose()
+
+
+async def test_mcp_cli_post_staging_sdk_spawn_rejects_lost_volume_replacement(
+    live_mcp: _LiveMcpCli,
+) -> None:
+    # Requirement: the guard has no mount; validate_started rejects an auto-created volume.
+    live_mcp.configure(mcp_only=True)
+    pause = _CliPause(live_mcp.root)
+    live_mcp.hooks["controller-a"] = ("sdk", pause.port)
+    result: list[int] = []
+
+    async def run() -> None:
+        result.append(await live_mcp.cli(["run", str(live_mcp.workflow)]))
+
+    try:
+        async with anyio.create_task_group() as group:
+            group.start_soon(run)
+            held, event = await pause.event()
+            assert event["event"] == "sdk"
+            guards = await live_mcp.containers()
+            assert len(guards) == 1 and guards[0].Mounts == []
+            assert guards[0].State["Status"] == "created"
+            rc, output, error = await _docker("volume", "inspect", live_mcp.volume)
+            assert rc == 0, error
+            original = TypeAdapter(list[_LiveVolume]).validate_json(output)[0]
+            assert original.Labels is not None
+            assert original.Labels["io.conductor.run_id"] == live_mcp.run_id
+            rc, _output, error = await _docker("volume", "rm", live_mcp.volume)
+            assert rc == 0, error
+            live_mcp.dispositions.append(
+                {
+                    "kind": "qa-loss-injection",
+                    "name": original.Name,
+                    "created": original.CreatedAt,
+                    "incarnation": original.Labels["io.conductor.incarnation"],
+                    "remove_exit": rc,
+                }
+            )
+            (live_mcp.root / "qa-loss-injection.json").write_text(
+                json.dumps(
+                    {
+                        "original": original.model_dump(),
+                        "original_remove_exit": rc,
+                        "registered_replacement_name": live_mcp.volume,
+                        "guard_id": guards[0].Id,
+                        "controller_pid": event["pid"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            held.sendall(b"R")
+        assert result == [1]
+        rc, output, error = await _docker("volume", "inspect", live_mcp.volume)
+        assert rc == 0, error
+        replacement = TypeAdapter(list[_LiveVolume]).validate_json(output)[0]
+        assert replacement.Labels is None
+        target_path = live_mcp.root / "controller-a/qa-targets.jsonl"
+        target = _LiveContainer.model_validate_json(target_path.read_text().splitlines()[0])
+        assert target.Config.Labels["io.conductor.run_id"] == live_mcp.run_id
+        assert (
+            target.Config.Labels["io.conductor.incarnation"]
+            == (original.Labels["io.conductor.incarnation"])
+        )
+        assert any(
+            mount.Type == "volume"
+            and mount.Name == replacement.Name
+            and mount.Destination == "/workspace"
+            for mount in target.Mounts
+        )
+        # Product ownership remains refused. Independent QA ownership comes
+        # from this run's exact creator ID and its observed replacement mount.
+        live_mcp.qa_replacement = (replacement, target.Id)
+        inventory = await live_mcp.containers()
+        # Validation refusal is not owner uncertainty: the SDK/target cleanup
+        # completed, so removing the verified guard is permitted.
+        assert inventory == []
+        assert (
+            await live_mcp.cli(
+                ["resume", "--from", str(live_mcp.checkpoint())], home="controller-b"
+            )
+            == 1
+        )
+        rc, output, error = await _docker("volume", "inspect", live_mcp.volume)
+        assert rc == 0, error
+        assert TypeAdapter(list[_LiveVolume]).validate_json(output)[0] == replacement
+        event_files = list((live_mcp.root / "controller-a").rglob("*.events.jsonl"))
+        events = [
+            json.loads(line) for path in event_files for line in path.read_text().splitlines()
+        ]
+        assert "mcp_completed" not in [event["type"] for event in events]
+        assert not any(
+            event["type"] == "agent_started" and event["data"]["agent_name"] == "observe"
+            for event in events
+        )
+        (live_mcp.root / "product-replacement-refusal.json").write_text(
+            json.dumps(
+                {
+                    "original": original.model_dump(),
+                    "replacement": replacement.model_dump(),
+                    "guard": guards[0].model_dump(),
+                    "replacement_creator": target.model_dump(),
+                    "outcome": "startup rejected; unverified replacement left untouched",
+                }
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        pause.close()
+        await live_mcp.dispose()
+
+
+@pytest.mark.parametrize("phase", ["stage", "sdk"])
+async def test_mcp_cli_delayed_owner_stop_uncertainty_fences_independent_resume(
+    live_mcp: _LiveMcpCli,
+    phase: str,
+) -> None:
+    # Requirement: empty MCP inventory cannot release the guard of a pending native owner.
+    live_mcp.configure()
+    pause = _CliPause(live_mcp.root)
+    web_reservation = _CliPause(live_mcp.root)
+    web_port = web_reservation.port
+    web_reservation.close()
+    live_mcp.hooks["controller-a"] = (phase, pause.port)
+    outcomes: list[int] = []
+
+    async def run() -> None:
+        outcomes.append(
+            await live_mcp.cli(
+                ["run", str(live_mcp.workflow), "--web", "--web-port", str(web_port)]
+            )
+        )
+
+    try:
+        async with anyio.create_task_group() as group:
+            group.start_soon(run)
+            held, event = await pause.event()
+            assert event["event"] == phase
+            token = (
+                live_mcp.root / "controller-a/.conductor/runs" / f"dashboard-{web_port}.token"
+            ).read_text()
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+                headers = {"Authorization": f"Bearer {token}"}
+                for action in ("stop", "kill"):
+                    response = await client.post(
+                        f"http://127.0.0.1:{web_port}/api/{action}", headers=headers, json={}
+                    )
+                    assert response.status_code == 200
+            messages: list[dict[str, JsonValue]] = []
+            while True:
+                _channel, message = await pause.event()
+                messages.append(message)
+                if message["event"] == "checkpoint":
+                    checkpoint_path = message["checkpoint"]
+                    assert isinstance(checkpoint_path, str)
+                    break
+            assert "uncertain" in [message["event"] for message in messages]
+            deadlines = {message["deadline"] for message in messages}
+            assert len(deadlines) == 1 and None not in deadlines
+            inventory = await live_mcp.containers()
+            guards = [
+                item
+                for item in inventory
+                if item.Config.Labels["io.conductor.resource"] == "mcp-fence"
+            ]
+            assert len(guards) == 1
+            assert guards[0].Mounts == [] and guards[0].State["Status"] == "created"
+            assert not any(
+                item.Config.Labels["io.conductor.resource"] == "mcp" for item in inventory
+            )
+            rc, original, error = await _docker("volume", "inspect", live_mcp.volume)
+            assert rc == 0, error
+            assert (
+                await live_mcp.cli(["resume", "--from", checkpoint_path], home="controller-b") == 1
+            )
+            after = await live_mcp.containers()
+            assert guards[0].Id in {item.Id for item in after}
+            assert not any(item.Config.Labels["io.conductor.resource"] == "mcp" for item in after)
+            rc, current, error = await _docker("volume", "inspect", live_mcp.volume)
+            assert rc == 0, error
+            assert json.loads(current) == json.loads(original)
+            (live_mcp.root / "product-delayed-refusal.json").write_text(
+                json.dumps(
+                    {
+                        "phase": phase,
+                        "guard": guards[0].model_dump(),
+                        "volume": json.loads(original),
+                        "events": messages,
+                        "controller_b_exit": 1,
+                        "controller_a_pending_at_refusal": not outcomes,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            assert not outcomes
+            held.sendall(b"R")
+        assert outcomes == [1]
+    finally:
+        pause.close()
+        await live_mcp.dispose()
+
+
+@pytest.mark.parametrize("ownership", ["matching", "mismatched"])
+async def test_mcp_cli_orphan_refusal_preserves_exact_existing_container(
+    live_mcp: _LiveMcpCli,
+    ownership: str,
+) -> None:
+    # Requirement: surviving MCP containers refuse attach, including unverified ownership.
+    live_mcp.configure(resume=True)
+    orphan_id: str | None = None
+    orphan_labels: dict[str, str] = {}
+    try:
+        assert await live_mcp.cli(["run", str(live_mcp.workflow)]) == 1
+        rc, output, error = await _docker("volume", "inspect", live_mcp.volume)
+        assert rc == 0, error
+        volume = TypeAdapter(list[_LiveVolume]).validate_json(output)[0]
+        assert volume.Labels is not None
+        orphan_labels = {
+            key: value for key, value in volume.Labels.items() if key != "io.conductor.retention"
+        } | {"io.conductor.resource": "mcp"}
+        if ownership == "mismatched":
+            orphan_labels["io.conductor.incarnation"] = "qa-different-incarnation"
+        name = f"conductor-mcp-{live_mcp.run_id[:8]}-{uuid4().hex}"
+        argv = ["create", "--name", name]
+        for key, value in orphan_labels.items():
+            argv.extend(("--label", f"{key}={value}"))
+        rc, output, error = await _docker(
+            *argv, "--entrypoint", "/qa-orphan-never-started", live_mcp.image
+        )
+        assert rc == 0, error
+        orphan_id = output.strip()
+        assert len(orphan_id) == 64
+        before = await live_mcp.read_volume("/workspace/peer-history.jsonl")
+        assert (
+            await live_mcp.cli(
+                ["resume", "--from", str(live_mcp.checkpoint())], home="controller-b"
+            )
+            == 1
+        )
+        rc, output, error = await _docker("inspect", orphan_id)
+        assert rc == 0, error
+        orphan = TypeAdapter(list[_LiveContainer]).validate_json(output)[0]
+        assert orphan.Id == orphan_id and orphan.Config.Labels == orphan_labels
+        assert orphan.State["Status"] == "created" and orphan.Mounts == []
+        assert await live_mcp.read_volume("/workspace/peer-history.jsonl") == before
+        (live_mcp.root / "product-orphan-refusal.json").write_text(
+            json.dumps(
+                {
+                    "orphan": orphan.model_dump(),
+                    "controller_b_exit": 1,
+                    "ownership": ownership,
+                    "volume": volume.model_dump(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        # Separate QA disposal: both CLI calls have joined. This fixture-created
+        # container is not adopted by product cleanup, even in the mismatch row.
+        if orphan_id is not None:
+            rc, output, error = await _docker("inspect", orphan_id)
+            assert rc == 0, error
+            orphan = TypeAdapter(list[_LiveContainer]).validate_json(output)[0]
+            assert orphan.Id == orphan_id and orphan.Config.Labels == orphan_labels
+            rc, _output, error = await _docker("rm", orphan_id)
+            assert rc == 0, error
+            live_mcp.dispositions.append({"kind": "qa-orphan", "id": orphan_id, "remove_exit": rc})
+        await live_mcp.dispose()
+
+
+@pytest.mark.parametrize("mode", ["startup-secret", "call-secret"])
+async def test_mcp_cli_secret_failure_is_visible_without_payload(
+    live_mcp: _LiveMcpCli,
+    mode: str,
+) -> None:
+    # Requirement: actual startup/call stderr is suppressed in console, events and diagnostics.
+    live_mcp.configure(mode)
+    try:
+        assert await live_mcp.cli(["run", str(live_mcp.workflow)]) == 1
+        history = [
+            json.loads(line)
+            for line in (await live_mcp.read_volume("/workspace/peer-history.jsonl")).splitlines()
+        ]
+        expected = "startup-stderr-emitted" if mode == "startup-secret" else "call-stderr-emitted"
+        assert [entry["event"] for entry in history].count(expected) == 1
+        assert [entry["event"] for entry in history].count("initialize") == 1
+        assert [entry["event"] for entry in history].count("call") == (
+            0 if mode == "startup-secret" else 1
+        )
+        console = (live_mcp.root / "cli-0.stdout").read_text() + (
+            live_mcp.root / "cli-0.stderr"
+        ).read_text()
+        assert "failed" in console.lower() or "error" in console.lower()
+        for path in live_mcp.root.rglob("*"):
+            if path.is_file():
+                assert b"task8-private-canary-94623" not in path.read_bytes(), str(path)
+        inventory = await live_mcp.containers()
+        if mode == "startup-secret":
+            assert len(inventory) == 1
+            assert inventory[0].Config.Labels["io.conductor.resource"] == "mcp-fence"
+            assert inventory[0].Mounts == [] and inventory[0].State["Status"] == "created"
+        else:
+            assert inventory == []
+        (live_mcp.root / "product-refusal.json").write_text(
+            json.dumps(
+                {
+                    "containers": [item.model_dump() for item in inventory],
+                    "retained_volume": live_mcp.volume,
+                }
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        await live_mcp.dispose()
+
+
+@pytest.mark.parametrize("mode", ["is-error", "transport", "timeout", "uncooperative"])
+async def test_mcp_cli_is_error_transport_timeout_and_uncooperative_cleanup(
+    live_mcp: _LiveMcpCli,
+    mode: str,
+) -> None:
+    # Requirement: is_error reuses the peer; failing exchanges have no automatic retry.
+    live_mcp.configure(mode)
+    try:
+        assert await live_mcp.cli(["run", str(live_mcp.workflow)]) == (
+            0 if mode == "is-error" else 1
+        )
+        history = [
+            json.loads(line)
+            for line in (await live_mcp.read_volume("/workspace/peer-history.jsonl")).splitlines()
+        ]
+        calls = [entry for entry in history if entry["event"] == "call"]
+        assert len(calls) == (2 if mode == "is-error" else 1)
+        assert len({entry["container"] for entry in calls}) == 1
+        inventory = await live_mcp.containers()
+        assert inventory == []
+        (live_mcp.root / "product-cleanup.json").write_text(
+            json.dumps(
+                {
+                    "containers": [item.model_dump() for item in inventory],
+                    "retained_volume": live_mcp.volume,
+                }
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        await live_mcp.dispose()
+
+
+async def test_mcp_only_start_failure_history_marker_loss_and_resume_refusal(
+    live_mcp: _LiveMcpCli,
+) -> None:
+    # Requirement: initialize alone records Docker history; marker loss never restages mutations.
+    live_mcp.configure("startup-secret", mcp_only=True)
+    live_mcp.hooks["controller-a"] = ("observe", 0)
+    try:
+        assert await live_mcp.cli(["run", str(live_mcp.workflow)]) == 1
+        checkpoint_path = next(
+            path
+            for path in (live_mcp.root / "controller-a").rglob("*.json")
+            if json.loads(path.read_text()).get("current_agent") == "first"
+        )
+        checkpoint = CheckpointManager.load_checkpoint(checkpoint_path)
+        assert checkpoint.workspace is not None
+        assert checkpoint.workspace["executed_backends"] == ["docker"]
+        assert checkpoint.context["execution_history"] == []
+        dispatches = [
+            json.loads(line)
+            for line in (live_mcp.root / "controller-a/qa-dispatch.jsonl").read_text().splitlines()
+        ]
+        assert dispatches[-1] == {"backends": ["docker"], "consumers": ["first"]}
+        assert await live_mcp.read_volume("/workspace/initialize-mutated.txt") == (
+            "initialize-mutated\n"
+        )
+        before = await live_mcp.read_volume("/workspace/peer-history.jsonl")
+        original_guard = await live_mcp.containers()
+        assert len(original_guard) == 1
+        assert original_guard[0].Config.Labels["io.conductor.resource"] == "mcp-fence"
+        assert original_guard[0].Mounts == [] and original_guard[0].State["Status"] == "created"
+        await live_mcp.volume_command(("rm", "/workspace/.conductor-staged"))
+        assert (
+            await live_mcp.cli(["resume", "--from", str(checkpoint_path)], home="controller-b") == 1
+        )
+        assert await live_mcp.read_volume("/workspace/peer-history.jsonl") == before
+        assert await live_mcp.read_volume("/workspace/initialize-mutated.txt") == (
+            "initialize-mutated\n"
+        )
+        inventory = await live_mcp.containers()
+        # This follows the product resume attempt, not the QA marker removal:
+        # resume must neither restage the bundle nor republish its marker.
+        await live_mcp.volume_command(("sh", "-c", "test ! -e /workspace/.conductor-staged"))
+        assert [(item.Id, item.Config.Labels) for item in inventory] == [
+            (original_guard[0].Id, original_guard[0].Config.Labels)
+        ]
+        (live_mcp.root / "product-refusal.json").write_text(
+            json.dumps(
+                {
+                    "history": checkpoint.workspace,
+                    "guard": [item.model_dump() for item in inventory],
+                    "retained_volume": live_mcp.volume,
+                }
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        await live_mcp.dispose()

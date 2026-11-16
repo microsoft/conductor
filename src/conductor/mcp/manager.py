@@ -29,11 +29,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import anyio
+from pydantic import ValidationError as ProtocolValidationError
+
 from conductor import redaction
 from conductor.config.schema import ToolOutputConfig
 from conductor.execution.errors import ExecutionSpecError
 from conductor.execution.local_windows_launch import merge_windows_environment
 from conductor.execution.types import ManagedWorkspaceContext, ProcessLaunchSpec
+from conductor.mcp.diagnostics import (
+    SAFE_TRANSPORT_DIAGNOSTICS,
+    install_safe_record_factory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,10 @@ _CLEANUP_TIMEOUT_SECONDS = 30.0
 _PENDING_LIFECYCLES: set[asyncio.Task[None]] = set()
 
 
+class McpTransportError(RuntimeError):
+    """The tool exchange lost its transport, independently of response processing."""
+
+
 @dataclass
 class _ConnectionOwner:
     """Retain an attempted connection and its cleanup outcome, independently of pools."""
@@ -65,6 +76,7 @@ class _ConnectionOwner:
     name: str
     stop: asyncio.Event
     redact_errors: bool
+    safe_transport_diagnostics: bool = False
     stack: AsyncExitStack = field(default_factory=AsyncExitStack)
     resources: list[Any] = field(default_factory=list)
     deadline: float | None = None
@@ -178,6 +190,8 @@ class MCPManager:
         if not MCP_SDK_AVAILABLE:
             raise ImportError("MCP SDK not installed. Install with: uv add 'mcp>=1.0.0'")
 
+        install_safe_record_factory()
+        self._safe_transport_diagnostics: dict[str, bool] = {}
         self.sessions: dict[str, Any] = {}
         self.tools: dict[str, list[dict[str, Any]]] = {}  # server -> tools
         self.tool_to_server: dict[str, str] = {}  # prefixed_name -> server
@@ -237,6 +251,8 @@ class MCPManager:
         timeout: int | None = None,
         cwd: str | None = None,
         redact_errors: bool = False,
+        *,
+        safe_transport_diagnostics: bool = False,
     ) -> list[dict[str, Any]]:
         """Connect to an MCP server and return its tools.
 
@@ -252,6 +268,7 @@ class MCPManager:
             cwd: Working directory for the spawned server process. When None,
                 the server inherits the conductor process's current working
                 directory (pre-pool legacy behavior).
+            safe_transport_diagnostics: Suppress Docker stderr and SDK payload diagnostics.
             redact_errors: When True, a connection failure is logged with
                 safe metadata only (server name; no exception text or
                 traceback — the exception a stdio failure carries can embed
@@ -285,7 +302,7 @@ class MCPManager:
         if self._strict_closed:
             raise RuntimeError("MCP manager has been strictly closed")
 
-        if self._managed_workspace is None:
+        if self._managed_workspace is None and not safe_transport_diagnostics:
             logger.info(
                 "Connecting to MCP server '%s': %s %s",
                 name,
@@ -305,11 +322,18 @@ class MCPManager:
 
         ready: asyncio.Future[list[dict[str, Any]]] = asyncio.get_running_loop().create_future()
         stop = asyncio.Event()
-        owner = _ConnectionOwner(name=name, stop=stop, redact_errors=redact_errors)
+        owner = _ConnectionOwner(
+            name=name,
+            stop=stop,
+            redact_errors=redact_errors,
+            safe_transport_diagnostics=safe_transport_diagnostics,
+        )
+        self._safe_transport_diagnostics[name] = safe_transport_diagnostics
         registered = asyncio.Event()
 
         async def own_connection_lifecycle() -> None:
             await registered.wait()
+            token = SAFE_TRANSPORT_DIAGNOSTICS.set(owner.safe_transport_diagnostics)
             try:
                 async with owner.stack as stack:
                     try:
@@ -361,7 +385,13 @@ class MCPManager:
                                 env=dict(launch.env),
                                 cwd=launch.working_dir,
                             )
-                        transport_context = open_stdio(params)
+                        if owner.safe_transport_diagnostics:
+                            sink = stack.enter_context(
+                                os.fdopen(os.open(os.devnull, os.O_WRONLY), "w", encoding="utf-8")
+                            )
+                            transport_context = open_stdio(params, errlog=sink)
+                        else:
+                            transport_context = open_stdio(params)
                         owner.resources.append(transport_context)
                         transport = await stack.enter_async_context(transport_context)
                         owner.resources.append(transport)
@@ -439,6 +469,7 @@ class MCPManager:
                     raise owner.primary_error
             finally:
                 owner.finished_at = asyncio.get_running_loop().time()
+                SAFE_TRANSPORT_DIAGNOSTICS.reset(token)
 
         task = asyncio.create_task(
             own_connection_lifecycle(),
@@ -488,7 +519,9 @@ class MCPManager:
         except Exception as exc:
             self._begin_cleanup(owner)
             await self._join_owners([task])
-            if redact_errors:
+            if safe_transport_diagnostics:
+                logger.error("Docker MCP startup failed; stderr suppressed for secrets")
+            elif redact_errors:
                 logger.error(
                     "Failed to connect to MCP server '%s' "
                     "(details redacted; see the MCP step diagnostic file)",
@@ -502,10 +535,17 @@ class MCPManager:
                     )
                 else:
                     logger.error("Failed to connect to MCP server '%s': %s", name, scrubbed_exc)
+            if safe_transport_diagnostics:
+                raise RuntimeError(
+                    f"Docker MCP startup failed for server '{name}'; stderr suppressed for secrets"
+                ) from None
             raise RuntimeError(
                 f"Failed to connect to MCP server '{name}': {_scrub_log_value(str(exc))}"
             ) from exc
 
+        if safe_transport_diagnostics:
+            logger.info("Connected to Docker MCP server '%s'", name)
+            return tools
         logger.info(
             f"Connected to MCP server '{name}' with {len(tools)} tools: "
             f"{[tool['original_name'] for tool in tools]}"
@@ -682,12 +722,46 @@ class MCPManager:
         if not session:
             raise RuntimeError(f"No session for server: {server_name}")
 
+        safe = self._safe_transport_diagnostics.get(server_name, False)
+        token = SAFE_TRANSPORT_DIAGNOSTICS.set(safe)
+        from mcp import McpError
+        from mcp.types import CONNECTION_CLOSED
+
         try:
             result = await session.call_tool(tool_name, arguments=arguments)
+        except (
+            anyio.EndOfStream,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+            ConnectionError,
+        ) as error:
+            if safe:
+                raise McpTransportError(
+                    f"Docker MCP tool transport failed for server '{server_name}'; "
+                    "stderr suppressed for secrets"
+                ) from None
+            raise McpTransportError(
+                f"MCP tool call failed: {tool_name}: {_scrub_log_value(str(error))}"
+            ) from error
+        except McpError as error:
+            if error.error.code != CONNECTION_CLOSED:
+                raise
+            raise McpTransportError(
+                f"MCP tool transport closed for server '{server_name}'"
+            ) from None
+        except (TimeoutError, ProtocolValidationError):
+            raise
         except Exception as e:
+            if safe:
+                raise RuntimeError(
+                    f"Docker MCP tool call failed for server '{server_name}'; "
+                    "stderr suppressed for secrets"
+                ) from None
             raise RuntimeError(
                 f"MCP tool call failed: {tool_name}: {_scrub_log_value(str(e))}"
             ) from e
+        finally:
+            SAFE_TRANSPORT_DIAGNOSTICS.reset(token)
 
         content: list[dict[str, Any]] = []
         for block in result.content or []:

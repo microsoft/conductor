@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -46,7 +48,7 @@ def _record(log_path: Path, argv: list[str], stdin: bytes) -> None:
         "env": dict(os.environ),
         "stdin": stdin.decode("utf-8", errors="replace"),
     }
-    if argv and argv[0] == "create" and "--env-file" in argv:
+    if argv and argv[0] in {"create", "run"} and "--env-file" in argv:
         path = _option(argv, "--env-file")
         assert path is not None
         record["env_file_content"] = Path(path).read_text(encoding="utf-8")
@@ -93,20 +95,35 @@ def main() -> int:
     _record(log_path, argv, stdin)
     state = _load(state_path)
     scenario = os.environ.get("FAKE_DOCKER_SCENARIO", "")
+    if argv == ["fake-daemon-commit"]:
+        pending = state.pop("pending_mcp", {})
+        assert not (pending.keys() & state["containers"].keys())
+        state["containers"].update(pending)
+        _save(state_path, state)
+        return 0
 
     delay_command = os.environ.get("FAKE_DOCKER_DELAY_COMMAND")
     if delay_command and delay_command in " ".join(argv):
         marker = os.environ.get("FAKE_DOCKER_DELAY_MARKER")
         if marker:
             Path(marker).write_text("started", encoding="utf-8")
-        time.sleep(float(os.environ.get("FAKE_DOCKER_DELAY", "30")))
+        ready_port = os.environ.get("FAKE_DOCKER_DELAY_READY_PORT")
+        if ready_port:
+            with socket.create_connection(("127.0.0.1", int(ready_port)), timeout=10) as ready:
+                ready.sendall(f"{os.getpid()} {argv[-1]}\n".encode())
+                ready.recv(1)
+        else:
+            time.sleep(float(os.environ.get("FAKE_DOCKER_DELAY", "30")))
 
     if argv[:2] == ["image", "inspect"]:
-        if scenario == "pull" or scenario == "pullfail":
+        if scenario in {"pull", "pullfail", "attach-pull-error"}:
             return 1
         print("{}")
         return 0
     if argv and argv[0] == "pull":
+        if scenario == "attach-pull-error":
+            print("pull denied: SECRET_DAEMON_VALUE", file=sys.stderr)
+            return 1
         if scenario == "pullfail":
             print("registry unavailable", file=sys.stderr)
             return 1
@@ -120,6 +137,9 @@ def main() -> int:
         print(name)
         return 0
     if argv[:2] == ["volume", "inspect"]:
+        if scenario == "attach-volume-error":
+            print("volume inspection denied: SECRET_DAEMON_VALUE", file=sys.stderr)
+            return 1
         if scenario == "inspect-error":
             print("Cannot connect to the Docker daemon", file=sys.stderr)
             return 1
@@ -142,13 +162,20 @@ def main() -> int:
     if argv[:3] == ["volume", "rm", "-f"]:
         state["volumes"].pop(argv[-1], None)
         _save(state_path, state)
+        if scenario == "volume-removal-committed-unconfirmed":
+            # Adversarial unknown-commit model, not evidence from a live Docker daemon.
+            print("removal response lost: SECRET_DAEMON_VALUE", file=sys.stderr)
+            return 1
         return 0
-    if argv and argv[0] == "create":
+    if argv and argv[0] in {"create", "run"}:
         if scenario == "createfail":
             print("create failed", file=sys.stderr)
             return 1
         name = _option(argv, "--name")
         assert name is not None
+        if name in state["containers"]:
+            print("container name already in use", file=sys.stderr)
+            return 1
         mount = next(
             (
                 argv[index + 1]
@@ -157,14 +184,24 @@ def main() -> int:
             ),
             None,
         )
-        state["containers"][name] = {
+        identifier = uuid4().hex + uuid4().hex
+        destination = (
+            state.setdefault("pending_mcp", {})
+            if scenario == "delayed-daemon" and _labels(argv).get("io.conductor.resource") == "mcp"
+            else state["containers"]
+        )
+        destination[name] = {
+            "Id": identifier,
             "Name": f"/{name}",
             "Volume": mount.rsplit(":", 1)[0] if mount else None,
             "Config": {"Labels": _labels(argv)},
-            "State": {"ExitCode": int(os.environ.get("FAKE_DOCKER_EXIT_CODE", "0"))},
+            "State": {
+                "ExitCode": int(os.environ.get("FAKE_DOCKER_EXIT_CODE", "0")),
+                "Status": "created" if argv[0] == "create" else "running",
+            },
         }
         _save(state_path, state)
-        print(f"cid-{name}")
+        print(identifier)
         return 0
     if argv and argv[0] == "cp":
         if scenario == "cpfail":
@@ -174,6 +211,16 @@ def main() -> int:
         # (docker cp <scratch>:/workspace/.conductor-staged) sees what was staged.
         marker_path = ":/workspace/.conductor-staged"
         markers = state.setdefault("markers", {})
+        workspace_root = os.environ.get("FAKE_DOCKER_WORKSPACE_ROOT")
+        if workspace_root and argv[-2].endswith("/."):
+            name = argv[-1].split(":", 1)[0]
+            volume = state["containers"][name]["Volume"]
+            shutil.copytree(
+                argv[-2][:-2],
+                Path(workspace_root) / volume,
+                dirs_exist_ok=True,
+                symlinks=True,
+            )
         if argv[-1].endswith(marker_path):
             container = state["containers"].get(argv[-1][: -len(marker_path)], {})
             if container.get("Volume"):
@@ -270,9 +317,28 @@ def main() -> int:
         return 0
     if argv and argv[0] == "inspect":
         name = argv[-1]
-        data = state["containers"].get(name)
+        data = next(
+            (
+                item
+                for key, item in state["containers"].items()
+                if key == name or item.get("Id") == name
+            ),
+            None,
+        )
         if data is None:
-            print("no such container", file=sys.stderr)
+            print(f"no such container: {name}", file=sys.stderr)
+            return 1
+        if (
+            scenario == "guard-inspect-fails"
+            and data["Config"]["Labels"].get("io.conductor.resource") == "mcp-fence"
+        ):
+            print("guard inspection denied: SECRET_DAEMON_VALUE", file=sys.stderr)
+            return 1
+        if (
+            scenario == "mcp-inspect-fails"
+            and data["Config"]["Labels"].get("io.conductor.resource") == "mcp"
+        ):
+            print("inspection denied: SECRET_DAEMON_VALUE", file=sys.stderr)
             return 1
         if "{{json .State}}" in argv:
             print(json.dumps(data["State"]))
@@ -282,8 +348,17 @@ def main() -> int:
             print(json.dumps(data))
         return 0
     if argv[:2] == ["ps", "-aq"]:
-        for name in state["containers"]:
-            print(name)
+        if scenario == "mcp-inventory-fails":
+            print("inventory denied: SECRET_DAEMON_VALUE", file=sys.stderr)
+            return 1
+        requested = dict(
+            argv[i + 1].removeprefix("label=").split("=", 1)
+            for i, flag in enumerate(argv[:-1])
+            if flag == "--filter"
+        )
+        for name, data in state["containers"].items():
+            if all(data["Config"]["Labels"].get(k) == v for k, v in requested.items()):
+                print(data["Id"] if "--no-trunc" in argv else name)
         return 0
     if argv and argv[0] == "kill":
         if scenario == "termination-fails":
@@ -294,7 +369,37 @@ def main() -> int:
         if scenario == "termination-fails":
             print("remove denied", file=sys.stderr)
             return 1
-        state["containers"].pop(argv[-1], None)
+        name = next(
+            (
+                key
+                for key, item in state["containers"].items()
+                if key == argv[-1] or item.get("Id") == argv[-1]
+            ),
+            argv[-1],
+        )
+        if (
+            scenario == "guard-removal-fails"
+            and state["containers"]
+            .get(name, {})
+            .get("Config", {})
+            .get("Labels", {})
+            .get("io.conductor.resource")
+            == "mcp-fence"
+        ):
+            print("guard removal denied: SECRET_DAEMON_VALUE", file=sys.stderr)
+            return 1
+        if (
+            scenario == "mcp-removal-fails"
+            and state["containers"]
+            .get(name, {})
+            .get("Config", {})
+            .get("Labels", {})
+            .get("io.conductor.resource")
+            == "mcp"
+        ):
+            print("removal denied: SECRET_DAEMON_VALUE", file=sys.stderr)
+            return 1
+        state["containers"].pop(name, None)
         _save(state_path, state)
         return 0
     print(f"unsupported fake docker argv: {argv}", file=sys.stderr)

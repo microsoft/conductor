@@ -39,6 +39,8 @@ from conductor.execution import (
     RunSpec,
     WorkspaceLease,
 )
+from conductor.execution import errors as execution_errors
+from conductor.execution.types import McpServerSpec, McpStdioTarget
 
 
 class RecordingBackend:
@@ -55,6 +57,11 @@ class RecordingBackend:
             shared_workspace=True,
             snapshots=False,
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        raise execution_errors.ExecutionSpecError("Test backend does not support direct stdio")
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         self.prepare_calls.append(run)

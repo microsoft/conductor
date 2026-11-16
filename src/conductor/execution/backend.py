@@ -3,8 +3,8 @@
 The protocol exposes typed command and agent operations
 (:meth:`RunnerBackend.run_command` and :meth:`RunnerBackend.run_agent`) plus
 the run-scoped lease lifecycle that the workflow engine drives. Agent calls
-return a complete result or propagate cancellation after teardown; separate
-``open_mcp`` and ``cancel`` operations are not part of this contract.
+return a complete result or propagate cancellation after teardown. Direct stdio
+servers use an owned launcher target without importing a client SDK.
 
 Like the contract types, this module imports nothing from Conductor.
 """
@@ -21,6 +21,8 @@ from conductor.execution.types import (
     AgentSpec,
     CommandResult,
     CommandSpec,
+    McpServerSpec,
+    McpStdioTarget,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
@@ -62,6 +64,12 @@ class RunnerBackend(Protocol):
         Returns:
             An opaque, backend-owned workspace lease.
         """
+        ...
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        """Prepare one stdio launch; unsupported backends refuse without spawning."""
         ...
 
     async def run_command(
@@ -135,8 +143,8 @@ class RunnerBackend(Protocol):
     ) -> WorkspaceLease:
         """Verify a retained workspace and return its process-local lease.
 
-        This operation checks existence, labels, and incarnation only. It must not
-        create, stage, delete, or replace any resource.
+        Verify existing workspace labels and incarnation without staging or
+        replacing it. A fenced run first acquires its independent daemon guard.
         """
         ...
 
