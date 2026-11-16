@@ -113,8 +113,12 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
 - The bundle is staged with `docker cp -a` under the scratch container's resolved `--user`
   (`_STAGING_COPY_MODE = "archive-to-container-user"`); plain `cp` left uid 65532 unable to
   write. Change this only with a new real-daemon spike.
-- Finalization is fail-closed: only verified resources are deliberately removed, and
-  unconfirmed cleanup produces a warning. For fenced or uncertain MCP leases, the warning
+- Resource verification refuses removal when required labels or names don't match.
+  Without fence intent, inventory or individual cleanup failures warn and may still be
+  followed by volume finalization; Docker refuses removal of a volume in use. Ordinary
+  cleanup is shielded and re-raises an absorbed cancellation after draining. For fenced
+  leases, the stronger owner and inventory barrier below applies. For fenced or uncertain
+  MCP leases, the warning
   requires terminal original controllers and owners, followed by independent ownership and
   immutable-ID verification; it doesn't suggest a run-wide deletion command.
 - Retained volumes use marker protocol v2: publish `.conductor-staged` with the bundle digest
@@ -137,18 +141,27 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   and incarnation, and mapped cwd. It serializes by server name and has a soft 16-entry
   threshold. Only a classified tool transport failure invalidates its entry; timeout, output
   validation, cancellation, and `is_error` don't themselves invalidate it or trigger a retry.
-- `RunSpec.mcp_fence_execution` is internal intent derived before lease preparation, not a
-  workflow field or a `WorkspaceIdentity` or checkpoint schema change. `prepare_run` and
+- `RunSpec.mcp_fence_execution` is internal intent derived from direct Docker MCP steps in
+  the compiled root and collected child closure before lease preparation, not a workflow
+  field or a `WorkspaceIdentity` or checkpoint schema change. It guards the common Docker
+  lease, including mixed script and agent work, without changing non-fenced runs.
+  `prepare_run` and
   `attach_run` acquire the same deterministic, never-started daemon guard before workspace
   verification or staging. The guard has an owner token, contains no MCP payload, and doesn't
-  mount the volume. Failed or uncertain image, guard, volume, and inventory checks refuse fenced
+  mount the volume. This is cooperative daemon-scoped admission, not a volume lock or
+  exclusion of arbitrary Docker clients. Failed or uncertain image, guard, volume, and inventory checks refuse fenced
   attachment; an empty MCP inventory isn't a release proof.
 - `src/conductor/engine/mcp_lifecycle.py` retains preparation attempts and all MCP entries across
   eviction and cancellation. Root teardown seals admission and shares one absolute deadline
-  with staging and SDK/target cleanup. `src/conductor/execution/docker_mcp.py::ContainerOwner`
+  with staging and SDK/target cleanup. `src/conductor/engine/mcp_entry.py::McpStepEntry`
+  closes the SDK manager's spawn/connection owners before its Docker target; SDK closure
+  alone isn't daemon release proof. Cleanup absorbs racing cancellation while observing
+  owners and re-raises it when cleanup is confirmed; uncertainty remains a failure and
+  never renews the deadline. `src/conductor/execution/docker_mcp.py::ContainerOwner`
   verifies ownership and immutable IDs. Only after all required proofs and finalization may the
-  owning lease release its guard. Unconfirmed owner cleanup or inventory blocks workspace and
-  guard removal; late completion doesn't clear that uncertainty. The finalizer skips volume
+  original owning lease release its guard last. Unconfirmed owner cleanup or inventory before
+  a volume removal request blocks that request and guard release; late completion doesn't
+  clear that uncertainty. The finalizer skips volume
   removal with `retain=True`; with `retain=False`, it can remove the verified volume before
   releasing the guard. Once removal has been requested, an unconfirmed response doesn't prove
   the resource remains. In particular, a guard release can fail after an ephemeral volume was
@@ -199,8 +212,10 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   execute bridge starts. A checkpoint must retain that history even when the agent
   fails, so resume refuses a missing staging marker instead of overwriting its workspace.
 - `src/conductor/engine/workspace_claim.py::WorkspaceClaim` fences concurrent resume on the
-  local machine. Its advisory lock serializes acquisition and token-checked release; Windows
-  locking covers the same fixed one-byte range on both operations.
+  local machine within the same `CONDUCTOR_HOME`. Its advisory lock serializes acquisition
+  and token-checked release; Windows locking covers the same fixed one-byte range on both
+  operations. It isn't a distributed daemon lock. Ordinary Docker attachment inventories
+  execution and MCP containers, not all runners or scratch containers.
 - An injected `(secret_cache, redactor)` pair must belong together (the cache's redactor); a
   mismatched pair is rejected at construction.
 
@@ -397,9 +412,13 @@ reusing a dead handle; shielding finalize keeps a racing cancellation from leaki
 volumes. Tests: `tests/test_execution/test_resolver.py`,
 `tests/test_execution/test_engine_integration.py`.
 
-**Fail-closed Docker cleanup.** Removing by label alone could delete another run's or a user's
-resources. Direct MCP targets and guards require ownership and immutable-ID proof. Unconfirmed
-owner cleanup blocks workspace removal rather than suggesting a broad deletion command.
+**Docker cleanup proofs.** Removing by label alone could delete another run's or a user's
+resources. Per-resource metadata verification refuses an unverifiable resource; ordinary
+cleanup warnings don't establish an all-owner barrier. Fenced leases additionally require
+SDK-owner, target, staging and inventory proof before requesting volume removal, and release
+the original owner's guard last by immutable ID. A failed response after a removal request
+doesn't prove the volume remains. See
+[operator recovery](../design/docker-backend.md#orphaned-resource-cleanup).
 
 **Content zone (#527).** Keeping provenance out of the digest makes cache reuse depend only on
 content. Writing the sentinel last and renaming atomically means a reader that sees

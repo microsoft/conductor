@@ -257,6 +257,7 @@ All Docker resources created by Conductor use predictable naming patterns and me
 * **Named volume**: `conductor-ws-<run_id>`
 * **Execution container**: `conductor-<run_id[:8]>-<sha1(step name or command)[:8]>-<attempt>`
 * **Scratch container**: `conductor-stage-<run_id[:8]>-<uuid6>`
+* **Agent runner container**: `conductor-<run_id[:8]>-runner-<uuid8>`
 * **Direct MCP container**: `conductor-mcp-<run_id[:8]>-<uuid>`
 * **MCP fence**: `conductor-mcp-fence-<sha256(volume name)[:24]>`
 
@@ -280,22 +281,35 @@ payload, doesn't mount the workspace, and is never started.
 
 ### Direct MCP fence and cleanup
 
-When a run includes a Docker direct MCP step, the backend ensures the selected
-image is available, then atomically acquires a stopped guard with the
+Before lease preparation, Conductor derives fence intent from direct Docker
+MCP steps in the compiled root and collected child workflow closure. The
+guard covers the common Docker lease, including script and agent work in
+that run; runs without that intent keep their existing lifecycle.
+The backend ensures the selected image is available, then atomically
+acquires a stopped guard with the
 deterministic fence name. Preparation and retained-workspace attachment use
 the same name before volume verification or staging. A conflicting,
 unverifiable, or foreign guard isn't adopted or removed. A fenced attachment
 can fail while checking the image, guard, volume, or existing container
 inventory; an empty MCP inventory alone doesn't prove the workspace is safe.
 
-The root owns preparation, staging, SDK connections, and targets through
-cleanup, including partial startup and cancellation. It seals admission,
-closes each SDK owner and target, and waits for all entries and staging
-operations within the shared cleanup deadline. The backend releases its
+This is cooperative admission on the selected Docker daemon, using its
+container-name uniqueness. The guard doesn't lock the volume or exclude
+arbitrary Docker clients. The separate local workspace claim is scoped to
+`CONDUCTOR_HOME`; it isn't a distributed daemon lock.
+
+The root retains preparation attempts, staging, SDK connection owners, and
+Docker targets through cleanup, including partial startup and cancellation.
+SDK ownership covers the CLI spawn and connection lifetime; target ownership
+separately proves daemon container identity and removal. The root seals
+admission, closes the SDK manager before its target, and joins the required
+owners and staging operations within the original absolute cleanup deadline.
+Cancellation doesn't renew that deadline, and late completion doesn't clear
+latched uncertainty. The backend releases its
 guard by verified immutable container ID and owner token only after that
 proof and resource finalization. Unconfirmed owner cleanup or inventory
-blocks workspace removal and leaves the guard in place, so a later attachment
-is refused even if no MCP container is listed. A late acquisition after
+before a volume removal request blocks that request and guard release, so a
+later attachment is refused even if no MCP container is listed. A late acquisition after
 admission is sealed can't begin workspace work.
 
 When the finalizer receives `retain=True`, it doesn't request volume removal.
@@ -314,25 +328,92 @@ schema. There is no automatic force recovery.
 
 When a workflow run concludes (whether successfully, on failure, or upon cancellation):
 
-1. The engine closes direct MCP owners and targets before Docker finalization.
+1. For a fenced lease, the engine requires the SDK-owner, target, and staging
+   proofs above before Docker finalization.
 2. `DockerRunnerBackend.finalize_run()` inspects and cleans up verified lease resources.
 3. The workspace is retained or removed according to the configured policy.
 4. A fenced run releases its own verified guard last, only after the required
-   owner and staging proofs. Unconfirmed inventory or ownership blocks
-   workspace removal. The outcome of a failed removal request can be unknown.
+   proofs. Unconfirmed inventory or ownership before volume removal blocks
+   that request. The outcome of a removal request already issued can be unknown.
 
-Cleanup is fail-closed. Resource labels and names, and the immutable IDs used
-for direct MCP targets and guards, must verify before removal.
+Resource verification refuses removal of a resource whose required metadata
+doesn't match. Direct MCP targets and guards additionally use immutable IDs.
+The stronger owner and inventory barrier applies to fenced leases.
+
+Without fence intent, the existing finalizer warns on inventory or individual
+cleanup failures and may still proceed to volume finalization; Docker refuses
+removal of a volume in use. Ordinary attachment checks execution and MCP
+containers, not a complete runner or scratch inventory. Neither this
+inventory nor the local claim proves that every workspace user has finished.
+Ordinary cleanup is shielded and re-raises cancellation absorbed while
+draining; fenced cleanup retains owners under the bounded deadline above.
 
 ### Orphaned Resource Cleanup
 
 An abruptly terminated controller can leave containers, a guard, or a
-workspace volume behind. For a fenced or uncertain run, first stop the
-original controllers and independently confirm that staging, SDK, and
-native owners have all reached a terminal state. Then independently verify
-the exact resource ownership labels and immutable container IDs before any
-manual recovery. A run ID or an empty container listing isn't sufficient
-proof of ownership or completion.
+workspace volume behind. First identify the intended run. While it is live,
+`conductor status --json` exposes `running[].run_id`, alongside `workflow`,
+`pid`, and `event_log`. Match the workflow and PID rather than selecting the
+first record on a shared runner, and save the identifier and event-log path
+before the live record disappears. For an already-dead run, correlate its
+event log under `$TMPDIR/conductor/`:
+`conductor-<workflow_name>-<YYYYMMDD-HHMMSS>-<run_id>.events.jsonl`.
+A resumed controller can reuse the same run ID and event log.
+
+Use the confirmed identifier only for read-only discovery on the same Docker
+daemon/context used by that run:
+
+```bash
+: "${RUN_ID:?Set RUN_ID to the intended run identifier}"
+docker ps -a --no-trunc --filter label=io.conductor.managed=true \
+  --filter "label=io.conductor.run_id=${RUN_ID}"
+docker volume inspect "conductor-ws-${RUN_ID}"
+```
+
+The listing is a candidate inventory, not a deletion authorization. Inspect
+each candidate independently: match its full immutable container ID, exact
+name, `managed`, `run_id`, `workspace`, `resource`, and `incarnation` labels
+against the recorded lease. An attached legacy non-MCP volume can lack
+`workspace`; don't infer it or relax other identity checks. For a guard,
+also verify the original `io.conductor.owner` token. A run ID, matching name,
+or empty listing alone proves neither ownership nor completed cleanup.
+
+**Ordinary runs without fence intent:** Confirm abandonment: no original or
+resumed controller will dispatch, stage, resume, or finalize the workspace,
+and all native/staging owners have reached a terminal state. Inventory
+execution, runner, and scratch containers independently; attachment's narrower
+checks aren't sufficient. An operator can then recover only resources whose
+ownership was proved, addressing containers by verified immutable IDs and
+checking the volume separately before requesting its removal. Treat old
+run-ID cleanup advice in ordinary warnings as discovery context, not a safe
+unconditional sweep.
+
+**Fenced or uncertain runs:** Stop the original controllers and independently
+confirm terminal staging, SDK connection/spawn owners, and native owners,
+including delayed operations. SDK closure alone doesn't prove Docker target
+removal. Preserve unverifiable or foreign resources. Automatic guard release
+belongs to the original verified backend/lease; other controllers must not
+adopt or automatically remove it. Separately, after independently proving the
+original controller and all staging, SDK, and native owners terminal,
+including delayed operations, an operator may manually recover only
+independently verified owned resources using the exact recorded original
+owner token, lease incarnation, and full immutable container IDs. Recover
+the proved original guard last, after all required terminal and identity
+proofs and other resource finalization. If those proofs cannot be established,
+leave the guard in place for investigation. If removal was already
+requested, independently inspect actual resource disposition; uncertainty
+doesn't prove that the volume was retained.
+
+#### CI recovery prerequisites
+
+Record the job's matched status record, event-log path, lease incarnation,
+and resource identities before teardown. An `if: always()` cleanup step
+doesn't establish abandonment. CI may perform the read-only discovery above,
+but automated removal requires the same terminal-controller, native,
+staging, and (for fenced runs) SDK-owner proofs and per-resource identity
+checks as operator recovery. A job failure, absent PID, or empty MCP
+inventory alone doesn't supply them. Don't let generic CI cleanup remove a
+guard; preserve evidence and unresolved resources when proof is unavailable.
 
 Don't remove a guard or volume blindly, sweep resources by run ID, or use
 daemon-wide pruning as a recovery shortcut. A delayed owner can still affect

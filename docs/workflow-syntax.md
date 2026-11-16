@@ -3295,7 +3295,7 @@ session merely to resolve a remote agent's settings.
 
 The `inherit_control_environment` setting behaves differently depending on the backend:
 
-* **Local backend**: Defaults to effective `true` (subprocesses inherit the host `os.environ`).
+* **Local backend**: For script steps, defaults to effective `true` (subprocesses inherit the host `os.environ`). Local agent runtimes and direct MCP consumers use provider/SDK inheritance and explicit overrides; they don't consume this profile flag.
 * **Docker backend**: Defaults to effective `false` for the container payload. Script steps receive their declared `env` and secret deliveries; direct MCP servers receive their declared server `env` and server-scoped secret deliveries.
 * **Validation warning**: Setting `inherit_control_environment: true` on a Docker profile triggers a validation warning because it copies the full host environment into container metadata visible to Docker daemon administrators via `docker inspect`.
 
@@ -3966,14 +3966,22 @@ for paths, provider requirements, cleanup, and resume restrictions. The
 [example](../examples/local-retained-workspace.yaml) demonstrates two script
 steps using the same copied tree.
 
-For Docker direct MCP, retention applies to workspace files rather than
-preserving reusable server connections. Conductor attempts to close the
-server owners before finalizing the lease; an unconfirmed owner may still
-be running.
-If owner cleanup or inventory can't be confirmed before workspace removal,
-it leaves the workspace and guard in place and refuses attachment, even if
-no MCP container is listed. A removal request with an unconfirmed outcome
-doesn't prove that the resource still exists; inspect it independently.
+Direct Docker MCP steps in the compiled root and collected child closure
+activate a cooperative daemon guard for the common Docker lease, including
+mixed script and agent work. Runs without that fence intent keep their
+existing lifecycle. The guard doesn't lock the volume against arbitrary
+Docker clients.
+
+For a fenced lease, retention preserves workspace files, not reusable server
+connections. Conductor requires SDK-owner, Docker-target, and staging proof
+before finalizing the lease; an unconfirmed owner may still be running.
+Unconfirmed owner cleanup or inventory before a volume removal request
+blocks that request and guard release, so attachment is refused even if no
+MCP container is listed. When the workspace persistence policy retains the
+workspace, Conductor never requests volume removal. When the policy calls
+for removal, it can remove the verified volume before releasing the original
+owner's guard last. An unconfirmed response after a removal request doesn't
+prove that the resource still exists; inspect it independently.
 See the [Docker backend recovery guidance](design/docker-backend.md#orphaned-resource-cleanup).
 
 #### Sub-workflow Inheritance
