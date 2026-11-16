@@ -2290,6 +2290,15 @@ class TestAcaProtocolVersionSkewWarnings:
 class TestAcaRoutingPreferences:
     """Legacy ``provider: aca`` forwards Copilot routing preferences to its runner."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_routing_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in (
+            "COPILOT_PROVIDER_BASE_URL",
+            "COPILOT_PROVIDER_API_KEY",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
     @staticmethod
     def _provider(**defaults: str):
         from conductor.providers.aca import AcaRuntimeProvider

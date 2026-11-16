@@ -719,12 +719,13 @@ agents:
 
 ### Omission, resume and reproducibility
 
-Leaving both fields unset sends no tier. A new session then uses the runtime's
-default routing, which may depend on your user or administrator settings, and a
-resumed session keeps the tier the runtime persisted with it. Set an explicit
-Fusion tier when you want reproducible runs. An explicit tier is resent on
-resume and on interrupted-session continuation, so it overrides the persisted
-value with the same preference.
+When an agent sets neither field and no matching workflow default applies,
+Conductor sends no tier. A new session then uses the runtime's default routing,
+which may depend on your user or administrator settings, and a resumed session
+keeps the tier the runtime persisted with it. An explicit tier fixes the
+requested routing preference, not the runtime's model choices or results.
+It is resent on resume and on interrupted-session continuation, so it
+overrides the persisted value with the same preference.
 
 The deprecated HydraFusion identifiers (`model: hydrafusion`,
 `model: hydrafusion-max`, and the `auto_tier` values `balance`, `hydrafusion`

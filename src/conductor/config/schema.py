@@ -2968,7 +2968,7 @@ class RuntimeConfig(BaseModel):
 
     Copilot provider only. Applies only to agents whose effective model is
     ``auto`` and that set neither ``fusion_tier`` nor ``auto_tier``. Identifiers
-    are extensible and validated by the runtime. Mutually exclusive with
+    are extensible literals, not templates. Mutually exclusive with
     ``default_fusion_tier``.
     """
 
@@ -3123,9 +3123,11 @@ class RuntimeConfig(BaseModel):
     @field_validator("default_auto_tier")
     @classmethod
     def validate_default_auto_tier(cls, v: str | None) -> str | None:
-        """Reject a blank Auto tier identifier."""
+        """Require a nonblank literal because runtime defaults are not rendered."""
         if v is None:
             return v
+        if is_jinja_template(v):
+            raise ValueError("default_auto_tier must be a literal identifier, not a template")
         try:
             return validate_auto_tier(v, field_name="default_auto_tier")
         except RoutingPreferenceError as exc:

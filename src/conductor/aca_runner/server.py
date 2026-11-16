@@ -64,7 +64,7 @@ from conductor.providers.claude import ClaudeProvider
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.copilot_routing import (
     RoutingPreferenceError,
-    check_preference_compatibility,
+    resolve_routing_preference,
 )
 from conductor.providers.openai import OpenAIProvider
 from conductor.redaction import RunRedactor
@@ -242,10 +242,12 @@ def _check_routing_preference(request: RunnerAgentRequest) -> None:
             is_retryable=False,
         )
     try:
-        check_preference_compatibility(
+        resolve_routing_preference(
             model=agent.model,
-            fusion_tier=agent.fusion_tier,
-            auto_tier=agent.auto_tier,
+            agent_fusion_tier=agent.fusion_tier,
+            agent_auto_tier=agent.auto_tier,
+            default_fusion_tier=None,
+            default_auto_tier=None,
             subject=f"runner: agent '{agent.name}'",
         )
     except RoutingPreferenceError as exc:

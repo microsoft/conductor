@@ -124,8 +124,11 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
   selector as `AgentOutput.model` (`_attributed_model`). Their aggregate tokens MUST NOT be priced at
   the last constituent's rate, so routing selectors (`auto`, `fusion`, HydraFusion) get no provider
   price or context window; only a workflow `cost.pricing` entry prices them. Plain Auto reports the
-  concrete model when usage names exactly one. Parse-recovery calls and follow-ups merge their models
-  into the same decision; `_fusion_session_ids` keeps a follow-up on a Fusion session composite.
+  concrete model when usage names exactly one. Parse-recovery calls merge their model history into
+  the same decision. Follow-ups account only for their own calls, while `_fusion_session_ids`
+  retains the session's Fusion preference until a replacement is confirmed. Fusion
+  attribution uses the configured selector (`fusion` or `auto`); a `cost.pricing` override must
+  use that selector as its key.
 - `session.fusion_completed` aggregate counts are a fallback used only when a turn produced no
   `assistant.usage`; they cover the same calls, so adding them would double-count. Never convert
   `total_nano_aiu` into a cost. A `degraded_reason` or `session.fusion_route_failed` logs a warning.

@@ -1669,8 +1669,6 @@ class CopilotProvider(AgentProvider):
                 self._check_managed_mutations()
                 self._session_ids[agent.name] = sid
                 self._session_cwds[agent.name] = resolved_cwd
-                if routing.is_fusion:
-                    self._fusion_session_ids.add(sid)
 
             # Capture verbose state before callback (contextvars don't propagate to sync callbacks)
             from conductor.cli.app import is_full, is_verbose
@@ -1703,6 +1701,7 @@ class CopilotProvider(AgentProvider):
                     max_session_seconds=effective_max_session,
                     max_agent_iterations=effective_max_iterations,
                     agent_name=agent.name,
+                    routing_preference=routing,
                 )
                 response_content = sdk_response.content
 
@@ -1835,6 +1834,8 @@ class CopilotProvider(AgentProvider):
                             verbose_enabled,
                             full_enabled,
                             agent_name=agent.name,
+                            event_callback=event_callback,
+                            routing_preference=routing,
                         )
                         response_content = recovery_response.content
 
@@ -1951,6 +1952,7 @@ class CopilotProvider(AgentProvider):
         max_session_seconds: float | None = None,
         max_agent_iterations: int | None = None,
         agent_name: str | None = None,
+        routing_preference: RoutingPreference | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -1973,6 +1975,7 @@ class CopilotProvider(AgentProvider):
                 emitted. The Copilot provider's ``_execute_sdk_call`` always
                 passes ``agent.name`` here, so sequential agents are also
                 tagged with their plain name.
+            routing_preference: Explicitly requested tier, if any.
 
         Returns:
             SDKResponse with content and usage data. Usage is summed across
@@ -1987,6 +1990,8 @@ class CopilotProvider(AgentProvider):
         response_content = ""
         done = asyncio.Event()
         error_message: str | None = None
+        routing_error: str | None = None
+        routing_confirmation: bool | None = None
 
         # Mutable container for last activity: [event_type, tool_call, timestamp]
         # Using a list so the nested callback can mutate it
@@ -2031,7 +2036,7 @@ class CopilotProvider(AgentProvider):
         invocation = self._managed_invocation()
 
         def on_event(event: Any) -> None:
-            nonlocal response_content, error_message
+            nonlocal response_content, error_message, routing_error, routing_confirmation
             if (
                 invocation is not None
                 and not invocation.workspace.process_scopes.owners.mutations_allowed(
@@ -2063,6 +2068,23 @@ class CopilotProvider(AgentProvider):
 
             if event_type == "assistant.message":
                 response_content = event.data.content
+            elif event_type == "session.auto_tier_switch_failed":
+                routing_error = self._routing_rejection_message(event)
+                if routing_preference:
+                    done.set()
+            elif event_type in ("session.start", "session.resume", "session.model_change"):
+                model_field = (
+                    "new_model" if event_type == "session.model_change" else "selected_model"
+                )
+                selected_model = getattr(event.data, model_field, None)
+                if isinstance(selected_model, str):
+                    if is_composite_selector(selected_model):
+                        routing_confirmation = True
+                    elif selected_model.strip().lower() == "auto" and routing_preference:
+                        auto_tier = getattr(event.data, "auto_tier", None)
+                        auto_tier = getattr(auto_tier, "value", auto_tier)
+                        if auto_tier is not None and auto_tier == routing_preference.auto_tier:
+                            routing_confirmation = False
             elif event_type == "assistant.usage":
                 # Capture token usage from the assistant.usage event. One
                 # event is emitted per API call, so accumulate across calls
@@ -2111,7 +2133,7 @@ class CopilotProvider(AgentProvider):
                 ("session.fusion_", "assistant.fusion_")
             ):
                 fusion_ref[0] = True
-                self._note_fusion_event(event_type, event, agent_name, fusion_ref)
+                self._note_fusion_event(event_type, event, agent_name, fusion_ref, event_callback)
             elif event_type == "session.idle":
                 done.set()
             elif event_type == "error" or event_type == "session.error":
@@ -2188,6 +2210,16 @@ class CopilotProvider(AgentProvider):
             agent_name=agent_name,
             active_tools_ref=active_tools,
         )
+        if routing_error is not None and routing_preference:
+            raise ProviderError(routing_error, is_retryable=False)
+        sid = getattr(session, "session_id", None)
+        if isinstance(sid, str) and routing_error is None and routing_preference:
+            self._check_managed_mutations()
+            if routing_preference.is_fusion or routing_confirmation is True:
+                self._fusion_session_ids.add(sid)
+            elif routing_confirmation is False:
+                self._fusion_session_ids.discard(sid)
+        fusion_ref[0] = fusion_ref[0] or sid in self._fusion_session_ids
         aggregate = fusion_ref[1]
         if aggregate is not None and all(value is None for value in usage_ref):
             usage_ref[:] = list(aggregate)
@@ -2226,19 +2258,32 @@ class CopilotProvider(AgentProvider):
         )
 
     @staticmethod
-    def _note_fusion_event(
-        event_type: str, event: Any, agent_name: str | None, fusion_ref: list[Any]
-    ) -> None:
-        """Record Fusion aggregate usage and surface runtime-reported degradation.
+    def _routing_rejection_message(event: Any) -> str:
+        data = getattr(event, "data", None)
+        values = [
+            getattr(data, name, None)
+            for name in ("reason", "requested_auto_tier", "effective_auto_tier")
+        ]
+        reason, requested, effective = [getattr(value, "value", value) for value in values]
+        return (
+            f"Copilot routing preference rejected: {reason}; "
+            f"requested_auto_tier={requested!r}, effective_auto_tier={effective!r}"
+        )
 
-        ``session.fusion_completed`` carries the turn's aggregate token counts
-        (kept as a fallback only) and a ``degraded_reason`` when the runtime
-        could not run the full Fusion pattern. ``session.fusion_route_failed``
-        means the runtime fell back to a single concrete model. Both change
-        what the user asked for, so they are warnings rather than debug noise.
-        """
+    @staticmethod
+    def _note_fusion_event(
+        event_type: str,
+        event: Any,
+        agent_name: str | None,
+        fusion_ref: list[Any],
+        event_callback: EventCallback | None = None,
+    ) -> None:
+        """Record fallback aggregate usage and warn about degraded Fusion routing."""
         data = getattr(event, "data", None)
         label = f"agent '{agent_name}'" if agent_name else "a Copilot session"
+        message = None
+        reason = None
+        fallback = None
         if event_type == "session.fusion_completed":
             counts = [
                 getattr(data, name, None)
@@ -2250,16 +2295,32 @@ class CopilotProvider(AgentProvider):
                 )
             reason = getattr(data, "degraded_reason", None)
             if isinstance(reason, str) and reason:
-                logger.warning("Copilot Fusion turn for %s completed degraded: %s", label, reason)
+                message = f"Copilot Fusion turn for {label} completed degraded: {reason}"
         elif event_type == "session.fusion_route_failed":
             reason = getattr(data, "reason", None)
             fallback = getattr(data, "fallback_model", None)
-            logger.warning(
-                "Copilot Fusion routing failed for %s (%s); the runtime fell back to %s",
-                label,
-                reason if isinstance(reason, str) and reason else "no reason given",
-                fallback if isinstance(fallback, str) and fallback else "another model",
+            reason = reason if isinstance(reason, str) and reason else "no reason given"
+            fallback = fallback if isinstance(fallback, str) and fallback else "another model"
+            message = (
+                f"Copilot Fusion routing failed for {label} ({reason}); "
+                f"the runtime fell back to {fallback}"
             )
+        if message is not None:
+            logger.warning("%s", message)
+            if event_callback is not None:
+                try:
+                    event_callback(
+                        "agent_routing_warning",
+                        {
+                            "agent_name": agent_name,
+                            "message": message,
+                            "reason": reason,
+                            "fallback_model": fallback,
+                            "source_event": event_type,
+                        },
+                    )
+                except Exception:
+                    logger.warning("Could not deliver Copilot routing warning", exc_info=True)
 
     async def _abort_session(self, session: Any, done: asyncio.Event) -> None:
         """Attempt to abort a Copilot SDK session.
@@ -2319,6 +2380,7 @@ class CopilotProvider(AgentProvider):
         agent_model: str | None = None,
         *,
         managed_workspace: ManagedWorkspaceContext | None = None,
+        _routing_preference: RoutingPreference | None = None,
     ) -> AgentOutput:
         """Send follow-up guidance to an interrupted session.
 
@@ -2339,6 +2401,7 @@ class CopilotProvider(AgentProvider):
                 used when the follow-up response does not report a resolved model.
             managed_workspace: Required for a managed interrupted session; resumes
                 its disk SID in a fresh owned runtime with the original cwd.
+            _routing_preference: Retained tier reapplied by a managed resume.
 
         Returns:
             AgentOutput with the follow-up response content.
@@ -2356,7 +2419,15 @@ class CopilotProvider(AgentProvider):
                 resumed = await self._session_client().resume_session(
                     session.session_id, **session.resume_kwargs
                 )
-                return await self.send_followup(resumed, guidance, agent_name, agent_model)
+                return await self.send_followup(
+                    resumed,
+                    guidance,
+                    agent_name,
+                    agent_model,
+                    _routing_preference=RoutingPreference(
+                        **(session.resume_kwargs.get("capi") or {})
+                    ),
+                )
 
             return await self._managed_call(managed_workspace, session.cwd, resume)
         if isinstance(session, _ManagedCopilotSession):
@@ -2375,6 +2446,7 @@ class CopilotProvider(AgentProvider):
                 verbose_enabled,
                 full_enabled,
                 agent_name=agent_name,
+                routing_preference=_routing_preference,
             )
             if getattr(session, "session_id", None) in self._fusion_session_ids:
                 sdk_response = dataclasses.replace(sdk_response, fusion=True)
@@ -3768,6 +3840,7 @@ class CopilotProvider(AgentProvider):
         *,
         managed_workspace: ManagedWorkspaceContext | None = None,
         working_dir: str | None = None,
+        event_callback: EventCallback | None = None,
     ) -> str:
         """Execute a single dialog turn using a lightweight Copilot session.
 
@@ -3784,6 +3857,7 @@ class CopilotProvider(AgentProvider):
                 and a fresh client rather than the provider's legacy runtime.
             working_dir: Explicit resolved staged cwd, required with
                 managed_workspace. Omitted on legacy calls.
+            event_callback: Optional callback for routing warnings.
 
         Returns:
             The agent's response text.
@@ -3800,7 +3874,9 @@ class CopilotProvider(AgentProvider):
             return await self._managed_call(
                 managed_workspace,
                 working_dir,
-                lambda: self.execute_dialog_turn(system_prompt, user_message, history, model),
+                lambda: self.execute_dialog_turn(
+                    system_prompt, user_message, history, model, event_callback=event_callback
+                ),
             )
         await self._ensure_client_started()
 
@@ -3871,10 +3947,12 @@ class CopilotProvider(AgentProvider):
             response_content = ""
             done = asyncio.Event()
             error_message: str | None = None
+            routing_error: str | None = None
+            fusion_ref: list[Any] = [False, None]
             invocation = self._managed_invocation()
 
             def on_event(event: Any) -> None:
-                nonlocal response_content, error_message
+                nonlocal response_content, error_message, routing_error
                 if (
                     invocation is not None
                     and not invocation.workspace.process_scopes.owners.mutations_allowed(
@@ -3885,6 +3963,11 @@ class CopilotProvider(AgentProvider):
                 event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
                 if event_type == "assistant.message":
                     response_content = event.data.content
+                elif event_type == "session.auto_tier_switch_failed" and capi is not None:
+                    routing_error = self._routing_rejection_message(event)
+                    done.set()
+                elif event_type.startswith(("session.fusion_", "assistant.fusion_")):
+                    self._note_fusion_event(event_type, event, None, fusion_ref, event_callback)
                 elif event_type == "session.idle":
                     done.set()
                 elif event_type in ("error", "session.error"):
@@ -3901,6 +3984,9 @@ class CopilotProvider(AgentProvider):
                     "Dialog turn timed out after 120s",
                     is_retryable=False,
                 ) from exc
+
+            if routing_error is not None:
+                raise ProviderError(routing_error, is_retryable=False)
 
             if error_message:
                 raise ProviderError(

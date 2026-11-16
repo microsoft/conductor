@@ -95,6 +95,26 @@ class TestSchema:
         with pytest.raises(PydanticValidationError, match="nonblank"):
             RuntimeConfig(default_auto_tier=" ")
 
+    @pytest.mark.parametrize(
+        "value",
+        ["{{ workflow.input.tier }}", "{% if true %}efficiency{% endif %}"],
+    )
+    def test_runtime_auto_default_rejects_templates(self, value: str) -> None:
+        with pytest.raises(PydanticValidationError, match="default_auto_tier.*literal"):
+            RuntimeConfig(default_auto_tier=value)
+        runtime = RuntimeConfig(default_auto_tier="efficiency")
+        with pytest.raises(PydanticValidationError, match="default_auto_tier.*literal"):
+            runtime.default_auto_tier = value
+        assert runtime.default_auto_tier == "efficiency"
+
+        with pytest.raises(ConfigurationError, match="default_auto_tier.*literal"):
+            load_config_string(
+                _workflow(
+                    f"provider: copilot\ndefault_auto_tier: {value!r}\n",
+                    "- name: first\n  model: auto\n  routes: [{to: $end}]\n",
+                )
+            )
+
     @pytest.mark.parametrize("step", [ScriptStepDef, SetStepDef])
     @pytest.mark.parametrize("field", ["fusion_tier", "auto_tier"])
     def test_non_agent_steps_reject_fields(self, step: type, field: str) -> None:

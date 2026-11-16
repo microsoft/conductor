@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -65,6 +66,9 @@ class _FakeSession:
 
     async def disconnect(self) -> None:
         self.disconnected = True
+
+    async def abort(self) -> None:
+        self._handlers[-1](_IDLE)
 
 
 class _FakeClient:
@@ -356,6 +360,191 @@ class TestRefusals:
         assert client.creates[0]["capi"] == {"auto_tier": "efficiency"}
 
 
+class TestRoutingRejection:
+    @pytest.mark.parametrize("capi", [None, {"auto_tier": "efficiency"}, {"fusion_tier": "high"}])
+    async def test_managed_followup_honors_retained_preference_rejection(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capi: dict[str, str] | None
+    ) -> None:
+        from unittest.mock import Mock
+
+        from conductor.execution.local_process_scope import LocalProcessScopeController
+        from conductor.execution.types import ManagedWorkspaceContext
+        from conductor.providers.copilot import _ManagedCopilotSession
+
+        rejected = _event(
+            "session.auto_tier_switch_failed",
+            reason="policy_rejected",
+            requested_auto_tier="intelligence",
+            effective_auto_tier="efficiency",
+        )
+        client = _FakeClient(turns=[[rejected, _message("answer"), _IDLE]])
+        provider = _provider(client, monkeypatch)
+        controller = Mock(spec=LocalProcessScopeController)
+        workspace = ManagedWorkspaceContext(str(tmp_path), "managed-followup", controller)
+        kwargs: dict[str, Any] = {"working_directory": str(tmp_path)}
+        if capi is not None:
+            kwargs["capi"] = capi
+        handle = _ManagedCopilotSession(
+            workspace.root, workspace.incarnation, "retained", str(tmp_path), kwargs
+        )
+
+        async def in_owned_context(*args: Any) -> Any:
+            return await args[-1]()
+
+        monkeypatch.setattr(provider, "_managed_call", in_owned_context)
+        if capi is not None:
+            with pytest.raises(ProviderError, match="policy_rejected") as error:
+                await provider.send_followup(handle, "more", managed_workspace=workspace)
+            assert error.value.is_retryable is False
+            assert "requested_auto_tier='intelligence'" in str(error.value)
+            assert "effective_auto_tier='efficiency'" in str(error.value)
+        else:
+            output = await provider.send_followup(handle, "more", managed_workspace=workspace)
+            assert output.content == {"result": "answer"}
+
+        assert client.resumes == [("retained", kwargs)]
+        assert client.creates == []
+        assert client.sessions[0].disconnected
+        assert client.sessions[0].prompts == ["more"]
+
+    @pytest.mark.parametrize("dialog", [False, True])
+    @pytest.mark.parametrize("fusion", [False, True])
+    async def test_answer_and_idle_cannot_hide_tier_rejection(
+        self, monkeypatch: pytest.MonkeyPatch, dialog: bool, fusion: bool
+    ) -> None:
+        from copilot.generated.session_events import (
+            AutoTier,
+            AutoTierSwitchFailureReason,
+            SessionAutoTierSwitchFailedData,
+        )
+
+        rejected = _event("session.auto_tier_switch_failed")
+        rejected.data = SessionAutoTierSwitchFailedData(
+            reason=AutoTierSwitchFailureReason.POLICY_REJECTED,
+            requested_auto_tier=AutoTier.INTELLIGENCE,
+            effective_auto_tier=AutoTier.BALANCE,
+        )
+        client = _FakeClient(turns=[[rejected, _message("answer"), _IDLE]])
+        defaults = (
+            {"default_fusion_tier": "high"} if fusion else {"default_auto_tier": "intelligence"}
+        )
+        model = "fusion" if fusion else "auto"
+        provider = _provider(client, monkeypatch, model=model, **defaults)
+
+        with pytest.raises(ProviderError, match="routing preference rejected") as error:
+            if dialog:
+                await provider.execute_dialog_turn("sys", "hi")
+            else:
+                await provider.execute(_agent(model=model), {}, "p")
+
+        assert error.value.is_retryable is False
+        assert "policy_rejected" in str(error.value)
+        assert "requested_auto_tier='intelligence'" in str(error.value)
+        assert "effective_auto_tier='balance'" in str(error.value)
+        assert len(client.creates) == 1
+        assert len(client.sessions[0].prompts) == 1
+
+    @pytest.mark.parametrize("dialog", [False, True])
+    async def test_omitted_preference_does_not_refuse_runtime_tier_failure(
+        self, monkeypatch: pytest.MonkeyPatch, dialog: bool
+    ) -> None:
+        rejected = _event(
+            "session.auto_tier_switch_failed",
+            reason="request_failed",
+            requested_auto_tier="intelligence",
+            effective_auto_tier="balance",
+        )
+        client = _FakeClient(turns=[[rejected, _message("answer"), _IDLE]])
+        provider = _provider(client, monkeypatch, model="auto")
+
+        if dialog:
+            assert await provider.execute_dialog_turn("sys", "hi") == "answer"
+        else:
+            output = await provider.execute(_agent(model="auto"), {}, "p")
+            assert output.content == {"result": "answer"}
+        assert "capi" not in client.creates[0]
+
+    async def test_rejected_fusion_replacement_does_not_mark_plain_auto_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeClient()
+        provider = _provider(client, monkeypatch)
+        await provider.execute(_agent(model="auto", auto_tier="efficiency"), {}, "p")
+        sid = client.sessions[0].session_id
+        provider.set_resume_session_ids({"writer": sid})
+        client.turns = [
+            [
+                _event("session.model_change", new_model="fusion"),
+                _event(
+                    "session.auto_tier_switch_failed",
+                    reason="unsupported",
+                    requested_auto_tier="intelligence",
+                    effective_auto_tier="efficiency",
+                ),
+                _message("answer"),
+                _IDLE,
+            ]
+        ]
+
+        with pytest.raises(ProviderError, match="routing preference rejected"):
+            await provider.execute(_agent(model="auto", fusion_tier="high"), {}, "p")
+
+        assert sid not in provider._fusion_session_ids
+
+
+class TestRoutingWarnings:
+    @pytest.mark.parametrize("dialog", [False, True])
+    @pytest.mark.parametrize(
+        ("event_type", "details", "reason"),
+        [
+            (
+                "session.fusion_completed",
+                {"degraded_reason": "synthesis_timeout"},
+                "synthesis_timeout",
+            ),
+            (
+                "session.fusion_route_failed",
+                {"reason": "policy_rejected", "fallback_model": "gpt-5"},
+                "policy_rejected",
+            ),
+        ],
+    )
+    async def test_fusion_degradation_logs_and_emits_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        dialog: bool,
+        event_type: str,
+        details: dict[str, Any],
+        reason: str,
+    ) -> None:
+        client = _FakeClient(turns=[[_event(event_type, **details), _message("reply"), _IDLE]])
+        provider = _provider(client, monkeypatch)
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def capture(name: str, data: dict[str, Any]) -> None:
+            events.append((name, data))
+
+        with caplog.at_level(logging.WARNING, logger="conductor.providers.copilot"):
+            if dialog:
+                assert (
+                    await provider.execute_dialog_turn(
+                        "sys", "hi", model="fusion", event_callback=capture
+                    )
+                    == "reply"
+                )
+            else:
+                await provider.execute(_agent(model="fusion"), {}, "p", event_callback=capture)
+
+        warnings = [data for name, data in events if name == "agent_routing_warning"]
+        assert len(warnings) == 1
+        assert warnings[0]["reason"] == reason
+        assert warnings[0]["source_event"] == event_type
+        assert warnings[0]["message"] in caplog.text
+        if event_type == "session.fusion_route_failed":
+            assert warnings[0]["fallback_model"] == "gpt-5"
+
+
 class TestAttribution:
     async def test_fusion_usage_keeps_selector_label(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Requirement: aggregate Fusion tokens are never attributed to the last
@@ -557,19 +746,119 @@ class TestAttribution:
 
         assert output.model == "gpt-5"
 
+    @pytest.mark.parametrize(
+        "event_type", ["session.start", "session.resume", "session.model_change"]
+    )
+    @pytest.mark.parametrize(
+        "replacement", ["confirmed", "unconfirmed", "mismatched", "omitted", "rejected"]
+    )
+    async def test_resumed_routing_survives_interrupt_and_actual_handle_followup(
+        self, monkeypatch: pytest.MonkeyPatch, event_type: str, replacement: str
+    ) -> None:
+        from copilot.generated.session_events import AutoTier
+
+        model_field = "new_model" if event_type == "session.model_change" else "selected_model"
+        client = _FakeClient(
+            turns=[
+                [
+                    _event(event_type, auto_tier=AutoTier.INTELLIGENCE, **{model_field: "auto"}),
+                    _usage("gpt-5", 1, 1, "initial"),
+                    _message("x"),
+                    _IDLE,
+                ]
+            ]
+        )
+        provider = _provider(client, monkeypatch)
+        await provider.execute(_agent(model="auto", fusion_tier="high"), {}, "p")
+        sid = client.sessions[0].session_id
+        assert sid in provider._fusion_session_ids
+        provider.set_resume_session_ids({"writer": sid})
+        confirmation = _event(event_type, auto_tier=AutoTier.EFFICIENCY, **{model_field: "auto"})
+        if replacement == "mismatched":
+            confirmation.data.auto_tier = AutoTier.INTELLIGENCE
+
+        if replacement == "rejected":
+            client.turns = [
+                [
+                    confirmation,
+                    _event(
+                        "session.auto_tier_switch_failed",
+                        reason="policy_rejected",
+                        requested_auto_tier="efficiency",
+                        effective_auto_tier="intelligence",
+                    ),
+                    _message("answer"),
+                    _IDLE,
+                ]
+            ]
+            with pytest.raises(ProviderError, match="routing preference rejected"):
+                await provider.execute(_agent(model="auto", auto_tier="efficiency"), {}, "p")
+            assert sid in provider._fusion_session_ids
+
+        events = [] if replacement in ("unconfirmed", "rejected") else [confirmation]
+        client.turns = [
+            [*events, _usage("gpt-5", 2, 1, "partial"), _message("partial")],
+            [_usage("gpt-5", 3, 1, "followup"), _message("answer"), _IDLE],
+        ]
+        signal = asyncio.Event()
+        signal.set()
+        tier = (
+            {"auto_tier": "efficiency"}
+            if replacement in ("confirmed", "unconfirmed", "mismatched")
+            else {}
+        )
+        partial = await provider.execute(
+            _agent(model="auto", **tier), {}, "p", interrupt_signal=signal
+        )
+        handle = provider.get_interrupted_session()
+        assert partial.partial
+        assert handle is client.sessions[-1]
+        assert not handle.disconnected
+        expected = "gpt-5" if replacement == "confirmed" else "auto"
+        assert partial.model == expected
+
+        followup = await provider.send_followup(handle, "more", agent_model="auto")
+
+        assert followup.model == expected
+        assert handle.disconnected
+        assert (sid in provider._fusion_session_ids) == (replacement != "confirmed")
+
+    async def test_fusion_turn_evidence_does_not_persist_a_preference(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeClient(
+            turns=[[_event("session.fusion_started"), _usage("gpt-5", 1, 1, "c1"), _IDLE]]
+        )
+        provider = _provider(client, monkeypatch)
+
+        output = await provider.execute(_agent(model="auto"), {}, "p")
+
+        assert output.model == "auto"
+        assert client.sessions[0].session_id not in provider._fusion_session_ids
+
     @pytest.mark.parametrize("model", ["auto", "fusion", "hydrafusion", "hydrafusion-max"])
     async def test_selector_labels_have_no_provider_price_or_window(
         self, monkeypatch: pytest.MonkeyPatch, model: str
     ) -> None:
-        # Requirement: no rate or context window is fabricated for a routing selector.
-        listed = SimpleNamespace(id=model, billing=None, capabilities=None)
+        billing = SimpleNamespace(
+            token_prices=SimpleNamespace(batch_size=1000, input_price=2.0, output_price=4.0)
+        )
+        capabilities = SimpleNamespace(limits=SimpleNamespace(max_prompt_tokens=128000))
         client = _FakeClient()
 
         async def list_models() -> list[Any]:
-            return [listed]
+            return [
+                SimpleNamespace(id=model, billing=billing, capabilities=capabilities),
+                SimpleNamespace(id="gpt-4.1", billing=billing, capabilities=capabilities),
+            ]
 
         monkeypatch.setattr(client, "list_models", list_models)
         provider = _provider(client, monkeypatch)
 
         assert await provider.get_model_pricing(model) is None
         assert await provider.get_max_prompt_tokens(model) is None
+        pricing = await provider.get_model_pricing("gpt-4.1")
+        assert pricing is not None
+        assert pricing.input_per_mtok == 20.0
+        assert pricing.output_per_mtok == 40.0
+        assert await provider.get_max_prompt_tokens("gpt-4.1") == 128000

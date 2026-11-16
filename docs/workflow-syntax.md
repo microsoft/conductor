@@ -89,7 +89,7 @@ workflow:
                                       # Applies to agents whose model is `fusion`
                                       # and that set neither fusion_tier nor
                                       # auto_tier. Mutually exclusive with
-                                      # default_auto_tier. Unset sends no tier.
+                                      # default_auto_tier.
     default_auto_tier: efficiency     # Optional: Auto routing preference (Copilot only)
                                       # Applies to agents whose model is `auto`.
                                       # See docs/configuration.md#copilot-fusion-and-auto-routing.
@@ -232,7 +232,8 @@ agents:
 - **Omission and resume**: with neither field nor a matching default, nothing is
   sent. New sessions use the runtime's default routing, and resumed sessions
   keep the tier the runtime stored with them. A configured tier is resent on
-  resume. Set an explicit Fusion tier for reproducible runs.
+  resume. An explicit tier fixes the requested routing preference, not model
+  choices or results.
 - **Auxiliary sessions**: dialog turns and `validator:` graders take only the
   workflow defaults (when their model matches), never the agent's own tier.
 - **Cost**: Fusion tokens are reported under the configured selector (for

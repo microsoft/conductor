@@ -9,10 +9,10 @@
 # - Tool-free agents (`tools: []`), so the example only spends model quota
 #
 # Copilot Fusion is experimental and depends on your Copilot account, its
-# policies, and the Copilot runtime version. Fusion tiers are `standard`,
-# `high` and `max`; set one explicitly so runs are reproducible rather than
-# depending on runtime, user or administrator defaults. Routing tiers are
-# independent of `reasoning.effort`.
+# policies, and the Copilot runtime version.
+# Explicit tiers (`standard`, `high`, `max`) fix the preference, not model choices or results.
+# No tier is sent only when neither an agent preference nor a matching workflow default applies.
+# Routing tiers are independent of `reasoning.effort`.
 #
 # Fusion turns combine several models, so their tokens are reported under the
 # `fusion` label with an unknown cost unless you add a `cost.pricing` entry

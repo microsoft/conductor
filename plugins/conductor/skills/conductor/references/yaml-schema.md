@@ -309,7 +309,7 @@ agents:
 
 All three providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
 
-**Copilot routing tiers:** `model: fusion` with `fusion_tier` (`standard`/`high`/`max`) selects experimental Copilot Fusion; `model: auto` with `auto_tier` selects an Auto routing preference (extensible identifiers, validated by the runtime). Defaults apply only to agents on the matching model; an incompatible model, a non-Copilot provider, or BYOK `base_url` routing is a validation error and is refused at run time. Unset tiers send nothing, so runtime defaults and persisted resume tiers apply — set an explicit Fusion tier for reproducible runs. Fusion usage is reported under the selector label with unknown cost unless `cost.pricing` names it. Routing tiers are independent of `reasoning.effort`.
+**Copilot routing tiers:** `model: fusion` with `fusion_tier` (`standard`/`high`/`max`) selects experimental Copilot Fusion; `model: auto` with `auto_tier` selects an Auto routing preference (extensible identifiers, validated by the runtime). Defaults apply only to agents on the matching model; an incompatible model, a non-Copilot provider, or BYOK `base_url` routing is a validation error and is refused at run time. Only when neither an agent preference nor a matching workflow default applies does Conductor send no tier, leaving runtime defaults and persisted resume tiers in effect. An explicit tier fixes the requested routing preference, not model choices or results. Fusion usage is reported under the selector label with unknown cost unless `cost.pricing` names it. Routing tiers are independent of `reasoning.effort`.
 
 Forbidden on agent types: `script`, `human_gate`, `workflow`, `wait`.
 
