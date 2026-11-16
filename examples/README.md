@@ -276,6 +276,24 @@ conductor run examples/context-tier.yaml \
 
 See [Context Tier](../docs/configuration.md#context-tier) for details. This is a Copilot-only capability.
 
+## Copilot Fusion and Auto Routing
+
+### copilot-fusion.yaml
+
+A two-agent, tool-free workflow that lets the Copilot runtime route model calls. Demonstrates:
+- Copilot Fusion via `runtime.default_model: fusion` with an explicit `runtime.default_fusion_tier: high`
+- An agent that switches to `model: auto` with its own `auto_tier`, which replaces the workflow default
+- Conservative cost reporting: Fusion tokens appear under `fusion` with an unknown cost unless `cost.pricing` names it
+
+Prerequisites: the `copilot` provider with Copilot's own routing (not BYOK `base_url`), and a Copilot account and runtime with Fusion enabled. Fusion is experimental; running the example consumes Copilot quota.
+
+```bash
+conductor run examples/copilot-fusion.yaml \
+  --input question="What trade-offs matter when choosing a consensus algorithm?"
+```
+
+See [Copilot Fusion and Auto Routing](../docs/configuration.md#copilot-fusion-and-auto-routing) for precedence, resume behavior and restrictions.
+
 ## OpenTelemetry Tracing
 
 Enable tracing by setting an OTLP endpoint after installing the optional extra. The trace

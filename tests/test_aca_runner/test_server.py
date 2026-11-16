@@ -879,3 +879,76 @@ class TestInnerProviderSettingsAllowlist:
             assert response.status_code == 400
             assert "message" in response.json().get("error", {})
             assert _FakeCopilotProvider.instances == []
+
+
+class TestRoutingPreferences:
+    """Copilot routing preferences reach the inner provider or fail before streaming."""
+
+    def test_health_advertises_routing_feature(self, client: TestClient) -> None:
+        # Requirement: hosts gate tier-bearing requests on this advertisement.
+        from conductor.execution.agent_wire import RUNNER_ROUTING_FEATURE
+
+        features = client.get("/health").json()["features"]
+        assert RUNNER_ROUTING_FEATURE == "copilot_model_routing"
+        assert {"interrupt", RUNNER_ROUTING_FEATURE} <= set(features)
+
+    @pytest.mark.parametrize(
+        ("agent", "field", "value"),
+        [
+            ({"model": "fusion", "fusion_tier": "max"}, "fusion_tier", "max"),
+            ({"model": "auto", "auto_tier": "premium-v2"}, "auto_tier", "premium-v2"),
+        ],
+    )
+    def test_preference_reaches_inner_agent(
+        self, client: TestClient, agent: dict[str, str], field: str, value: str
+    ) -> None:
+        response = client.post("/execute", json=_execute_body(agent={"name": "a", **agent}))
+        assert response.status_code == 200
+        _parse_ndjson(response.text)
+
+        inner = _FakeCopilotProvider.instances[0].execute_calls[0]["agent"]
+        assert getattr(inner, field) == value
+
+    def test_absent_preference_reaches_inner_agent_as_none(self, client: TestClient) -> None:
+        response = client.post("/execute", json=_execute_body())
+        assert response.status_code == 200
+        _parse_ndjson(response.text)
+
+        inner = _FakeCopilotProvider.instances[0].execute_calls[0]["agent"]
+        assert (inner.fusion_tier, inner.auto_tier) == (None, None)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"agent": {"name": "a", "model": "gpt-4.1", "fusion_tier": "high"}}, "requires"),
+            ({"agent": {"name": "a", "model": "fusion", "auto_tier": "x"}}, "requires"),
+            ({"agent": {"name": "a", "model": "fusion", "fusion_tier": "ultra"}}, "fusion_tier"),
+            (
+                {"agent": {"name": "a", "model": "auto", "fusion_tier": "high", "auto_tier": "x"}},
+                "mutually exclusive",
+            ),
+            (
+                {
+                    "agent": {"name": "a", "model": "auto", "auto_tier": "x"},
+                    "inner_provider": "openai",
+                },
+                "copilot inner provider",
+            ),
+            (
+                {
+                    "agent": {"name": "a", "model": "fusion", "fusion_tier": "high"},
+                    "inner_provider_settings": {"base_url": "https://byok.example.com"},
+                },
+                "BYOK",
+            ),
+        ],
+    )
+    def test_incompatible_request_is_rejected_before_streaming(
+        self, client: TestClient, overrides: dict[str, Any], message: str
+    ) -> None:
+        response = client.post("/execute", json=_execute_body(**overrides))
+
+        assert response.status_code == 400
+        assert not response.headers["content-type"].startswith("application/x-ndjson")
+        assert message in response.json()["error"]["message"]
+        assert _FakeCopilotProvider.instances == []

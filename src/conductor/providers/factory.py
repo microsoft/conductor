@@ -67,6 +67,8 @@ async def create_provider(
     default_context_tier: ContextTier | None = None,
     provider_settings: ProviderSettings | None = None,
     tool_output: ToolOutputConfig | None = None,
+    default_fusion_tier: str | None = None,
+    default_auto_tier: str | None = None,
 ) -> AgentProvider:
     """Factory function to create the appropriate provider.
 
@@ -106,6 +108,13 @@ async def create_provider(
         tool_output: MCP tool result output-size configuration. Defines the
             per-result character limit and spill-to-file behavior for MCP
             tool outputs. ``None`` means the provider uses its defaults.
+        default_fusion_tier: Workflow-wide Copilot Fusion tier for agents whose
+            model is ``fusion``. Forwarded to Copilot and to the ``aca``
+            compatibility provider (which runs Copilot remotely); other
+            providers have no native routing preferences and ignore it.
+        default_auto_tier: Workflow-wide Copilot Auto routing preference for
+            agents whose model is ``auto``. Forwarded like
+            ``default_fusion_tier``.
 
     Returns:
         Configured AgentProvider instance.
@@ -144,6 +153,8 @@ async def create_provider(
                 default_context_tier=default_context_tier,
                 provider_settings=provider_settings,
                 tool_output=tool_output,
+                default_fusion_tier=default_fusion_tier,
+                default_auto_tier=default_auto_tier,
             )
         case "openai":
             if not OPENAI_SDK_AVAILABLE:
@@ -313,6 +324,8 @@ async def create_provider(
                 default_reasoning_effort=default_reasoning_effort,
                 max_session_seconds=max_session_seconds,
                 tool_output=tool_output,
+                default_fusion_tier=default_fusion_tier,
+                default_auto_tier=default_auto_tier,
             )
         case _:
             raise ProviderError(
@@ -383,6 +396,8 @@ class ProviderFactory:
         max_idle_recovery_attempts = getattr(runtime_config, "max_idle_recovery_attempts", None)
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
         default_context_tier = getattr(runtime_config, "default_context_tier", None)
+        default_fusion_tier = getattr(runtime_config, "default_fusion_tier", None)
+        default_auto_tier = getattr(runtime_config, "default_auto_tier", None)
         tool_output = getattr(runtime_config, "tool_output", None)
 
         _enforce_temperature(provider_type, temperature)
@@ -402,4 +417,6 @@ class ProviderFactory:
             default_context_tier=default_context_tier,
             provider_settings=provider_settings,
             tool_output=tool_output,
+            default_fusion_tier=default_fusion_tier,
+            default_auto_tier=default_auto_tier,
         )

@@ -33,6 +33,12 @@ from conductor.executor.template import TemplateRenderer
 from conductor.mcp_auth import resolve_mcp_servers
 from conductor.providers.base import AgentOutput, EventCallback
 from conductor.providers.context_tier import ContextTier
+from conductor.providers.copilot_routing import (
+    FUSION_TIERS,
+    RoutingPreferenceError,
+    check_preference_compatibility,
+    resolve_routing_preference,
+)
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 from conductor.skills import BYTES_PER_TOKEN_ESTIMATE
 from conductor.templating import is_jinja_template
@@ -553,6 +559,9 @@ class AgentExecutor:
             )
             agent = agent.model_copy(update={"context_tier": resolved_tier})
 
+        agent = self._render_routing_preference(agent, context)
+        self._reject_unsupported_routing_preference(agent)
+
         # Render a new task or add one user turn to provider-owned state.
         if continuation_state is not None:
             # Discarding the rendered prompt is only safe when the provider
@@ -866,6 +875,10 @@ class AgentExecutor:
             default_iterations = runtime.max_agent_iterations
             default_seconds = runtime.max_session_seconds
             default_tier = runtime.default_context_tier if provider_name == "copilot" else None
+            default_fusion_tier = (
+                runtime.default_fusion_tier if provider_name == "copilot" else None
+            )
+            default_auto_tier = runtime.default_auto_tier if provider_name == "copilot" else None
             tool_output = runtime.tool_output
         else:
             assert self.provider is not None
@@ -888,12 +901,26 @@ class AgentExecutor:
             max_tokens = getattr(self.provider, "_default_max_tokens", None)
             default_iterations = getattr(self.provider, "_default_max_agent_iterations", None)
             default_tier = getattr(self.provider, "_default_context_tier", None)
+            default_fusion_tier = getattr(self.provider, "_default_fusion_tier", None)
+            default_auto_tier = getattr(self.provider, "_default_auto_tier", None)
         merged_servers = {**servers, **(extra_mcp_servers or {})}
+        model = agent.model or default_model
+        try:
+            routing = resolve_routing_preference(
+                model=model,
+                agent_fusion_tier=agent.fusion_tier,
+                agent_auto_tier=agent.auto_tier,
+                default_fusion_tier=default_fusion_tier,
+                default_auto_tier=default_auto_tier,
+                subject=f"Agent '{agent.name}'",
+            )
+        except RoutingPreferenceError as exc:
+            raise ValidationError(str(exc)) from exc
         return AgentSpec(
             name=agent.name,
             execution_id=uuid4().hex,
             model_provider=provider_name,
-            model=agent.model or default_model,
+            model=model,
             rendered_prompt=rendered_prompt,
             system_prompt=agent.system_prompt,
             output_schema=(
@@ -932,6 +959,8 @@ class AgentExecutor:
             retry=agent.retry.model_dump(mode="json") if agent.retry else None,
             context_tier=agent.context_tier or default_tier,
             execution=execution,
+            fusion_tier=routing.fusion_tier,
+            auto_tier=routing.auto_tier,
         )
 
     def render_prompt(self, agent: AgentDef, context: dict[str, Any]) -> str:
@@ -1610,6 +1639,83 @@ class AgentExecutor:
                 "reports this before a run starts."
             ),
         )
+
+    def _render_routing_preference(self, agent: AgentDef, context: dict[str, Any]) -> AgentDef:
+        """Render templated ``fusion_tier`` / ``auto_tier`` on a copy of ``agent``.
+
+        A Fusion tier must resolve to one of its literals. An Auto tier is an
+        extensible identifier, so it only has to resolve to a nonblank value.
+        """
+        fusion_tier = agent.fusion_tier
+        if is_jinja_template(fusion_tier):
+            resolved = self._render_enum_field(
+                value=fusion_tier,
+                context=context,
+                allowed=FUSION_TIERS,
+                field_name="fusion_tier",
+                agent_name=agent.name,
+            )
+            agent = agent.model_copy(update={"fusion_tier": resolved})
+        auto_tier = agent.auto_tier
+        if is_jinja_template(auto_tier):
+            resolved = self.renderer.render(auto_tier, context).strip()
+            if not resolved:
+                raise ValidationError(
+                    f"Agent '{agent.name}': auto_tier template resolved to an empty value.",
+                    suggestion=(
+                        "Emit a tier identifier, add an else-branch, or omit auto_tier "
+                        "to use the runtime default."
+                    ),
+                )
+            agent = agent.model_copy(update={"auto_tier": resolved})
+        return agent
+
+    def _routing_default_model(self) -> str | None:
+        """Return the model an agent without ``model:`` runs on."""
+        if self._remote_runtime is not None and self._remote_provider_type is not None:
+            return self._remote_runtime.default_model
+        return getattr(self.provider, "_default_model", None)
+
+    def _reject_unsupported_routing_preference(self, agent: AgentDef) -> None:
+        """Refuse an explicit ``fusion_tier`` / ``auto_tier`` that cannot be honored.
+
+        Mirrors the static validator for ``conductor run``: the provider must
+        declare ``capabilities.native_routing_preferences`` and the effective
+        model must be ``fusion`` / ``auto`` as the preference requires. A
+        provider without ``CAPABILITIES`` is left alone, like the other checks.
+
+        Raises:
+            ExecutionError: If the provider cannot forward routing preferences.
+            ValidationError: If the preference does not suit the agent's model.
+        """
+        if agent.fusion_tier is None and agent.auto_tier is None:
+            return
+        capabilities = self._capabilities
+        if capabilities is None:
+            return
+        if not capabilities.native_routing_preferences:
+            raise ExecutionError(
+                f"Agent '{agent.name}' sets a Copilot routing preference "
+                f"(fusion_tier/auto_tier) but provider '{self._provider_label}' cannot "
+                f"honor it (capabilities.native_routing_preferences=False).",
+                agent_name=agent.name,
+                suggestion="Use the copilot provider or remove fusion_tier/auto_tier.",
+            )
+        try:
+            check_preference_compatibility(
+                model=agent.model or self._routing_default_model(),
+                fusion_tier=agent.fusion_tier,
+                auto_tier=agent.auto_tier,
+                subject=f"Agent '{agent.name}'",
+            )
+        except RoutingPreferenceError as exc:
+            raise ValidationError(
+                str(exc),
+                suggestion=(
+                    "Use fusion_tier with model 'fusion' and auto_tier with model 'auto', "
+                    "or remove the routing preference."
+                ),
+            ) from exc
 
     def _reject_unsupported_session_key(self, agent: AgentDef) -> None:
         """Refuse ``session_key`` on a provider that cannot continue a session.

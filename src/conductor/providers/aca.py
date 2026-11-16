@@ -45,11 +45,16 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from pydantic import ConfigDict, Field, SecretStr
 
-from conductor.exceptions import ProviderError
+from conductor.exceptions import ProviderError, ValidationError
 from conductor.execution.types import AgentEventSink, AgentResult, AgentSpec, WorkspaceLease
 from conductor.install_hint import install_command
 from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
 from conductor.providers.capabilities import ProviderCapabilities
+from conductor.providers.copilot_routing import (
+    RoutingPreference,
+    RoutingPreferenceError,
+    resolve_routing_preference,
+)
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 from conductor.runner.protocol import (
     RUNNER_PROTOCOL_VERSION,
@@ -285,6 +290,9 @@ class AcaRuntimeProvider(AgentProvider):
         # MCP declarations live in host-filesystem directories the in-sandbox
         # runner cannot read.
         plugins=False,
+        # Forwarded to the runner's inner Copilot provider; requests whose
+        # inner provider cannot honor them are refused before dispatch.
+        native_routing_preferences=True,
         max_temperature=1.0,
         upstream_pin="azure-identity>=1.19.0",
         maintainer=None,
@@ -299,6 +307,8 @@ class AcaRuntimeProvider(AgentProvider):
         default_reasoning_effort: ReasoningEffort | None = None,
         max_session_seconds: float | None = None,
         tool_output: ToolOutputConfig | None = None,
+        default_fusion_tier: str | None = None,
+        default_auto_tier: str | None = None,
     ) -> None:
         """Initialize the ACA runtime provider.
 
@@ -315,6 +325,11 @@ class AcaRuntimeProvider(AgentProvider):
             max_session_seconds: Maximum wall-clock duration for agent
                 sessions, enforced runner-side.
             tool_output: MCP tool result output-size configuration.
+            default_fusion_tier: Workflow-wide Copilot Fusion tier for
+                ``model: fusion`` agents, resolved here and forwarded to the
+                runner's inner Copilot provider.
+            default_auto_tier: Workflow-wide Copilot Auto routing preference
+                for ``model: auto`` agents, forwarded the same way.
 
         Raises:
             ProviderError: If the ``azure-identity`` package is not
@@ -333,6 +348,8 @@ class AcaRuntimeProvider(AgentProvider):
         self._default_reasoning_effort = default_reasoning_effort
         self._default_max_session_seconds = max_session_seconds
         self._tool_output_config = tool_output
+        self._default_fusion_tier = default_fusion_tier
+        self._default_auto_tier = default_auto_tier
 
         # Per-run random salt (E3-T1) mixed into every derived identifier so
         # two workflow runs never collide even for identical agent/context —
@@ -702,6 +719,50 @@ class AcaRuntimeProvider(AgentProvider):
             result[name] = cfg.model_dump(mode="json") if hasattr(cfg, "model_dump") else cfg
         return result
 
+    def _routing_preference(
+        self,
+        agent: AgentDef,
+        model: str | None,
+        inner_provider: str,
+        inner_settings: dict[str, Any],
+    ) -> RoutingPreference:
+        """Resolve the routing preference the runner's inner provider must honor.
+
+        Defaults apply only to a compatible routed model on an inner Copilot
+        provider. An explicit agent preference that the inner provider cannot
+        honor (another SDK, BYOK routing, or an incompatible model) is refused
+        rather than dropped.
+        """
+        explicit = agent.fusion_tier is not None or agent.auto_tier is not None
+        if inner_provider != "copilot":
+            if explicit:
+                raise ValidationError(
+                    f"Agent '{agent.name}' sets a Copilot routing preference "
+                    f"(fusion_tier/auto_tier) but the aca inner provider is "
+                    f"{inner_provider!r}, which cannot honor it.",
+                    suggestion="Use inner_provider: copilot or remove the routing preference.",
+                )
+            return RoutingPreference()
+        try:
+            preference = resolve_routing_preference(
+                model=model,
+                agent_fusion_tier=agent.fusion_tier,
+                agent_auto_tier=agent.auto_tier,
+                default_fusion_tier=self._default_fusion_tier,
+                default_auto_tier=self._default_auto_tier,
+                subject=f"Agent '{agent.name}'",
+            )
+        except RoutingPreferenceError as exc:
+            raise ValidationError(str(exc)) from exc
+        if preference and "base_url" in inner_settings:
+            raise ValidationError(
+                f"Agent '{agent.name}' resolves to a Copilot routing preference, but "
+                "the runner's inner Copilot provider uses BYOK custom routing "
+                "(COPILOT_PROVIDER_BASE_URL), which cannot honor Fusion or Auto tiers.",
+                suggestion="Unset COPILOT_PROVIDER_BASE_URL or remove the routing preference.",
+            )
+        return preference
+
     def _build_request(
         self,
         agent: AgentDef,
@@ -711,6 +772,10 @@ class AcaRuntimeProvider(AgentProvider):
         suppress_mcp_servers: bool = False,
     ) -> RunnerAgentRequest:
         reasoning_effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+        inner_provider = self._provider_settings.inner_provider or "copilot"
+        inner_settings = self._resolve_inner_provider_settings()
+        model = agent.model or self._default_model
+        routing = self._routing_preference(agent, model, inner_provider, inner_settings)
         working_dir = agent.sandbox.working_dir if agent.sandbox is not None else None
         output_schema = (
             {
@@ -722,7 +787,7 @@ class AcaRuntimeProvider(AgentProvider):
         )
         agent_payload = RunnerAgentPayload(
             name=agent.name,
-            model=agent.model or self._default_model,
+            model=model,
             system_prompt=agent.system_prompt,
             output=output_schema,
             tools=list(agent.tools) if agent.tools is not None else None,
@@ -732,6 +797,8 @@ class AcaRuntimeProvider(AgentProvider):
             working_dir=working_dir,
             retry=agent.retry.model_dump(mode="json") if agent.retry is not None else None,
             context_tier=agent.context_tier,
+            fusion_tier=routing.fusion_tier,
+            auto_tier=routing.auto_tier,
         )
         return RunnerAgentRequest(
             agent=agent_payload,
@@ -741,8 +808,8 @@ class AcaRuntimeProvider(AgentProvider):
             # forwards no servers, so the in-sandbox runner attaches none.
             mcp_servers=None if suppress_mcp_servers else self._serialize_mcp_servers(),
             context=context,
-            inner_provider=self._provider_settings.inner_provider or "copilot",
-            inner_provider_settings=self._resolve_inner_provider_settings(),
+            inner_provider=inner_provider,
+            inner_provider_settings=inner_settings,
             tool_output=(
                 self._tool_output_config.model_dump(mode="json")
                 if self._tool_output_config is not None
@@ -1089,6 +1156,8 @@ class AcaRuntimeProvider(AgentProvider):
             working_dir=payload.working_dir,
             retry=payload.retry,
             context_tier=payload.context_tier,
+            fusion_tier=payload.fusion_tier,
+            auto_tier=payload.auto_tier,
         )
         result = await self._legacy_backend.run_agent(
             spec,

@@ -51,6 +51,7 @@ validator so the operator can plan accordingly.
 | `checkpoint_resume` | Provider session state does not survive `conductor resume` (re-runs the agent from scratch). |
 | `working_dir` | Provider does not apply the resolved working directory to its session/subprocess cwd. Workflows that set `working_dir` against this provider fail validation. |
 | `session_continuity` | Provider does not honor a per-agent `session_key`; every execution starts a fresh session. Agents that set `session_key` fail validation. |
+| `native_routing_preferences` | Provider cannot forward Copilot `fusion_tier` / `auto_tier`. An agent that sets either fails validation and is refused at run time; `runtime.default_fusion_tier` / `default_auto_tier` simply do not apply. |
 | `max_temperature` | Provider caps the effective temperature below the schema's `0..2` range. `runtime.temperature` or a per-agent `temperature` above the cap fails validation. |
 
 ## Non-negotiable rules

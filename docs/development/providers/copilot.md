@@ -90,6 +90,25 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
   server name containing `__` still resolves. Forwarding untranslated names hides the allowed tool.
 - Tests: `tests/test_providers/test_copilot_tools_allowlist.py`.
 
+### Routing preferences: Fusion and Auto tiers (#637)
+
+- The SDK floor is `github-copilot-sdk>=1.0.32`, the first release whose `CapiSessionOptions`
+  carries `fusion_tier`. Older SDKs drop unknown `capi` keys silently, so the floor is the guard.
+- One resolver, `src/conductor/providers/copilot_routing.py::resolve_routing_preference`, owns the
+  precedence: an agent `fusion_tier`/`auto_tier` replaces both runtime defaults as a unit and must
+  suit the model (`fusion_tier` needs `fusion` or `auto`, `auto_tier` needs `auto`); a default applies
+  only to a matching routed model. The schema, static validator, executor, Copilot and `aca`
+  providers, and the runner use it or its compatibility check; do not re-derive the rules.
+- `CopilotProvider._routing_preference` sends the result as `capi={"fusion_tier": ...}` or
+  `capi={"auto_tier": ...}` on create, resume and dialog sessions, and omits `capi` when nothing
+  resolves so runtime defaults and persisted resume tiers survive. Managed continuations resume with
+  the stored session kwargs, so they carry the same `capi`. A failed resume falls back to create with
+  the same `capi`; a preference is never dropped to make a call succeed.
+- BYOK custom routing (`has_custom_routing()`) refuses any resolved preference. `runtime_url` is a
+  transport, not SDK remote/cloud sessions, and does not refuse.
+- The Fusion-to-Auto tier mapping is runtime-owned; never hard-code HydraFusion routes. Deprecated
+  HydraFusion model and tier identifiers pass through unchanged.
+
 ### Usage and pricing
 
 - `assistant.usage` fires once per API call; totals accumulate across calls. A repeated event is
@@ -100,6 +119,16 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
 - `CopilotProvider.get_model_pricing` derives USD from the SDK's `billing.token_prices` (AI Credits,
   `_COPILOT_USD_PER_CREDIT`, an observed 100 credits = $1). It MUST never raise; a missing or
   malformed price returns `None` so cost falls back to the static table.
+- Composite turns (`SDKResponse.composite`: a requested Fusion tier, any `session.fusion_*` or
+  `assistant.fusion_*` event, or `assistant.usage` from more than one model) keep the configured
+  selector as `AgentOutput.model` (`_attributed_model`). Their aggregate tokens MUST NOT be priced at
+  the last constituent's rate, so routing selectors (`auto`, `fusion`, HydraFusion) get no provider
+  price or context window; only a workflow `cost.pricing` entry prices them. Plain Auto reports the
+  concrete model when usage names exactly one. Parse-recovery calls and follow-ups merge their models
+  into the same decision; `_fusion_session_ids` keeps a follow-up on a Fusion session composite.
+- `session.fusion_completed` aggregate counts are a fallback used only when a turn produced no
+  `assistant.usage`; they cover the same calls, so adding them would double-count. Never convert
+  `total_nano_aiu` into a cost. A `degraded_reason` or `session.fusion_route_failed` logs a warning.
 
 ### Other Copilot-specific rules
 
@@ -123,6 +152,9 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
 - [ ] Allowlist change covered in `tests/test_providers/test_copilot_tools_allowlist.py` for both
       create and resume paths.
 - [ ] Usage change keeps dedup and the single-call `last_call_input_tokens` rule.
+- [ ] Routing change keeps create, resume, dialog and continuation parity and is covered in
+      `tests/test_providers/test_copilot_routing.py` (kwargs) and
+      `tests/test_providers/test_copilot_managed_workspace.py` (real-SDK camelCase wire).
 
 ## Rationale and evidence
 
@@ -151,5 +183,8 @@ repeated event double-billed.
   runtime](../../configuration.md#connecting-to-an-existing-copilot-runtime)
 - [Workflow syntax: agent-level tools](../../workflow-syntax.md#agent-level-tools)
 - [Telemetry](../../telemetry.md), [MCP tools](../../mcp-tools.md#tool-output-limits)
-- Examples: `examples/copilot-local-llm.yaml`, `examples/copilot-existing-runtime.yaml`
+- [Configuration: Copilot Fusion and Auto
+  routing](../../configuration.md#copilot-fusion-and-auto-routing)
+- Examples: `examples/copilot-local-llm.yaml`, `examples/copilot-existing-runtime.yaml`,
+  `examples/copilot-fusion.yaml`
 - [Providers (shared contract)](../providers.md)

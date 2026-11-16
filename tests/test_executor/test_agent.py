@@ -1246,3 +1246,131 @@ class TestContinuationState:
         for cls in (CopilotProvider, AcaRuntimeProvider, ClaudeAgentSdkProvider):
             assert cls.supports_continuation is AgentProvider.supports_continuation
         assert CopilotProvider(mock_handler=lambda a, p, c: {}).supports_continuation is False
+
+
+class TestRoutingPreferences:
+    """Copilot ``fusion_tier`` / ``auto_tier`` on the execution path."""
+
+    @staticmethod
+    def _copilot(captured: list[AgentDef], **kwargs: Any) -> CopilotProvider:
+        def mock_handler(agent, prompt, context):  # noqa: ANN001, ANN202
+            captured.append(agent)
+            return {"result": "ok"}
+
+        return CopilotProvider(mock_handler=mock_handler, **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_templated_tiers_render_on_a_copy(self) -> None:
+        # Requirement: templates render with context and never mutate the definition.
+        captured: list[AgentDef] = []
+        executor = AgentExecutor(self._copilot(captured))
+        fusion = AgentDef(
+            name="fusion", prompt="p", model="fusion", fusion_tier="{{ workflow.input.tier }}"
+        )
+        auto = AgentDef(
+            name="auto", prompt="p", model="auto", auto_tier="{{ workflow.input.route }}"
+        )
+        context = {"workflow": {"input": {"tier": "max", "route": " premium-v2 "}}}
+
+        await executor.execute(fusion, context)
+        await executor.execute(auto, context)
+
+        assert [agent.fusion_tier for agent in captured] == ["max", None]
+        assert captured[1].auto_tier == "premium-v2"
+        assert fusion.fusion_tier == "{{ workflow.input.tier }}"
+        assert auto.auto_tier == "{{ workflow.input.route }}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("fusion_tier", "ultra", "not a valid value"),
+            ("fusion_tier", "", "empty value"),
+            ("auto_tier", "  ", "empty value"),
+        ],
+    )
+    async def test_bad_rendered_tier_is_refused(self, field: str, value: str, message: str) -> None:
+        captured: list[AgentDef] = []
+        model = "fusion" if field == "fusion_tier" else "auto"
+        agent = AgentDef(name="a", prompt="p", model=model, **{field: "{{ workflow.input.v }}"})
+
+        with pytest.raises(ValidationError, match=message):
+            await AgentExecutor(self._copilot(captured)).execute(
+                agent, {"workflow": {"input": {"v": value}}}
+            )
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_incompatible_model_is_refused_before_the_provider(self) -> None:
+        # Requirement: conductor run enforces what conductor validate reports.
+        captured: list[AgentDef] = []
+        agent = AgentDef(name="a", prompt="p", model="gpt-5", fusion_tier="high")
+
+        with pytest.raises(ValidationError, match="fusion_tier requires model"):
+            await AgentExecutor(self._copilot(captured)).execute(agent, {})
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_templated_model_is_checked_after_rendering(self) -> None:
+        captured: list[AgentDef] = []
+        agent = AgentDef(
+            name="a", prompt="p", model="{{ workflow.input.model }}", auto_tier="efficiency"
+        )
+        executor = AgentExecutor(self._copilot(captured))
+
+        await executor.execute(agent, {"workflow": {"input": {"model": "auto"}}})
+        with pytest.raises(ValidationError, match="auto_tier requires model"):
+            await executor.execute(agent, {"workflow": {"input": {"model": "gpt-5"}}})
+        assert len(captured) == 1
+
+    @pytest.mark.asyncio
+    async def test_provider_default_model_satisfies_the_preference(self) -> None:
+        captured: list[AgentDef] = []
+        agent = AgentDef(name="a", prompt="p", fusion_tier="standard")
+
+        await AgentExecutor(self._copilot(captured, model="fusion")).execute(agent, {})
+
+        assert captured[0].fusion_tier == "standard"
+
+    @pytest.mark.asyncio
+    async def test_provider_without_capability_is_refused(self) -> None:
+        provider = ClaudeProvider(api_key="test-key")
+        assert provider.CAPABILITIES.native_routing_preferences is False
+        agent = AgentDef(name="a", prompt="p", model="auto", auto_tier="efficiency")
+
+        with pytest.raises(ExecutionError, match="native_routing_preferences=False"):
+            await AgentExecutor(provider).execute(agent, {})
+
+    def test_realm_spec_carries_effective_local_preference(self) -> None:
+        # Requirement: Docker/ACA realms receive the same resolved preference as
+        # the host provider would send.
+        executor = AgentExecutor(
+            CopilotProvider(mock_handler=lambda *_: {}, default_fusion_tier="high")
+        )
+
+        inherited = executor.build_realm_spec(AgentDef(name="a", model="fusion"), "p", {})
+        replaced = executor.build_realm_spec(
+            AgentDef(name="b", model="auto", auto_tier="efficiency"), "p", {}
+        )
+        unmatched = executor.build_realm_spec(AgentDef(name="c", model="gpt-5"), "p", {})
+
+        assert (inherited.fusion_tier, inherited.auto_tier) == ("high", None)
+        assert (replaced.fusion_tier, replaced.auto_tier) == (None, "efficiency")
+        assert (unmatched.fusion_tier, unmatched.auto_tier) == (None, None)
+
+    @pytest.mark.parametrize(("provider_type", "expected"), [("copilot", "max"), ("openai", None)])
+    def test_realm_spec_uses_remote_runtime_defaults(
+        self, provider_type: str, expected: str | None
+    ) -> None:
+        from conductor.config.schema import RuntimeConfig
+
+        executor = AgentExecutor(
+            None,
+            remote_provider_type=provider_type,  # type: ignore[arg-type]
+            remote_runtime=RuntimeConfig(default_model="fusion", default_fusion_tier="max"),
+        )
+
+        spec = executor.build_realm_spec(AgentDef(name="a", prompt="p"), "p", {})
+
+        assert spec.model == "fusion"
+        assert spec.fusion_tier == expected

@@ -12,6 +12,9 @@ from conductor.execution.types import AgentSpec
 
 _DEFAULT_PROTOCOL_VERSION = 2
 
+RUNNER_ROUTING_FEATURE = "copilot_model_routing"
+"""Runner ``/health`` feature: the runner accepts ``agent.fusion_tier``/``auto_tier``."""
+
 
 def _plain_credential(value: Any) -> Any:
     """Unwrap a secret wrapper at the transport boundary without importing it."""
@@ -33,6 +36,8 @@ def agent_spec_to_wire_body(
         raise ValueError("runner protocol v1 cannot honor temperature or max_tokens")
     if protocol_version == 1 and spec.declared_tools == ():
         raise ValueError("runner protocol v1 cannot honor tools: []")
+    if protocol_version == 1 and (spec.fusion_tier is not None or spec.auto_tier is not None):
+        raise ValueError("runner protocol v1 cannot honor fusion_tier or auto_tier")
 
     body: dict[str, Any] = {
         "agent": {
@@ -62,6 +67,11 @@ def agent_spec_to_wire_body(
         ),
         "tool_output": dict(spec.tool_output) if spec.tool_output is not None else None,
     }
+    # Routing preferences are sent only when configured, so a request without
+    # them stays acceptable to strict runners that predate the fields.
+    for key, value in (("fusion_tier", spec.fusion_tier), ("auto_tier", spec.auto_tier)):
+        if value is not None:
+            body["agent"][key] = value
     if protocol_version >= 2:
         body.update(
             execution_id=spec.execution_id,

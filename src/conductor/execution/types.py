@@ -503,6 +503,10 @@ class AgentSpec:
     execution: ResolvedExecutionSpec | None = None
     declared_tools: tuple[str, ...] | None = None
     """Declared agent tools before workflow resolution: None if omitted, () if empty."""
+    fusion_tier: str | None = None
+    """Resolved Copilot Fusion tier; None sends no preference."""
+    auto_tier: str | None = None
+    """Resolved Copilot Auto routing preference; None sends no preference."""
 
 
 @dataclass(frozen=True)

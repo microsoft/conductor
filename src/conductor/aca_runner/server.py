@@ -58,9 +58,14 @@ from conductor.config.schema import (
     ToolOutputConfig,
 )
 from conductor.exceptions import ProviderError
+from conductor.execution.agent_wire import RUNNER_ROUTING_FEATURE
 from conductor.providers.base import AgentProvider
 from conductor.providers.claude import ClaudeProvider
 from conductor.providers.copilot import CopilotProvider
+from conductor.providers.copilot_routing import (
+    RoutingPreferenceError,
+    check_preference_compatibility,
+)
 from conductor.providers.openai import OpenAIProvider
 from conductor.redaction import RunRedactor
 from conductor.runner.protocol import (
@@ -138,6 +143,8 @@ def _build_agent(payload: RunnerAgentPayload) -> AgentDef:
         working_dir=payload.working_dir,
         retry=retry,
         context_tier=payload.context_tier,
+        fusion_tier=payload.fusion_tier,
+        auto_tier=payload.auto_tier,
     )
 
 
@@ -204,11 +211,45 @@ def _validate_execute_request(
             provider_name="aca",
             is_retryable=False,
         )
+    _check_routing_preference(request)
     _check_stdio_binaries(request.mcp_servers)
     check_inner_provider_settings(
         request.inner_provider_settings, allowed_base_urls=allowed_base_urls
     )
     return _build_agent(request.agent)
+
+
+def _check_routing_preference(request: RunnerAgentRequest) -> None:
+    """Refuse a routing preference the inner provider cannot honor, before streaming.
+
+    The host resolves defaults, so any tier present here was requested and must
+    reach a Copilot inner provider on Copilot routing with a matching model.
+    """
+    agent = request.agent
+    if agent.fusion_tier is None and agent.auto_tier is None:
+        return
+    if request.inner_provider != "copilot":
+        raise ProviderError(
+            f"runner: fusion_tier/auto_tier require the copilot inner provider "
+            f"(got {request.inner_provider!r})",
+            provider_name="aca",
+            is_retryable=False,
+        )
+    if (request.inner_provider_settings or {}).get("base_url") is not None:
+        raise ProviderError(
+            "runner: fusion_tier/auto_tier cannot be honored with BYOK custom routing",
+            provider_name="aca",
+            is_retryable=False,
+        )
+    try:
+        check_preference_compatibility(
+            model=agent.model,
+            fusion_tier=agent.fusion_tier,
+            auto_tier=agent.auto_tier,
+            subject=f"runner: agent '{agent.name}'",
+        )
+    except RoutingPreferenceError as exc:
+        raise ProviderError(str(exc), provider_name="aca", is_retryable=False) from exc
 
 
 def _mcp_servers_for_request(request: RunnerAgentRequest) -> dict[str, Any] | None:
@@ -639,7 +680,7 @@ def create_app() -> FastAPI:
             "conductor_version": _conductor_version,
             "runner_version": RUNNER_VERSION,
             "protocol_version": RUNNER_PROTOCOL_VERSION,
-            "features": ["interrupt"],
+            "features": ["interrupt", RUNNER_ROUTING_FEATURE],
             "auth_required": runner_token is not None,
             "auth_token_present": http_request.headers.get(RUNNER_TOKEN_HEADER) is not None,
         }

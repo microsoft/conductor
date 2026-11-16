@@ -17,6 +17,8 @@ workflow:
     max_tokens: 4096
     default_reasoning_effort: medium  # low | medium | high | xhigh | max (optional)
     default_context_tier: default  # default | long_context (optional, Copilot only)
+    default_fusion_tier: high  # standard | high | max (optional, Copilot only)
+    # default_auto_tier: efficiency  # Auto routing preference (optional, Copilot only)
     idle_timeout_seconds: 90  # Copilot only (optional)
     max_idle_recovery_attempts: 5  # Copilot only (optional)
     # Provider-specific settings...
@@ -32,6 +34,10 @@ The `default_context_tier` field sets a workflow-wide default for the model's
 context-window tier that every provider-backed agent inherits unless it
 declares its own `context_tier` override. See [Context Tier](#context-tier)
 for details. This is a Copilot-only capability.
+
+The `default_fusion_tier` and `default_auto_tier` fields set a workflow-wide
+Copilot routing preference for agents whose model is `fusion` or `auto`. See
+[Copilot Fusion and Auto Routing](#copilot-fusion-and-auto-routing).
 
 The `idle_timeout_seconds` and `max_idle_recovery_attempts` fields tune the
 Copilot provider's idle watchdog: when a session stops emitting SDK events
@@ -649,6 +655,107 @@ model).
   `CopilotClient.create_session`. No static capability validation is performed;
   the SDK accepts or rejects the value at session creation.
 - **Other providers** — The value is ignored; there is no equivalent knob.
+
+## Copilot Fusion and Auto Routing
+
+Instead of naming one model, a Copilot agent can let the Copilot runtime route
+its calls:
+
+- **Copilot Fusion** (`model: fusion`) runs a turn across several models and
+  combines their work. `fusion_tier` picks its tier: `standard`, `high` or
+  `max`. Fusion is **experimental**.
+- **Auto** (`model: auto`) lets the runtime pick a model per call. `auto_tier`
+  picks a routing preference such as `efficiency` or `intelligence`. Auto tier
+  identifiers are extensible: Conductor only rejects a blank value, and the
+  runtime validates whether a tier is available to you.
+
+Model names are case-insensitive. Routing tiers are independent of
+`reasoning.effort`, which tunes how hard a model thinks rather than which
+models the runtime uses, so an agent may set both.
+
+```yaml
+workflow:
+  runtime:
+    provider: copilot
+    default_model: fusion
+    default_fusion_tier: high        # applies to agents whose model is `fusion`
+
+agents:
+  - name: draft
+    # Inherits model `fusion` and `default_fusion_tier: high`.
+    prompt: "Draft {{ workflow.input.topic }}"
+
+  - name: review
+    model: auto
+    auto_tier: efficiency            # replaces the workflow default for this agent
+    prompt: "Review the draft"
+
+  - name: deep
+    model: fusion
+    fusion_tier: "{{ workflow.input.tier }}"   # templates render at run time
+    prompt: "Go deep"
+```
+
+### Precedence
+
+- `fusion_tier` and `auto_tier` are mutually exclusive, as are
+  `runtime.default_fusion_tier` and `runtime.default_auto_tier`.
+- An agent that sets either field replaces the workflow default as a unit:
+  `fusion_tier` on an agent cancels `runtime.default_auto_tier` for it, and
+  vice versa.
+- A workflow default applies only to a compatible routed model on Copilot:
+  `default_fusion_tier` to agents whose model is `fusion`, and
+  `default_auto_tier` to agents whose model is `auto`. Other agents, and agents
+  on other providers, are unaffected. `conductor validate` warns when no agent
+  can receive a default.
+- An explicit agent preference must suit the agent's effective model (its own
+  `model:` or `runtime.default_model`): `fusion_tier` needs `fusion` (or
+  `auto`), and `auto_tier` needs `auto`. An incompatible combination is a
+  `conductor validate` error and is refused again by `conductor run` and
+  `conductor resume` after templates render.
+- Dialog turns and output-validator graders are auxiliary sessions: they take
+  only the workflow defaults, under the same model rule, never an agent's own
+  tier.
+
+### Omission, resume and reproducibility
+
+Leaving both fields unset sends no tier. A new session then uses the runtime's
+default routing, which may depend on your user or administrator settings, and a
+resumed session keeps the tier the runtime persisted with it. Set an explicit
+Fusion tier when you want reproducible runs. An explicit tier is resent on
+resume and on interrupted-session continuation, so it overrides the persisted
+value with the same preference.
+
+The deprecated HydraFusion identifiers (`model: hydrafusion`,
+`model: hydrafusion-max`, and the `auto_tier` values `balance`, `hydrafusion`
+and `hydrafusion-max`) still work: Conductor forwards them unchanged. Prefer
+`model: fusion` with `fusion_tier`.
+
+### Requirements and restrictions
+
+- The Copilot provider (directly, or in a Docker or ACA execution profile) with
+  Copilot's own routing. BYOK custom routing (`runtime.provider.base_url` /
+  `type`) cannot route Fusion or Auto, so a configured tier with BYOK is an
+  error. `runtime_url` only connects to an existing Copilot runtime and is
+  allowed.
+- Fusion availability depends on your account, its policies and the Copilot
+  runtime version. Conductor forwards the tier; the runtime decides. A refused
+  tier fails the agent with the runtime's error and is never silently replaced
+  by another tier or dropped. When the runtime reports a degraded Fusion turn
+  or a routing fallback, Conductor logs a warning.
+- Docker and ACA runner images must advertise the `copilot_model_routing`
+  feature. An older image is refused before dispatch with a rebuild
+  instruction; agents without a tier still run on it.
+
+### Cost reporting
+
+A Fusion turn combines several models, so its aggregate tokens have no single
+model's price. Conductor records them under the selector you configured (for
+example `fusion`) with an unknown cost, rather than pricing them at the last
+constituent model's rate. Add a `cost.pricing` entry for that name if you want
+an estimate. Plain Auto reports the concrete model when every call in the turn
+used the same model, and the selector name when calls used different models.
+Because these costs are unknown, a `budget_usd` limit does not count them.
 
 ## MCP Servers
 

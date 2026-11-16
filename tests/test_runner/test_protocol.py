@@ -142,7 +142,7 @@ class TestWireGoldenKeySets:
     """
 
     # Requirement: RunnerAgentPayload serializes to exactly these keys on the
-    # wire — all 13 lifted fields, no more, no less.
+    # wire — all 15 lifted fields, no more, no less.
     def test_payload_wire_keys(self) -> None:
         assert set(_sample_payload().model_dump(mode="json").keys()) == {
             "name",
@@ -158,6 +158,8 @@ class TestWireGoldenKeySets:
             "working_dir",
             "retry",
             "context_tier",
+            "fusion_tier",
+            "auto_tier",
         }
 
     # Requirement: RunnerAgentRequest serializes to exactly these keys — the
@@ -423,7 +425,8 @@ class TestSecretRedaction:
                     expected = {
                         k: v
                         for k, v in expected.items()
-                        if k not in ("temperature", "max_tokens", "tools")
+                        if k
+                        not in ("temperature", "max_tokens", "tools", "fusion_tier", "auto_tier")
                     }
                 assert body[key] == expected
 
