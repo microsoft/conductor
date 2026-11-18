@@ -38,6 +38,9 @@ workflow:
     idle_timeout_seconds: float     # Seconds without SDK events before session is idle (optional, Copilot only, default 90)
     max_idle_recovery_attempts: integer # "please continue" prompts before failing idle session (optional, Copilot only, default 5)
     default_reasoning_effort: string # Workflow-wide reasoning/thinking effort: low, medium, high, xhigh, max (optional)
+    default_fusion_tier: string     # Copilot Fusion tier for agents on model `fusion`: standard, high, max (optional, Copilot only)
+    default_auto_tier: string       # Copilot Auto routing preference for agents on model `auto` (optional, Copilot only;
+                                    # mutually exclusive with default_fusion_tier)
     skills: [string]                # Skills enabled for every provider-backed agent (default: [])
                                     # Each entry is a built-in NAME or a filesystem PATH.
                                     #   name:  "conductor" (the only registered built-in)
@@ -215,6 +218,11 @@ agents:
     reasoning:
       effort: string                # low, medium, high, xhigh, or max
 
+    # Copilot routing tiers (optional, Copilot only, type: agent only; mutually exclusive).
+    # Either one replaces runtime.default_fusion_tier / default_auto_tier for this agent.
+    fusion_tier: string             # standard, high, max, or a {{ }} template; needs model `fusion` (or `auto`)
+    auto_tier: string               # Auto routing preference identifier or template; needs model `auto`
+
     # Skills (optional, only on provider-backed agents)
     # Tri-state via list presence:
     #   - omit:           inherit runtime.skills
@@ -300,6 +308,8 @@ agents:
 - **Hermes**: forwarded to hermes-agent via `reasoning_config={"effort": value}`. Support depends on the underlying model and hermes version. `max` is **not** offered on Hermes; the provider re-checks the resolved effort against its capability tuple at execute time in addition to the static `conductor validate` cross-check, so `max` is rejected both statically and at runtime on this provider.
 
 All three providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and console at `-vv`.
+
+**Copilot routing tiers:** `model: fusion` with `fusion_tier` (`standard`/`high`/`max`) selects experimental Copilot Fusion; `model: auto` with `auto_tier` selects an Auto routing preference (extensible identifiers, validated by the runtime). Defaults apply only to agents on the matching model; an incompatible model, a non-Copilot provider, or BYOK `base_url` routing is a validation error and is refused at run time. Only when neither an agent preference nor a matching workflow default applies does Conductor send no tier, leaving runtime defaults and persisted resume tiers in effect. An explicit tier fixes the requested routing preference, not model choices or results. Fusion usage is reported under the selector label with unknown cost unless `cost.pricing` names it. Routing tiers are independent of `reasoning.effort`.
 
 Forbidden on agent types: `script`, `human_gate`, `workflow`, `wait`.
 

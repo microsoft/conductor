@@ -1062,3 +1062,51 @@ def test_collector_exposes_only_authored_agent_directory_paths(tmp_path: Path) -
         workflow, environment=None, allow_network=False, on_warning=lambda _message: None
     )
     assert (str(skill), "skills/review") in collected.agent_paths
+
+
+def _execute_bodies(log: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(row["stdin"])
+        for row in _rows(log)
+        if row["argv"][:2] == ["exec", "-i"]
+        and "--health" not in row["argv"]
+        and "--interrupt" not in row["argv"]
+        and row["stdin"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_routing_preference_reaches_advertising_runner(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path], tmp_path: Path
+) -> None:
+    # Requirement: a runner advertising routing support receives the resolved tier.
+    backend, log, _state = fake_realm
+    backend._cli_env["FAKE_DOCKER_FEATURES"] = "interrupt,copilot_model_routing"
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+
+    await backend.run_agent(replace(_spec(), model="fusion", fusion_tier="max"), lease)
+    await backend.run_agent(_spec(), lease)
+
+    tiered, plain = _execute_bodies(log)
+    assert tiered["agent"]["fusion_tier"] == "max"
+    assert "auto_tier" not in tiered["agent"]
+    assert "fusion_tier" not in plain["agent"] and "auto_tier" not in plain["agent"]
+    await backend.finalize_run(lease, "succeeded")
+
+
+@pytest.mark.asyncio
+async def test_routing_preference_is_refused_by_old_runner_before_dispatch(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path], tmp_path: Path
+) -> None:
+    # Requirement: an image without the feature is refused with a rebuild remedy, and
+    # requests without tiers still run on it.
+    backend, log, _state = fake_realm
+    backend._cli_env["FAKE_DOCKER_FEATURES"] = "interrupt"
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+
+    with pytest.raises(ConfigurationError, match="copilot_model_routing.*Rebuild"):
+        await backend.run_agent(replace(_spec(), model="auto", auto_tier="efficiency"), lease)
+    assert _execute_bodies(log) == []
+
+    assert (await backend.run_agent(_spec(), lease)).content == {"answer": "agent"}
+    await backend.finalize_run(lease, "succeeded")

@@ -85,6 +85,15 @@ workflow:
                                       # its own `context_tier`.
                                       # See docs/configuration.md#context-tier.
 
+    default_fusion_tier: high         # Optional: standard | high | max (Copilot only)
+                                      # Applies to agents whose model is `fusion`
+                                      # and that set neither fusion_tier nor
+                                      # auto_tier. Mutually exclusive with
+                                      # default_auto_tier.
+    default_auto_tier: efficiency     # Optional: Auto routing preference (Copilot only)
+                                      # Applies to agents whose model is `auto`.
+                                      # See docs/configuration.md#copilot-fusion-and-auto-routing.
+
     idle_timeout_seconds: 90          # Optional: seconds without SDK events before a
                                       # Copilot session is treated as idle (Copilot only).
                                       # Default: 90. Suppressed entirely while a tool
@@ -178,10 +187,61 @@ agents:
                                     # human_gate, questions, workflow).
                                     # See docs/configuration.md#context-tier.
 
+    fusion_tier: high               # Optional: Copilot Fusion tier (Copilot only)
+                                    # standard | high | max, or a {{ }} template.
+                                    # Requires model `fusion` (or `auto`).
+    auto_tier: efficiency           # Optional: Copilot Auto routing preference
+                                    # Requires model `auto`. Mutually exclusive
+                                    # with fusion_tier; either one replaces the
+                                    # runtime routing default for this agent.
+                                    # Only valid on type=agent.
+                                    # See "Copilot Routing Tiers" below.
+
     routes:                         # Optional: Routing logic
       - to: next_agent              # Agent name or $end
         when: "{{ condition }}"     # Optional: Route condition
 ```
+
+### Copilot Routing Tiers
+
+`fusion_tier` and `auto_tier` ask the Copilot runtime to route an agent's
+calls instead of using one named model. They are Copilot-only, only valid on
+`type: agent`, and mutually exclusive.
+
+```yaml
+agents:
+  - name: draft
+    model: fusion
+    fusion_tier: high                 # standard | high | max
+    prompt: "Draft {{ workflow.input.topic }}"
+
+  - name: review
+    model: auto
+    auto_tier: "{{ workflow.input.route | default('efficiency') }}"
+    prompt: "Review the draft"
+```
+
+- **Templates** render with the agent's context when it runs. A Fusion tier
+  must render to `standard`, `high` or `max`; an Auto tier must render to a
+  nonblank identifier. Either rule failing stops the agent before any model
+  call.
+- **Defaults**: an agent without either field inherits
+  `runtime.default_fusion_tier` when its model is `fusion`, or
+  `runtime.default_auto_tier` when its model is `auto`. Setting either field
+  replaces the default entirely.
+- **Omission and resume**: with neither field nor a matching default, nothing is
+  sent. New sessions use the runtime's default routing, and resumed sessions
+  keep the tier the runtime stored with them. A configured tier is resent on
+  resume. An explicit tier fixes the requested routing preference, not model
+  choices or results.
+- **Auxiliary sessions**: dialog turns and `validator:` graders take only the
+  workflow defaults (when their model matches), never the agent's own tier.
+- **Cost**: Fusion tokens are reported under the configured selector (for
+  example `fusion`) with an unknown cost unless `cost.pricing` names it. They
+  are never priced at the rate of the last model that ran.
+
+See [Copilot Fusion and Auto Routing](configuration.md#copilot-fusion-and-auto-routing)
+for requirements, BYOK restrictions and runtime support.
 
 ### Retry Policy
 
@@ -1119,8 +1179,8 @@ are skipped, and `outcome` is `skipped_remaining`.
   compete for one terminal and one dashboard prompt slot, the same reason gates
   are refused). Route to a `questions` step from the group's `routes:` instead.
 - Cannot set `options`, `model`, `provider`, `tools`, `output`, `dialog`,
-  `validator`, `reasoning`, `skills`, `plugins`, `context_tier`,
-  `input_mapping`, `sandbox`, `max_depth`, `timeout_seconds`, `session_key`,
+  `validator`, `reasoning`, `skills`, `plugins`, `context_tier`, `fusion_tier`,
+  `auto_tier`, `input_mapping`, `sandbox`, `max_depth`, `timeout_seconds`, `session_key`,
   `output_mode`, or `working_dir` — no provider is invoked. Note `timeout_seconds` in particular: there is no
   bound on how long a human may take.
 - `abort_route` requires `allow_abort: true`.
@@ -1574,7 +1634,7 @@ MCP steps do not support automatic retries (`retry:` is forbidden). A dashboard 
 
 **Restrictions:**
 
-MCP steps cannot have `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `settings_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
+MCP steps cannot have `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `fusion_tier`, `auto_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `settings_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
 
 ### Sub-Workflow Steps
 

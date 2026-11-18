@@ -497,7 +497,7 @@ requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude-agent-sdk'", specifier = ">=0.2.82" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "genai-prices", specifier = ">=0.1.4" },
-    { name = "github-copilot-sdk", specifier = ">=1.0.9" },
+    { name = "github-copilot-sdk", specifier = ">=1.0.32" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
@@ -804,7 +804,7 @@ wheels = [
 
 [[package]]
 name = "github-copilot-sdk"
-version = "1.0.9"
+version = "1.0.33"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -812,7 +812,7 @@ dependencies = [
     { name = "python-dateutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a7/b5/c4d11863213835b65d19633e62de347001528bb834b5c376dffe6836358a/github_copilot_sdk-1.0.9-py3-none-any.whl", hash = "sha256:4521c9a98ac340e61ce5eb46bcffe0b1f0755cf198282497403776cc65c99fcb", size = 477929, upload-time = "2026-08-06T00:44:01.66Z" },
+    { url = "https://files.pythonhosted.org/packages/76/b1/292f5fe5c236e2c435320ed19667b022620a216d3c4fb0aea6addb6faafa/github_copilot_sdk-1.0.33-py3-none-any.whl", hash = "sha256:e5013214da847ac532395e355a2fccbea84a24739e5ee4e2d275d2e5f2202c38", size = 1113336, upload-time = "2026-11-13T13:50:42.008Z" },
 ]
 
 [[package]]

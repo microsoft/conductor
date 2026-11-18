@@ -794,3 +794,50 @@ async def test_unjoined_owner_is_sticky_after_late_failure(
     finally:
         finish.set()
         await controller.close()
+
+
+async def test_routing_preference_reaches_wire_and_survives_continuation(
+    workspace: ManagedWorkspaceContext,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Requirement: the real SDK serializes the preference as camelCase capi on create,
+    # and a managed continuation resumes with the same effective preference.
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "interrupt")
+    provider = CopilotProvider()
+    signal = asyncio.Event()
+    signal.set()
+    partial = await provider.execute(
+        agent(model="fusion", fusion_tier="high"),
+        {},
+        "p",
+        interrupt_signal=signal,
+        managed_workspace=workspace,
+    )
+    assert partial.partial
+    identity = provider.get_interrupted_session()
+    monkeypatch.setenv("COPILOT_FIXTURE_MODE", "history")
+    await provider.send_followup(identity, "guidance", managed_workspace=workspace)
+    await provider.release_workspace(workspace.root)
+    calls = [item for wire in receipts(tmp_path) for item in wire if item.get("event") == "rpc"]
+    create = next(item for item in calls if item["method"] == "session.create")
+    resume = next(item for item in calls if item["method"] == "session.resume")
+    assert create["params"]["model"] == "fusion"
+    assert create["params"]["capi"] == {"fusionTier": "high"}
+    assert resume["params"]["capi"] == {"fusionTier": "high"}
+
+
+async def test_unset_preference_is_absent_from_wire(
+    workspace: ManagedWorkspaceContext, tmp_path: Path
+) -> None:
+    # Requirement: omission leaves runtime defaults and persisted tiers in place.
+    provider = CopilotProvider()
+    await provider.execute(agent(model="auto"), {}, "p", managed_workspace=workspace)
+    await provider.release_workspace(workspace.root)
+    create = next(
+        item
+        for wire in receipts(tmp_path)
+        for item in wire
+        if item.get("method") == "session.create"
+    )
+    assert "capi" not in create["params"]

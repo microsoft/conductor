@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from conductor.config.environment import AcaProfileOptions
 from conductor.exceptions import ConfigurationError
-from conductor.execution.agent_wire import agent_spec_to_wire_body
+from conductor.execution.agent_wire import RUNNER_ROUTING_FEATURE, agent_spec_to_wire_body
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
     AgentEventSink,
@@ -195,12 +195,21 @@ class AcaRunnerBackend:
                 "use a Docker agent profile for staged components"
             )
         transport = self._get_transport()
-        if self.options is not None and transport._runner_protocol_version is None:
+        routed = spec.fusion_tier is not None or spec.auto_tier is not None
+        if transport._runner_protocol_version is None and (self.options is not None or routed):
             await transport.validate_connection()
         self._protocol_version = transport._runner_protocol_version or 1
         self._interrupt_available = (
             self._protocol_version >= 2 and "interrupt" in transport._runner_features
         )
+        if routed and (
+            self._protocol_version < 2 or RUNNER_ROUTING_FEATURE not in transport._runner_features
+        ):
+            raise ConfigurationError(
+                f"ACA runner does not advertise {RUNNER_ROUTING_FEATURE!r}, so it cannot "
+                "honor fusion_tier/auto_tier; rebuild the runner image from this "
+                "Conductor version"
+            )
         state = self._leases[lease.incarnation]
         scope = identifier_scope or (self.options.identifier_scope if self.options else "agent")
         if self._protocol_version < 2 and spec.env_overlay:

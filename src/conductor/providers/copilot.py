@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -48,6 +49,14 @@ from conductor.providers.base import (
 )
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.context_tier import ContextTier, resolve_context_tier
+from conductor.providers.copilot_routing import (
+    RoutingPreference,
+    RoutingPreferenceError,
+    is_auto_model,
+    is_composite_selector,
+    is_routing_selector,
+    resolve_routing_preference,
+)
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
 from conductor.telemetry import guards
 
@@ -309,6 +318,11 @@ class SDKResponse:
         resolved_model: Model name the SDK reported in the assistant.usage event's
             model field. None when that event is absent (error or interrupt paths)
             or carries no usable model name (the model field is missing or empty).
+        models: Every distinct model named by an assistant.usage event, in
+            first-seen order. More than one means the usage cannot be priced
+            at any single model's rates.
+        fusion: Whether the turn was a Copilot Fusion turn, either requested
+            (a Fusion tier) or reported (any Fusion event).
     """
 
     content: str
@@ -319,6 +333,23 @@ class SDKResponse:
     last_call_input_tokens: int | None = None
     partial: bool = False
     resolved_model: str | None = None
+    models: tuple[str, ...] = ()
+    fusion: bool = False
+
+    @property
+    def composite(self) -> bool:
+        """Whether usage spans several constituent models or a Fusion turn."""
+        return self.fusion or len(self.models) > 1
+
+
+def _merge_models(*groups: Iterable[str]) -> tuple[str, ...]:
+    """Combine model lists, keeping first-seen order and dropping duplicates."""
+    merged: list[str] = []
+    for group in groups:
+        for name in group:
+            if name and name not in merged:
+                merged.append(name)
+    return tuple(merged)
 
 
 def copilot_tool_allowlist(
@@ -444,6 +475,10 @@ class CopilotProvider(AgentProvider):
         # ``runtime.idle_timeout_seconds`` / ``runtime.max_idle_recovery_attempts``
         # tune the IdleRecoveryConfig-backed watchdog (#488).
         idle_recovery=True,
+        # ``fusion_tier`` / ``auto_tier`` (and the runtime defaults) are
+        # forwarded as the SDK's ``capi`` session options on create, resume
+        # and dialog sessions; the runtime owns routing and validation.
+        native_routing_preferences=True,
         max_temperature=1.0,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
@@ -489,6 +524,8 @@ class CopilotProvider(AgentProvider):
         github_token: str | None = None,
         *,
         resolve_environment: bool = True,
+        default_fusion_tier: str | None = None,
+        default_auto_tier: str | None = None,
     ) -> None:
         """Initialize the Copilot provider.
 
@@ -548,7 +585,18 @@ class CopilotProvider(AgentProvider):
                 ``copilot`` CLI session).
             resolve_environment: Fill missing routing and runtime settings from
                 environment variables. False preserves host-effective settings.
+            default_fusion_tier: Workflow-wide Copilot Fusion tier sent as
+                ``capi.fusion_tier`` for ``model: fusion`` sessions whose agent
+                sets no routing preference of its own. ``None`` sends nothing.
+            default_auto_tier: Workflow-wide Auto routing preference sent as
+                ``capi.auto_tier`` for ``model: auto`` sessions whose agent
+                sets no routing preference of its own. ``None`` sends nothing.
+
+        Raises:
+            ValueError: If both routing defaults are set.
         """
+        if default_fusion_tier is not None and default_auto_tier is not None:
+            raise ValueError("default_fusion_tier and default_auto_tier are mutually exclusive")
         self._client: Any = None  # Will hold Copilot SDK client
         self._owned_legacy_client: Any = None
         self._managed_invocations: dict[str, list[_ManagedCopilotInvocation]] = {}
@@ -577,8 +625,13 @@ class CopilotProvider(AgentProvider):
         self._default_max_agent_iterations = max_agent_iterations
         self._default_reasoning_effort = default_reasoning_effort
         self._default_context_tier = default_context_tier
+        self._default_fusion_tier = default_fusion_tier
+        self._default_auto_tier = default_auto_tier
         self._max_schema_depth = 10  # Max nesting depth for recursive schema building
         self._session_ids: dict[str, str] = {}
+        # Sessions created with a Fusion tier, so a follow-up turn on an
+        # interrupted session keeps conservative composite attribution.
+        self._fusion_session_ids: set[str] = set()
         self._resume_session_ids: dict[str, str] = {}
         self._session_cwds: dict[str, str] = {}
         self._resume_session_cwds: dict[str, str] = {}
@@ -866,6 +919,67 @@ class CopilotProvider(AgentProvider):
             return
         session_kwargs["github_token"] = self._github_token
 
+    def _routing_preference(self, model: str, agent: AgentDef | None) -> RoutingPreference:
+        """Resolve the ``capi`` routing preference for one session.
+
+        An agent's own ``fusion_tier`` / ``auto_tier`` replaces the runtime
+        defaults and must suit ``model``; a default applies only to a matching
+        routed model. ``agent=None`` (dialog turns) applies defaults only.
+        Native routing preferences are refused with BYOK custom routing, whose
+        endpoint is not the Copilot router. ``runtime_url`` only changes the
+        transport to the Copilot runtime, so it does not affect this.
+
+        Raises:
+            ValidationError: If the preference cannot be honored as declared.
+        """
+        subject = f"Agent '{agent.name}'" if agent is not None else "Dialog turn"
+        try:
+            preference = resolve_routing_preference(
+                model=model,
+                agent_fusion_tier=agent.fusion_tier if agent is not None else None,
+                agent_auto_tier=agent.auto_tier if agent is not None else None,
+                default_fusion_tier=self._default_fusion_tier,
+                default_auto_tier=self._default_auto_tier,
+                subject=subject,
+            )
+        except RoutingPreferenceError as exc:
+            raise ValidationError(
+                str(exc),
+                suggestion=(
+                    "Use fusion_tier with model 'fusion' and auto_tier with model 'auto', "
+                    "or remove the routing preference."
+                ),
+            ) from exc
+        settings = self._provider_settings
+        if preference and settings is not None and settings.has_custom_routing():
+            field = "fusion_tier" if preference.is_fusion else "auto_tier"
+            origin = "runtime default" if preference.source == "default" else "setting"
+            raise ValidationError(
+                f"{subject}: {field} {origin} is a native Copilot routing preference and "
+                "cannot be honored with BYOK custom routing (runtime.provider base_url / "
+                "type), whose endpoint does not route Fusion or Auto.",
+                suggestion="Remove the routing preference or the custom provider routing.",
+            )
+        return preference
+
+    def _attributed_model(self, agent_model: str | None, response: SDKResponse | None) -> str:
+        """Choose the model name usage and cost are attributed to.
+
+        Composite usage (a Fusion turn, a deprecated HydraFusion selector, or
+        calls to more than one model) keeps the configured selector label: the
+        aggregate tokens have no single model's rates, so pricing them at the
+        last constituent's rate would fabricate a cost. Such a label is
+        unpriced unless the workflow's ``cost.pricing`` names it. Plain Auto
+        (or an unset model) reports the concrete model when usage names
+        exactly one.
+        """
+        configured = agent_model or self._default_model
+        if response is None or response.composite or is_composite_selector(configured):
+            return configured
+        if (agent_model is None or is_auto_model(agent_model)) and response.resolved_model:
+            return response.resolved_model
+        return configured
+
     def _resolve_runtime_connection(self) -> tuple[str, str | None] | None:
         """Resolve whether to connect to an already-running Copilot runtime.
 
@@ -1141,13 +1255,7 @@ class CopilotProvider(AgentProvider):
                 cache_read_tokens=cache_read,
                 cache_write_tokens=cache_write,
                 last_call_input_tokens=last_call_input_tokens,
-                model=(
-                    sdk_response.resolved_model
-                    if sdk_response and agent.model in (None, "auto")
-                    else None
-                )
-                or agent.model
-                or self._default_model,
+                model=self._attributed_model(agent.model, sdk_response),
                 partial=is_partial,
             )
 
@@ -1326,10 +1434,12 @@ class CopilotProvider(AgentProvider):
                 is_retryable=False,
             )
 
+        model = agent.model or self._default_model
+        # Deterministic configuration error: refuse before starting a runtime.
+        routing = self._routing_preference(model, agent)
+
         # Ensure client is started; lock serializes concurrent first calls
         await self._ensure_client_started()
-
-        model = agent.model or self._default_model
 
         full_prompt = rendered_prompt
 
@@ -1467,6 +1577,14 @@ class CopilotProvider(AgentProvider):
                     model,
                 )
 
+            # Native routing preference (Fusion / Auto tier). Omitted when
+            # unset so the runtime default, or the tier persisted with a
+            # resumed session, stays in effect.
+            capi = routing.to_capi()
+            if capi is not None:
+                session_kwargs["capi"] = capi
+                logger.debug("Setting capi=%s for agent %r (model=%s)", capi, agent.name, model)
+
             # Attempt to resume a previous session if one exists for this agent.
             # Resume is only valid when the session was originally created with
             # the same working directory: the SDK bakes cwd into the session's
@@ -1526,6 +1644,8 @@ class CopilotProvider(AgentProvider):
                             resume_kwargs["custom_agents"] = [dict(spec) for spec in custom_agents]
                         self._apply_provider_config(resume_kwargs)
                         self._apply_github_token(resume_kwargs)
+                        if capi is not None:
+                            resume_kwargs["capi"] = dict(capi)
                         session = await self._session_client().resume_session(
                             resume_sid, **resume_kwargs
                         )
@@ -1581,6 +1701,7 @@ class CopilotProvider(AgentProvider):
                     max_session_seconds=effective_max_session,
                     max_agent_iterations=effective_max_iterations,
                     agent_name=agent.name,
+                    routing_preference=routing,
                 )
                 response_content = sdk_response.content
 
@@ -1624,6 +1745,8 @@ class CopilotProvider(AgentProvider):
                         last_call_input_tokens=sdk_response.last_call_input_tokens,
                         partial=True,
                         resolved_model=sdk_response.resolved_model,
+                        models=sdk_response.models,
+                        fusion=sdk_response.fusion or routing.is_fusion,
                     )
                     return partial_content, partial_usage
 
@@ -1637,6 +1760,10 @@ class CopilotProvider(AgentProvider):
                 # each recovery call below.
                 last_call = sdk_response.last_call_input_tokens
                 current_resolved_model = sdk_response.resolved_model
+                # Recovery calls run in the same session, so their models and
+                # Fusion evidence join the turn's attribution.
+                models_seen = sdk_response.models
+                fusion_seen = sdk_response.fusion or routing.is_fusion
 
                 # If no output schema (or output_mode is raw), we're done
                 if output_schema is None:
@@ -1648,6 +1775,8 @@ class CopilotProvider(AgentProvider):
                         cache_write_tokens=cache_write_tokens,
                         last_call_input_tokens=last_call,
                         resolved_model=current_resolved_model,
+                        models=models_seen,
+                        fusion=fusion_seen,
                     )
                     return {"result": response_content}, final_usage
 
@@ -1668,6 +1797,8 @@ class CopilotProvider(AgentProvider):
                             cache_write_tokens=cache_write_tokens,
                             last_call_input_tokens=last_call,
                             resolved_model=current_resolved_model,
+                            models=models_seen,
+                            fusion=fusion_seen,
                         )
                         return parsed_content, final_usage
                     except (json.JSONDecodeError, ValueError, ValidationError) as e:
@@ -1703,6 +1834,8 @@ class CopilotProvider(AgentProvider):
                             verbose_enabled,
                             full_enabled,
                             agent_name=agent.name,
+                            event_callback=event_callback,
+                            routing_preference=routing,
                         )
                         response_content = recovery_response.content
 
@@ -1732,6 +1865,8 @@ class CopilotProvider(AgentProvider):
                         # Keep the latest resolved model (recovery uses the same session/model)
                         if recovery_response.resolved_model:
                             current_resolved_model = recovery_response.resolved_model
+                        models_seen = _merge_models(models_seen, recovery_response.models)
+                        fusion_seen = fusion_seen or recovery_response.fusion
 
                 # All recovery attempts exhausted. A schema-shape failure keeps
                 # its own error: it names the offending field and type, which a
@@ -1817,6 +1952,7 @@ class CopilotProvider(AgentProvider):
         max_session_seconds: float | None = None,
         max_agent_iterations: int | None = None,
         agent_name: str | None = None,
+        routing_preference: RoutingPreference | None = None,
     ) -> SDKResponse:
         """Send a prompt to the session and wait for response.
 
@@ -1839,6 +1975,7 @@ class CopilotProvider(AgentProvider):
                 emitted. The Copilot provider's ``_execute_sdk_call`` always
                 passes ``agent.name`` here, so sequential agents are also
                 tagged with their plain name.
+            routing_preference: Explicitly requested tier, if any.
 
         Returns:
             SDKResponse with content and usage data. Usage is summed across
@@ -1853,6 +1990,8 @@ class CopilotProvider(AgentProvider):
         response_content = ""
         done = asyncio.Event()
         error_message: str | None = None
+        routing_error: str | None = None
+        routing_confirmation: bool | None = None
 
         # Mutable container for last activity: [event_type, tool_call, timestamp]
         # Using a list so the nested callback can mutate it
@@ -1874,6 +2013,17 @@ class CopilotProvider(AgentProvider):
         # Mutable container for the resolved model name (from assistant.usage event)
         resolved_model_ref: list[str | None] = [None]
 
+        # Every distinct model named by assistant.usage, so a turn whose calls
+        # went to several models is never priced as the last one alone.
+        models_seen: list[str] = []
+
+        # Copilot Fusion evidence: [any fusion event seen, aggregate usage
+        # from session.fusion_completed as (input, output, cache_read,
+        # cache_write)]. The aggregate is only a fallback for a turn that
+        # produced no assistant.usage events; it is never added to them, as
+        # it covers the same calls.
+        fusion_ref: list[Any] = [False, None]
+
         # Mutable container for tool iteration counting
         tool_iteration_ref: list[int] = [0]
 
@@ -1886,7 +2036,7 @@ class CopilotProvider(AgentProvider):
         invocation = self._managed_invocation()
 
         def on_event(event: Any) -> None:
-            nonlocal response_content, error_message
+            nonlocal response_content, error_message, routing_error, routing_confirmation
             if (
                 invocation is not None
                 and not invocation.workspace.process_scopes.owners.mutations_allowed(
@@ -1918,6 +2068,23 @@ class CopilotProvider(AgentProvider):
 
             if event_type == "assistant.message":
                 response_content = event.data.content
+            elif event_type == "session.auto_tier_switch_failed":
+                routing_error = self._routing_rejection_message(event)
+                if routing_preference:
+                    done.set()
+            elif event_type in ("session.start", "session.resume", "session.model_change"):
+                model_field = (
+                    "new_model" if event_type == "session.model_change" else "selected_model"
+                )
+                selected_model = getattr(event.data, model_field, None)
+                if isinstance(selected_model, str):
+                    if is_composite_selector(selected_model):
+                        routing_confirmation = True
+                    elif selected_model.strip().lower() == "auto" and routing_preference:
+                        auto_tier = getattr(event.data, "auto_tier", None)
+                        auto_tier = getattr(auto_tier, "value", auto_tier)
+                        if auto_tier is not None and auto_tier == routing_preference.auto_tier:
+                            routing_confirmation = False
             elif event_type == "assistant.usage":
                 # Capture token usage from the assistant.usage event. One
                 # event is emitted per API call, so accumulate across calls
@@ -1960,6 +2127,13 @@ class CopilotProvider(AgentProvider):
                 sdk_model = getattr(event.data, "model", None)
                 if sdk_model:
                     resolved_model_ref[0] = sdk_model
+                    if isinstance(sdk_model, str) and sdk_model not in models_seen:
+                        models_seen.append(sdk_model)
+            elif isinstance(event_type, str) and event_type.startswith(
+                ("session.fusion_", "assistant.fusion_")
+            ):
+                fusion_ref[0] = True
+                self._note_fusion_event(event_type, event, agent_name, fusion_ref, event_callback)
             elif event_type == "session.idle":
                 done.set()
             elif event_type == "error" or event_type == "session.error":
@@ -2036,6 +2210,20 @@ class CopilotProvider(AgentProvider):
             agent_name=agent_name,
             active_tools_ref=active_tools,
         )
+        if routing_error is not None and routing_preference:
+            raise ProviderError(routing_error, is_retryable=False)
+        sid = getattr(session, "session_id", None)
+        if isinstance(sid, str) and routing_error is None and routing_preference:
+            self._check_managed_mutations()
+            if routing_preference.is_fusion or routing_confirmation is True:
+                self._fusion_session_ids.add(sid)
+            elif routing_confirmation is False:
+                self._fusion_session_ids.discard(sid)
+        fusion_ref[0] = fusion_ref[0] or sid in self._fusion_session_ids
+        aggregate = fusion_ref[1]
+        if aggregate is not None and all(value is None for value in usage_ref):
+            usage_ref[:] = list(aggregate)
+
         if was_interrupted:
             # Return partial content (don't check error_message for partial)
             return SDKResponse(
@@ -2047,6 +2235,8 @@ class CopilotProvider(AgentProvider):
                 last_call_input_tokens=last_call_ref[0],
                 partial=True,
                 resolved_model=resolved_model_ref[0],
+                models=tuple(models_seen),
+                fusion=bool(fusion_ref[0]),
             )
 
         if error_message:
@@ -2063,7 +2253,74 @@ class CopilotProvider(AgentProvider):
             cache_write_tokens=usage_ref[3],
             last_call_input_tokens=last_call_ref[0],
             resolved_model=resolved_model_ref[0],
+            models=tuple(models_seen),
+            fusion=bool(fusion_ref[0]),
         )
+
+    @staticmethod
+    def _routing_rejection_message(event: Any) -> str:
+        data = getattr(event, "data", None)
+        values = [
+            getattr(data, name, None)
+            for name in ("reason", "requested_auto_tier", "effective_auto_tier")
+        ]
+        reason, requested, effective = [getattr(value, "value", value) for value in values]
+        return (
+            f"Copilot routing preference rejected: {reason}; "
+            f"requested_auto_tier={requested!r}, effective_auto_tier={effective!r}"
+        )
+
+    @staticmethod
+    def _note_fusion_event(
+        event_type: str,
+        event: Any,
+        agent_name: str | None,
+        fusion_ref: list[Any],
+        event_callback: EventCallback | None = None,
+    ) -> None:
+        """Record fallback aggregate usage and warn about degraded Fusion routing."""
+        data = getattr(event, "data", None)
+        label = f"agent '{agent_name}'" if agent_name else "a Copilot session"
+        message = None
+        reason = None
+        fallback = None
+        if event_type == "session.fusion_completed":
+            counts = [
+                getattr(data, name, None)
+                for name in ("input_tokens", "output_tokens", "cached_tokens", "cache_write_tokens")
+            ]
+            if any(isinstance(value, int | float) for value in counts):
+                fusion_ref[1] = tuple(
+                    int(value) if isinstance(value, int | float) else None for value in counts
+                )
+            reason = getattr(data, "degraded_reason", None)
+            if isinstance(reason, str) and reason:
+                message = f"Copilot Fusion turn for {label} completed degraded: {reason}"
+        elif event_type == "session.fusion_route_failed":
+            reason = getattr(data, "reason", None)
+            fallback = getattr(data, "fallback_model", None)
+            reason = reason if isinstance(reason, str) and reason else "no reason given"
+            fallback = fallback if isinstance(fallback, str) and fallback else "another model"
+            message = (
+                f"Copilot Fusion routing failed for {label} ({reason}); "
+                f"the runtime fell back to {fallback}"
+            )
+        if message is not None:
+            logger.warning("%s", message)
+            if event_callback is not None:
+                try:
+                    event_callback(
+                        "agent_routing_warning",
+                        {
+                            "agent_name": agent_name,
+                            "message": message,
+                            "reason": reason,
+                            "fallback_model": fallback,
+                            "source_event": event_type,
+                        },
+                    )
+                except Exception:
+                    logger.warning("Could not deliver Copilot routing warning", exc_info=True)
 
     async def _abort_session(self, session: Any, done: asyncio.Event) -> None:
         """Attempt to abort a Copilot SDK session.
@@ -2123,6 +2380,7 @@ class CopilotProvider(AgentProvider):
         agent_model: str | None = None,
         *,
         managed_workspace: ManagedWorkspaceContext | None = None,
+        _routing_preference: RoutingPreference | None = None,
     ) -> AgentOutput:
         """Send follow-up guidance to an interrupted session.
 
@@ -2143,6 +2401,7 @@ class CopilotProvider(AgentProvider):
                 used when the follow-up response does not report a resolved model.
             managed_workspace: Required for a managed interrupted session; resumes
                 its disk SID in a fresh owned runtime with the original cwd.
+            _routing_preference: Retained tier reapplied by a managed resume.
 
         Returns:
             AgentOutput with the follow-up response content.
@@ -2160,7 +2419,15 @@ class CopilotProvider(AgentProvider):
                 resumed = await self._session_client().resume_session(
                     session.session_id, **session.resume_kwargs
                 )
-                return await self.send_followup(resumed, guidance, agent_name, agent_model)
+                return await self.send_followup(
+                    resumed,
+                    guidance,
+                    agent_name,
+                    agent_model,
+                    _routing_preference=RoutingPreference(
+                        **(session.resume_kwargs.get("capi") or {})
+                    ),
+                )
 
             return await self._managed_call(managed_workspace, session.cwd, resume)
         if isinstance(session, _ManagedCopilotSession):
@@ -2179,7 +2446,10 @@ class CopilotProvider(AgentProvider):
                 verbose_enabled,
                 full_enabled,
                 agent_name=agent_name,
+                routing_preference=_routing_preference,
             )
+            if getattr(session, "session_id", None) in self._fusion_session_ids:
+                sdk_response = dataclasses.replace(sdk_response, fusion=True)
 
             content: dict[str, Any]
             try:
@@ -2200,9 +2470,7 @@ class CopilotProvider(AgentProvider):
                 cache_read_tokens=sdk_response.cache_read_tokens,
                 cache_write_tokens=sdk_response.cache_write_tokens,
                 last_call_input_tokens=sdk_response.last_call_input_tokens,
-                model=(sdk_response.resolved_model if agent_model in (None, "auto") else None)
-                or agent_model
-                or self._default_model,
+                model=self._attributed_model(agent_model, sdk_response),
             )
         finally:
             if (invocation := self._managed_invocation()) is not None:
@@ -3572,6 +3840,7 @@ class CopilotProvider(AgentProvider):
         *,
         managed_workspace: ManagedWorkspaceContext | None = None,
         working_dir: str | None = None,
+        event_callback: EventCallback | None = None,
     ) -> str:
         """Execute a single dialog turn using a lightweight Copilot session.
 
@@ -3588,6 +3857,7 @@ class CopilotProvider(AgentProvider):
                 and a fresh client rather than the provider's legacy runtime.
             working_dir: Explicit resolved staged cwd, required with
                 managed_workspace. Omitted on legacy calls.
+            event_callback: Optional callback for routing warnings.
 
         Returns:
             The agent's response text.
@@ -3604,7 +3874,9 @@ class CopilotProvider(AgentProvider):
             return await self._managed_call(
                 managed_workspace,
                 working_dir,
-                lambda: self.execute_dialog_turn(system_prompt, user_message, history, model),
+                lambda: self.execute_dialog_turn(
+                    system_prompt, user_message, history, model, event_callback=event_callback
+                ),
             )
         await self._ensure_client_started()
 
@@ -3661,15 +3933,26 @@ class CopilotProvider(AgentProvider):
                     dialog_kwargs["model"],
                 )
 
+            # Dialog turns honor only the workflow-wide routing defaults, and
+            # only for a matching routed model, like the settings above.
+            capi = self._routing_preference(dialog_kwargs["model"], None).to_capi()
+            if capi is not None:
+                dialog_kwargs["capi"] = capi
+                logger.debug(
+                    "Setting capi=%s for dialog turn (model=%s)", capi, dialog_kwargs["model"]
+                )
+
             session = await self._session_client().create_session(**dialog_kwargs)
 
             response_content = ""
             done = asyncio.Event()
             error_message: str | None = None
+            routing_error: str | None = None
+            fusion_ref: list[Any] = [False, None]
             invocation = self._managed_invocation()
 
             def on_event(event: Any) -> None:
-                nonlocal response_content, error_message
+                nonlocal response_content, error_message, routing_error
                 if (
                     invocation is not None
                     and not invocation.workspace.process_scopes.owners.mutations_allowed(
@@ -3680,6 +3963,11 @@ class CopilotProvider(AgentProvider):
                 event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
                 if event_type == "assistant.message":
                     response_content = event.data.content
+                elif event_type == "session.auto_tier_switch_failed" and capi is not None:
+                    routing_error = self._routing_rejection_message(event)
+                    done.set()
+                elif event_type.startswith(("session.fusion_", "assistant.fusion_")):
+                    self._note_fusion_event(event_type, event, None, fusion_ref, event_callback)
                 elif event_type == "session.idle":
                     done.set()
                 elif event_type in ("error", "session.error"):
@@ -3696,6 +3984,9 @@ class CopilotProvider(AgentProvider):
                     "Dialog turn timed out after 120s",
                     is_retryable=False,
                 ) from exc
+
+            if routing_error is not None:
+                raise ProviderError(routing_error, is_retryable=False)
 
             if error_message:
                 raise ProviderError(
@@ -3757,6 +4048,10 @@ class CopilotProvider(AgentProvider):
         ``billing`` object without one, which kills the entire listing.
         """
         if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return None
+        # A routing selector has no single context window; reporting one would
+        # turn a constituent model's prompt size into a fabricated percentage.
+        if is_routing_selector(model):
             return None
         try:
             await self._ensure_client_started()
@@ -3821,6 +4116,10 @@ class CopilotProvider(AgentProvider):
         field (see :meth:`get_max_prompt_tokens`).
         """
         if self._mock_handler is not None or not COPILOT_SDK_AVAILABLE:
+            return None
+        # A routing selector (``auto`` / ``fusion`` / HydraFusion) is not a
+        # model with one rate; only a workflow ``cost.pricing`` entry prices it.
+        if is_routing_selector(model):
             return None
         try:
             await self._ensure_client_started()

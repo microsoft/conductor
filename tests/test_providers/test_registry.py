@@ -707,7 +707,40 @@ class TestConfigPassing:
             default_reasoning_effort="high",
             provider_settings=config.workflow.runtime.provider,
             tool_output=config.workflow.runtime.tool_output,
+            default_fusion_tier=None,
+            default_auto_tier=None,
         )
+
+    @patch("conductor.providers.registry.create_provider")
+    async def test_routing_defaults_reach_every_created_provider(
+        self, mock_create: MagicMock
+    ) -> None:
+        # Requirement: workflow routing defaults reach the factory for every provider
+        # type, while structured provider settings stay with their own type.
+        mock_create.side_effect = lambda **_kwargs: MockProvider()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test-workflow",
+                entry_point="agent1",
+                runtime=RuntimeConfig(provider="copilot", default_fusion_tier="high"),
+            ),
+            agents=[AgentDef(name="agent1", prompt="test")],
+            output={"result": "test"},
+        )
+        registry = ProviderRegistry(config)
+        await registry.get_provider(AgentDef(name="agent1", prompt="test"))
+        await registry.get_provider(AgentDef(name="agent2", prompt="test", provider="claude"))
+        await registry.get_provider(AgentDef(name="agent3", prompt="test"))
+
+        assert mock_create.call_count == 2
+        copilot_call, claude_call = (call.kwargs for call in mock_create.call_args_list)
+        assert copilot_call["provider_type"] == "copilot"
+        assert copilot_call["default_fusion_tier"] == "high"
+        assert copilot_call["default_auto_tier"] is None
+        assert copilot_call["provider_settings"] is config.workflow.runtime.provider
+        assert claude_call["provider_type"] == "claude"
+        assert claude_call["default_fusion_tier"] == "high"
+        assert claude_call["provider_settings"] is None
 
     @patch("conductor.providers.registry.create_provider")
     @pytest.mark.asyncio

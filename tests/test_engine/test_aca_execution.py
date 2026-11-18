@@ -374,3 +374,93 @@ async def test_negotiated_interrupt_targets_execution_id() -> None:
     assert requests[0].url.path == "/interrupt"
     assert json.loads(requests[0].content) == {"execution_id": "call-1"}
     await provider.close()
+
+
+def _routing_gateway(
+    features: list[str], protocol_version: int, requests: list[httpx.Request]
+) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/health":
+            return httpx.Response(
+                200,
+                json={"ready": True, "protocol_version": protocol_version, "features": features},
+            )
+        frame = {"type": "result", "data": {"content": {"answer": "done"}}}
+        return httpx.Response(200, content=json.dumps(frame) + "\n")
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_profile_sends_routing_tier_to_advertising_runner() -> None:
+    # Requirement: tier-bearing requests are admitted only after feature negotiation.
+    requests: list[httpx.Request] = []
+    transport = _provider(_routing_gateway(["interrupt", "copilot_model_routing"], 2, requests))
+    backend = AcaRunnerBackend(
+        AcaProfileOptions(pool_endpoint="https://pool.example.com"), transport=transport
+    )
+    lease = await backend.prepare_run(RunSpec("run-1"))
+
+    await backend.run_agent(replace(_spec(), model="fusion", fusion_tier="high"), lease)
+
+    body = json.loads(requests[-1].content)
+    assert body["agent"]["fusion_tier"] == "high"
+    assert "auto_tier" not in body["agent"]
+    await backend.finalize_run(lease, "succeeded")
+
+
+@pytest.mark.parametrize(("features", "protocol_version"), [(["interrupt"], 2), ([], 1)])
+@pytest.mark.asyncio
+async def test_profile_refuses_routing_tier_on_older_runner(
+    features: list[str], protocol_version: int
+) -> None:
+    requests: list[httpx.Request] = []
+    transport = _provider(_routing_gateway(features, protocol_version, requests))
+    backend = AcaRunnerBackend(
+        AcaProfileOptions(pool_endpoint="https://pool.example.com"), transport=transport
+    )
+    lease = await backend.prepare_run(RunSpec("run-1"))
+
+    with pytest.raises(ConfigurationError, match="copilot_model_routing.*rebuild"):
+        await backend.run_agent(replace(_spec(), model="auto", auto_tier="efficiency"), lease)
+
+    assert [request.url.path for request in requests] == ["/health"]
+    await backend.finalize_run(lease, "succeeded")
+
+
+@pytest.mark.parametrize(("features", "protocol_version"), [(["interrupt"], 2), ([], 1)])
+@pytest.mark.asyncio
+async def test_tier_free_requests_still_run_on_older_runners(
+    features: list[str], protocol_version: int
+) -> None:
+    # Requirement: hosts omit unset routing fields, so old strict runners keep working.
+    requests: list[httpx.Request] = []
+    transport = _provider(_routing_gateway(features, protocol_version, requests))
+    backend = AcaRunnerBackend(
+        AcaProfileOptions(pool_endpoint="https://pool.example.com"), transport=transport
+    )
+    lease = await backend.prepare_run(RunSpec("run-1"))
+
+    result = await backend.run_agent(_spec(), lease)
+
+    assert result.content == {"answer": "done"}
+    body = json.loads(requests[-1].content)
+    assert "fusion_tier" not in body["agent"] and "auto_tier" not in body["agent"]
+    await backend.finalize_run(lease, "succeeded")
+
+
+@pytest.mark.asyncio
+async def test_legacy_backend_negotiates_before_sending_routing_tier() -> None:
+    # Requirement: the legacy path, which normally skips the pre-flight, probes the
+    # runner before a tier-bearing request.
+    requests: list[httpx.Request] = []
+    transport = _provider(_routing_gateway(["copilot_model_routing"], 2, requests))
+    backend = AcaRunnerBackend(transport=transport)
+    lease = await backend.prepare_run(RunSpec("run-1"))
+
+    await backend.run_agent(replace(_spec(), model="fusion", fusion_tier="max"), lease)
+
+    assert [request.url.path for request in requests] == ["/health", "/execute"]
+    assert json.loads(requests[-1].content)["agent"]["fusion_tier"] == "max"
+    await backend.finalize_run(lease, "succeeded")

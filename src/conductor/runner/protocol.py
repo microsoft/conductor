@@ -127,6 +127,18 @@ class RunnerAgentPayload(BaseModel):
     rendered from any ``{{ ... }}`` template on the host. ``None`` means no
     per-agent override — the inner provider uses its own default."""
 
+    fusion_tier: str | None = None
+    """Effective Copilot Fusion tier, already merged from the agent and
+    ``runtime.default_fusion_tier`` on the host. ``None`` sends no preference.
+
+    Omitted from the wire when unset: runners that predate the field reject
+    it under ``extra="forbid"``, so hosts send it only to runners advertising
+    the ``copilot_model_routing`` health feature."""
+
+    auto_tier: str | None = None
+    """Effective Copilot Auto routing preference, merged on the host like
+    ``fusion_tier`` and omitted from the wire when unset."""
+
 
 class RunnerAgentRequest(BaseModel):
     """Body of ``POST {endpoint}/execute?identifier=<id>``.
@@ -371,7 +383,7 @@ def request_to_wire_body(request: RunnerAgentRequest) -> dict[str, Any]:
     body = request.model_dump(mode="json")
     # Legacy ACA requests do not carry newer optional agent fields; keep
     # their v1 payload shape intact when the host sends null defaults.
-    for key in ("temperature", "max_tokens", "tools"):
+    for key in ("temperature", "max_tokens", "tools", "fusion_tier", "auto_tier"):
         if body["agent"][key] is None:
             del body["agent"][key]
     # Legacy ACA callers construct no v2 fields; omitting their null defaults

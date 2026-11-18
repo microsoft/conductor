@@ -255,6 +255,16 @@ class ProviderCapabilities(BaseModel):
     bound, so a mismatch is a validate-time **warning**, not an error.
     Defaults to ``False``."""
 
+    native_routing_preferences: bool = False
+    """``True`` when the provider forwards Copilot routing preferences.
+
+    Covers per-agent ``fusion_tier`` / ``auto_tier`` and the workflow-wide
+    ``runtime.default_fusion_tier`` / ``runtime.default_auto_tier``, which the
+    Copilot runtime applies to ``model: fusion`` / ``model: auto`` sessions.
+    An explicit agent preference on a provider that declares ``False`` is a
+    validate-time error and is refused at run time; a runtime default simply
+    does not apply. Defaults to ``False``."""
+
     max_temperature: float | None = None
     """Highest temperature the provider accepts.
 

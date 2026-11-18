@@ -1,0 +1,86 @@
+# Copilot Fusion and Auto Routing Workflow
+#
+# This example demonstrates letting the Copilot runtime route model calls
+# instead of naming one model. It shows:
+# - Copilot Fusion (`model: fusion`) with an explicit workflow-wide tier via
+#   `runtime.default_fusion_tier`
+# - An agent that opts into Auto routing (`model: auto`) with its own
+#   `auto_tier`, which replaces the workflow default for that agent
+# - Tool-free agents (`tools: []`), so the example only spends model quota
+#
+# Copilot Fusion is experimental and depends on your Copilot account, its
+# policies, and the Copilot runtime version.
+# Explicit tiers (`standard`, `high`, `max`) fix the preference, not model choices or results.
+# No tier is sent only when neither an agent preference nor a matching workflow default applies.
+# Routing tiers are independent of `reasoning.effort`.
+#
+# Fusion turns combine several models, so their tokens are reported under the
+# `fusion` label with an unknown cost unless you add a `cost.pricing` entry
+# for it.
+#
+# Usage:
+#   conductor run examples/copilot-fusion.yaml \
+#     --input question="What trade-offs matter when choosing a consensus algorithm?"
+
+workflow:
+  name: copilot-fusion
+  description: Answers with Copilot Fusion and double-checks with Auto routing
+  version: "1.0.0"
+  entry_point: answer
+
+  runtime:
+    provider: copilot
+    default_model: fusion
+    # Applies to every agent whose model is `fusion` and that does not set
+    # its own fusion_tier or auto_tier.
+    default_fusion_tier: high
+
+  input:
+    question:
+      type: string
+      required: true
+      description: The question to answer
+
+agents:
+  - name: answer
+    description: Drafts an answer with Copilot Fusion at the workflow's High tier
+    # No model or tier here: inherits `default_model: fusion` and
+    # `default_fusion_tier: high`.
+    tools: []
+    prompt: |
+      Answer the following question thoroughly but concisely.
+
+      Question: {{ workflow.input.question }}
+    output:
+      answer:
+        type: string
+        description: The answer to the question
+    routes:
+      - to: review
+
+  - name: review
+    description: Reviews the draft using Auto routing with its own routing preference
+    model: auto
+    # An agent preference replaces the workflow default as a unit.
+    auto_tier: efficiency
+    tools: []
+    input:
+      - workflow.input.question
+      - answer.output.answer
+    prompt: |
+      Review this answer for accuracy and completeness.
+
+      Question: {{ workflow.input.question }}
+
+      Answer:
+      {{ answer.output.answer }}
+    output:
+      verdict:
+        type: string
+        description: One sentence on whether the answer is accurate and complete
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answer.output.answer }}"
+  verdict: "{{ review.output.verdict }}"

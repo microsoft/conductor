@@ -25,6 +25,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **Terminate steps** - Explicit terminal step with `status` (`success`/`failed`) and structured `reason` — distinguishable from the default `$end` path in CLI exit codes, dashboard state, and event logs
 - **Dialog mode** - Agents can pause for multi-turn conversation when uncertain
 - **Reasoning effort** - Unified `reasoning.effort` (low/medium/high/xhigh/max) per agent or workflow-wide, translated to each provider's native API
+- **Copilot Fusion and Auto routing** - `model: fusion` with `fusion_tier` (standard/high/max) or `model: auto` with `auto_tier`, per agent or workflow-wide; see [configuration](docs/configuration.md#copilot-fusion-and-auto-routing)
 - **Workspace instructions** - Auto-discover and inject `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` into every agent's prompt
 - **Conditional routing** - Route between agents based on output conditions
 - **Human-in-the-loop** - Pause for human decisions with Markdown-rendered prompts and clickable file links

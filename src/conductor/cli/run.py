@@ -1301,6 +1301,11 @@ class ConsoleEventSubscriber:
                 style="yellow",
             )
 
+        elif t == "agent_routing_warning":
+            message = d.get("message", "Provider routing degraded")
+            logger.warning("%s", message)
+            verbose_log(Text(f"  WARNING: {message}"), style="yellow")
+
         elif t == "agent_parse_recovery":
             agent_name = d.get("agent_name", "?")
             attempt = d.get("attempt", "?")

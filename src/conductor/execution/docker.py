@@ -28,6 +28,7 @@ from typing import cast
 from uuid import uuid4
 
 from conductor.exceptions import ConfigurationError
+from conductor.execution.agent_wire import RUNNER_ROUTING_FEATURE
 from conductor.execution.docker_agent import InterruptOutcome, stream_agent
 from conductor.execution.docker_paths import map_agent_paths
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
@@ -544,6 +545,15 @@ class DockerRunnerBackend:
         state = self._lease_states.get(self._lease_key(lease))
         if state is None:
             raise ConfigurationError("Docker lease was not prepared by this backend")
+        if (
+            spec.fusion_tier is not None or spec.auto_tier is not None
+        ) and RUNNER_ROUTING_FEATURE not in runner.features:
+            image = spec.execution.image if spec.execution is not None else "<unknown>"
+            raise ConfigurationError(
+                f"Docker runner image {image!r} does not advertise "
+                f"{RUNNER_ROUTING_FEATURE!r}, so it cannot honor fusion_tier/auto_tier. "
+                "Rebuild the runner image from this Conductor version."
+            )
         mapped = map_agent_paths(spec, state.run.bundle)
 
         async def send_interrupt(execution_id: str) -> InterruptOutcome:

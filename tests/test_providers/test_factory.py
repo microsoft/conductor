@@ -788,3 +788,60 @@ class TestClaudeAgentSdkAuthModeFactory:
             pytest.raises(ProviderError, match="Not logged in"),
         ):
             await create_provider("claude-agent-sdk", validate=True)
+
+
+class TestRoutingDefaultsFactory:
+    """Workflow routing defaults reach the providers that forward them."""
+
+    @pytest.mark.asyncio
+    async def test_copilot_receives_routing_defaults(self) -> None:
+        provider = await create_provider("copilot", validate=False, default_fusion_tier="high")
+        assert isinstance(provider, CopilotProvider)
+        assert provider._default_fusion_tier == "high"
+        assert provider._default_auto_tier is None
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_config_path_forwards_routing_defaults(self) -> None:
+        from conductor.config.schema import RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        provider = await ProviderFactory.create_provider(
+            RuntimeConfig(provider="copilot", default_auto_tier="efficiency"), validate=False
+        )
+        assert isinstance(provider, CopilotProvider)
+        assert provider._default_auto_tier == "efficiency"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_instances_do_not_share_routing_defaults(self) -> None:
+        # Requirement: settings are per provider instance, never process-wide.
+        first = await create_provider("copilot", validate=False, default_fusion_tier="max")
+        second = await create_provider("copilot", validate=False)
+        assert isinstance(first, CopilotProvider) and isinstance(second, CopilotProvider)
+        assert (first._default_fusion_tier, second._default_fusion_tier) == ("max", None)
+        await first.close()
+        await second.close()
+
+    @pytest.mark.asyncio
+    async def test_aca_compatibility_provider_receives_routing_defaults(self) -> None:
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        settings = ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
+        with (
+            patch("conductor.providers.factory.AZURE_IDENTITY_AVAILABLE", True),
+            patch("conductor.providers.aca.AZURE_IDENTITY_AVAILABLE", True),
+        ):
+            provider = await create_provider(
+                "aca", validate=False, provider_settings=settings, default_auto_tier="efficiency"
+            )
+        assert isinstance(provider, AcaRuntimeProvider)
+        assert provider._default_auto_tier == "efficiency"
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_other_providers_accept_and_ignore_routing_defaults(self) -> None:
+        provider = await create_provider("claude", validate=False, default_fusion_tier="high")
+        assert isinstance(provider, ClaudeProvider)
+        assert not hasattr(provider, "_default_fusion_tier")
+        await provider.close()

@@ -29,6 +29,12 @@ from pydantic import (
 from conductor.duration import parse_duration
 from conductor.file_string import FileString
 from conductor.providers.context_tier import ContextTier
+from conductor.providers.copilot_routing import (
+    FUSION_TIERS,
+    FusionTier,
+    RoutingPreferenceError,
+    validate_auto_tier,
+)
 from conductor.providers.reasoning import ReasoningEffort
 from conductor.skills.discovery import DiscoverySource
 from conductor.templating import is_jinja_template
@@ -1348,6 +1354,18 @@ class AgentDef(ExecutableStepBase):
     provider: ProviderName | None = None
     model: str | None = None
     context_tier: ContextTier | str | None = None
+    fusion_tier: FusionTier | str | None = None
+    """Copilot Fusion tier (``standard``/``high``/``max``) or a ``{{ ... }}`` template.
+
+    Requires ``model: fusion`` (or ``auto``) on the Copilot provider. Replaces
+    ``runtime.default_fusion_tier`` / ``runtime.default_auto_tier`` for this agent.
+    """
+    auto_tier: str | None = None
+    """Copilot Auto routing preference identifier or a ``{{ ... }}`` template.
+
+    Requires ``model: auto`` on the Copilot provider. Identifiers are extensible
+    and validated by the runtime. Mutually exclusive with ``fusion_tier``.
+    """
     tools: list[str] | None = None
     system_prompt: str | None = None
     prompt: str = ""
@@ -1397,6 +1415,16 @@ class AgentDef(ExecutableStepBase):
     def validate_skills(cls, value: list[str] | None) -> list[str] | None:
         return value if value is None else _validate_skill_entries(value)
 
+    @field_validator("auto_tier")
+    @classmethod
+    def validate_auto_tier_value(cls, value: str | None) -> str | None:
+        if value is None or is_jinja_template(value):
+            return value
+        try:
+            return validate_auto_tier(value)
+        except RoutingPreferenceError as exc:
+            raise ValueError(str(exc)) from exc
+
     @field_validator("plugins", mode="before")
     @classmethod
     def coerce_plugins(cls, value: Any) -> Any:
@@ -1417,6 +1445,17 @@ class AgentDef(ExecutableStepBase):
             raise ValueError(
                 f"context_tier must be one of {list(get_args(ContextTier))} "
                 f"or a '{{{{ ... }}}}' template (got {self.context_tier!r})"
+            )
+        if self.fusion_tier is not None and self.auto_tier is not None:
+            raise ValueError("fusion_tier and auto_tier are mutually exclusive; set at most one")
+        if (
+            self.fusion_tier is not None
+            and not is_jinja_template(self.fusion_tier)
+            and self.fusion_tier not in FUSION_TIERS
+        ):
+            raise ValueError(
+                f"fusion_tier must be one of {list(FUSION_TIERS)} "
+                f"or a '{{{{ ... }}}}' template (got {self.fusion_tier!r})"
             )
         if self.output_mode == "raw" and self.output:
             raise ValueError(
@@ -2915,6 +2954,24 @@ class RuntimeConfig(BaseModel):
     ``create_session`` ``context_tier`` param). Other providers ignore it.
     """
 
+    default_fusion_tier: FusionTier | None = None
+    """Workflow-wide Copilot Fusion tier for agents whose model is ``fusion``.
+
+    Copilot provider only. Applies only to agents whose effective model is
+    ``fusion`` and that set neither ``fusion_tier`` nor ``auto_tier``. ``None``
+    sends no tier, leaving the runtime default and any persisted resume
+    preference in place. Mutually exclusive with ``default_auto_tier``.
+    """
+
+    default_auto_tier: str | None = None
+    """Workflow-wide Copilot Auto routing preference for agents whose model is ``auto``.
+
+    Copilot provider only. Applies only to agents whose effective model is
+    ``auto`` and that set neither ``fusion_tier`` nor ``auto_tier``. Identifiers
+    are extensible literals, not templates. Mutually exclusive with
+    ``default_fusion_tier``.
+    """
+
     working_dir: str | None = None
     """Workflow-wide default working directory for provider-backed agents.
 
@@ -3062,6 +3119,29 @@ class RuntimeConfig(BaseModel):
     def validate_skills(cls, v: list[str]) -> list[str]:
         """Validate workflow-default ``skills:`` entry shape and built-in names."""
         return _validate_skill_entries(v)
+
+    @field_validator("default_auto_tier")
+    @classmethod
+    def validate_default_auto_tier(cls, v: str | None) -> str | None:
+        """Require a nonblank literal because runtime defaults are not rendered."""
+        if v is None:
+            return v
+        if is_jinja_template(v):
+            raise ValueError("default_auto_tier must be a literal identifier, not a template")
+        try:
+            return validate_auto_tier(v, field_name="default_auto_tier")
+        except RoutingPreferenceError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @model_validator(mode="after")
+    def _routing_defaults_exclusive(self) -> RuntimeConfig:
+        """Allow at most one workflow-wide Copilot routing preference."""
+        if self.default_fusion_tier is not None and self.default_auto_tier is not None:
+            raise ValueError(
+                "runtime.default_fusion_tier and runtime.default_auto_tier are "
+                "mutually exclusive; set at most one"
+            )
+        return self
 
 
 _REMOVED_WORKFLOW_FIELDS: dict[str, str] = {

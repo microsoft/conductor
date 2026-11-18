@@ -2285,3 +2285,131 @@ class TestAcaProtocolVersionSkewWarnings:
             assert await provider.validate_connection() is True
 
         assert caplog.records == []
+
+
+class TestAcaRoutingPreferences:
+    """Legacy ``provider: aca`` forwards Copilot routing preferences to its runner."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_routing_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in (
+            "COPILOT_PROVIDER_BASE_URL",
+            "COPILOT_PROVIDER_API_KEY",
+            "COPILOT_PROVIDER_BEARER_TOKEN",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    @staticmethod
+    def _provider(**defaults: str):
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        settings = ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
+        with patch("conductor.providers.aca.AZURE_IDENTITY_AVAILABLE", True):
+            return AcaRuntimeProvider(provider_settings=settings, **defaults)
+
+    def test_default_reaches_request_for_matching_model(self) -> None:
+        provider = self._provider(default_fusion_tier="high")
+
+        fusion = provider._build_request(_agent(model="fusion"), {}, "x", None)
+        other = provider._build_request(_agent(model="gpt-5"), {}, "x", None)
+
+        assert (fusion.agent.fusion_tier, fusion.agent.auto_tier) == ("high", None)
+        assert (other.agent.fusion_tier, other.agent.auto_tier) == (None, None)
+
+    def test_agent_preference_replaces_default(self) -> None:
+        provider = self._provider(default_fusion_tier="high")
+
+        request = provider._build_request(
+            _agent(model="auto", auto_tier="efficiency"), {}, "x", None
+        )
+
+        assert (request.agent.fusion_tier, request.agent.auto_tier) == (None, "efficiency")
+
+    def test_legacy_wire_body_omits_unset_preferences(self) -> None:
+        from conductor.runner.protocol import request_to_wire_body
+
+        provider = self._provider()
+        body = request_to_wire_body(provider._build_request(_agent(model="auto"), {}, "x", None))
+
+        assert "fusion_tier" not in body["agent"] and "auto_tier" not in body["agent"]
+
+    def test_incompatible_inner_provider_refuses_explicit_preference(self) -> None:
+        from conductor.exceptions import ValidationError
+
+        provider = _make_provider(inner_provider="claude-agent-sdk")
+
+        with pytest.raises(ValidationError, match="inner provider is 'claude-agent-sdk'"):
+            provider._build_request(_agent(model="auto", auto_tier="efficiency"), {}, "x", None)
+
+    def test_incompatible_inner_provider_drops_only_defaults(self) -> None:
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        settings = ProviderSettings(
+            name="aca", pool_endpoint="https://pool.example.com", inner_provider="claude-agent-sdk"
+        )
+        with patch("conductor.providers.aca.AZURE_IDENTITY_AVAILABLE", True):
+            provider = AcaRuntimeProvider(provider_settings=settings, default_auto_tier="x")
+
+        request = provider._build_request(_agent(model="auto"), {}, "x", None)
+
+        assert request.agent.auto_tier is None
+
+    def test_byok_inner_routing_refuses_preference(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from conductor.exceptions import ValidationError
+
+        monkeypatch.setenv("COPILOT_PROVIDER_BASE_URL", "https://byok.example.com")
+        provider = self._provider()
+
+        with pytest.raises(ValidationError, match="BYOK"):
+            provider._build_request(_agent(model="fusion", fusion_tier="max"), {}, "x", None)
+
+    def test_incompatible_model_is_refused(self) -> None:
+        from conductor.exceptions import ValidationError
+
+        with pytest.raises(ValidationError, match="fusion_tier requires model"):
+            self._provider()._build_request(_agent(model="gpt-5", fusion_tier="max"), {}, "x", None)
+
+    @staticmethod
+    def _transport(captured: list[httpx.Request], features: list[str]) -> httpx.AsyncClient:
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path == "/health":
+                return httpx.Response(
+                    200, json={"ready": True, "protocol_version": 2, "features": features}
+                )
+            return httpx.Response(
+                200, content=_ndjson_body([{"type": "result", "data": {"content": {}}}])
+            )
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    @pytest.mark.asyncio
+    async def test_execute_sends_preference_to_advertising_runner(self) -> None:
+        # Requirement: the legacy path pre-flights the runner before sending tiers.
+        captured: list[httpx.Request] = []
+        provider = self._provider(default_fusion_tier="max")
+        provider._http_client = self._transport(captured, ["interrupt", "copilot_model_routing"])
+
+        with patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential):
+            await provider.execute(_agent(model="fusion"), {}, "x")
+
+        assert [request.url.path for request in captured] == ["/health", "/execute"]
+        body = json.loads(captured[-1].content)
+        assert body["agent"]["fusion_tier"] == "max"
+        assert "auto_tier" not in body["agent"]
+
+    @pytest.mark.asyncio
+    async def test_execute_refuses_runner_without_routing_feature(self) -> None:
+        from conductor.exceptions import ConfigurationError
+
+        captured: list[httpx.Request] = []
+        provider = self._provider()
+        provider._http_client = self._transport(captured, ["interrupt"])
+
+        with (
+            patch("conductor.providers.aca._AsyncDefaultAzureCredential", _FakeAsyncCredential),
+            pytest.raises(ConfigurationError, match="rebuild the runner image"),
+        ):
+            await provider.execute(_agent(model="auto", auto_tier="efficiency"), {}, "x")
+
+        assert [request.url.path for request in captured] == ["/health"]

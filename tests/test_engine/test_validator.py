@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from conductor.config.schema import AgentDef, ValidatorConfig
 from conductor.engine.validator import OutputValidator, _truncate
 from conductor.providers.base import AgentOutput
+from conductor.providers.copilot import CopilotProvider, RetryConfig
 
 
 def _agent(criteria: str = "Must cite a real source.", model: str = "gpt-4", **kw) -> AgentDef:
@@ -365,3 +367,105 @@ class TestValidatorValidate:
 
         with pytest.raises(asyncio.CancelledError):
             await OutputValidator().validate(agent, "p", {"x": 1}, provider)
+
+
+class TestValidatorCopilotRouting:
+    @pytest.mark.parametrize(
+        ("grader_model", "defaults", "expected_capi"),
+        [
+            pytest.param("gpt-4.1", {}, None, id="concrete-grader"),
+            pytest.param(
+                "gpt-4.1",
+                {"default_fusion_tier": "max"},
+                None,
+                id="concrete-grader-ignores-fusion-default",
+            ),
+            pytest.param(
+                "fusion",
+                {"default_fusion_tier": "standard"},
+                {"fusion_tier": "standard"},
+                id="fusion-grader-uses-runtime-not-primary-tier",
+            ),
+            pytest.param(
+                "auto",
+                {"default_auto_tier": "efficiency"},
+                {"auto_tier": "efficiency"},
+                id="auto-grader-uses-runtime-not-primary-tier",
+            ),
+            pytest.param("fusion", {}, None, id="fusion-grader-without-default"),
+            pytest.param(
+                "fusion",
+                {"default_auto_tier": "efficiency"},
+                None,
+                id="fusion-grader-ignores-auto-default",
+            ),
+            pytest.param(
+                "auto",
+                {"default_fusion_tier": "max"},
+                None,
+                id="auto-grader-ignores-fusion-default",
+            ),
+        ],
+    )
+    async def test_grading_does_not_inherit_primary_routing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        grader_model: str,
+        defaults: dict[str, str],
+        expected_capi: dict[str, str] | None,
+    ) -> None:
+        agent = AgentDef(
+            name="reviewer",
+            prompt="Review the change.",
+            model="fusion",
+            fusion_tier="high",
+            validator=ValidatorConfig(criteria="Check correctness.", model=grader_model),
+        )
+        session = MagicMock()
+        session.session_id = "grader-session"
+        session.disconnect = AsyncMock()
+
+        async def send(prompt: str) -> None:
+            handler = session.on.call_args.args[0]
+            handler(
+                SimpleNamespace(
+                    type=SimpleNamespace(value="assistant.message"),
+                    data=SimpleNamespace(
+                        content='{"passed": false, "issues": ["missing edge case"]}'
+                    ),
+                )
+            )
+            handler(
+                SimpleNamespace(
+                    type=SimpleNamespace(value="session.idle"),
+                    data=SimpleNamespace(),
+                )
+            )
+
+        session.send = AsyncMock(side_effect=send)
+        client = MagicMock()
+        client.create_session = AsyncMock(return_value=session)
+        provider = CopilotProvider(
+            retry_config=RetryConfig(max_attempts=1),
+            resolve_environment=False,
+            **defaults,
+        )
+        provider._client = client
+        monkeypatch.setattr(provider, "_ensure_client_started", AsyncMock())
+
+        outcome = await OutputValidator().validate(
+            agent, "Review the change.", {"summary": "looks good"}, provider
+        )
+
+        client.create_session.assert_awaited_once()
+        session.send.assert_awaited_once()
+        session_kwargs = client.create_session.call_args.kwargs
+        assert session_kwargs["model"] == grader_model
+        if expected_capi is None:
+            assert "capi" not in session_kwargs
+        else:
+            assert session_kwargs["capi"] == expected_capi
+        assert outcome.passed is False
+        assert outcome.errored is False
+        assert outcome.issues == ["missing edge case"]
+        assert outcome.output is not None

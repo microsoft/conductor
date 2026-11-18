@@ -38,6 +38,12 @@ from conductor.providers.capabilities import (
     requires_plugin_root_for_skills,
     uses_native_skills,
 )
+from conductor.providers.copilot_routing import (
+    RoutingPreferenceError,
+    check_preference_compatibility,
+    is_auto_model,
+    is_fusion_model,
+)
 from conductor.providers.resolution import (
     effective_mcp_consumer_providers,
     format_claude_agent_sdk_remote_env_error,
@@ -2962,6 +2968,7 @@ def _validate_provider_capabilities(
     # closure free-variable) can never be invoked before the name is assigned,
     # no matter where future call sites are added.
     runtime_default_effort = config.workflow.runtime.default_reasoning_effort
+    runtime_default_model = config.workflow.runtime.default_model
     runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
     runtime_idle_timeout_seconds = config.workflow.runtime.idle_timeout_seconds
     runtime_max_idle_recovery_attempts = config.workflow.runtime.max_idle_recovery_attempts
@@ -3741,6 +3748,61 @@ def _validate_provider_capabilities(
 
         _check_agent_skills(agent, provider_name, caps)
         _check_agent_plugins(agent, provider_name, caps)
+        _check_agent_routing(agent, provider_name, caps)
+
+    def _check_agent_routing(
+        agent: AgentDef, provider_name: str, caps: ProviderCapabilities
+    ) -> None:
+        """Check an explicit ``fusion_tier`` / ``auto_tier`` against provider and model.
+
+        Statically resolvable combinations only: a templated tier or model is
+        rechecked by the executor and provider once rendered.
+        """
+        if agent.fusion_tier is None and agent.auto_tier is None:
+            return
+        field = "fusion_tier" if agent.fusion_tier is not None else "auto_tier"
+        if not caps.native_routing_preferences:
+            errors.append(
+                f"Agent '{agent.name}' sets {field} but provider '{provider_name}' cannot "
+                f"honor Copilot routing preferences "
+                f"(capabilities.native_routing_preferences=False). Use the copilot "
+                f"provider or remove {field}."
+            )
+            return
+        reason = _routing_transport_conflict(provider_name)
+        if reason is not None:
+            errors.append(f"Agent '{agent.name}' sets {field} but {reason}.")
+            return
+        model = agent.model or runtime_default_model
+        if is_jinja_template(model) or is_jinja_template(agent.fusion_tier or agent.auto_tier):
+            return
+        try:
+            check_preference_compatibility(
+                model=model,
+                fusion_tier=agent.fusion_tier,
+                auto_tier=agent.auto_tier,
+                subject=f"Agent '{agent.name}'",
+            )
+        except RoutingPreferenceError as exc:
+            errors.append(f"{exc}.")
+
+    def _routing_transport_conflict(provider_name: str) -> str | None:
+        """Describe why a routing-capable provider cannot reach the Copilot router."""
+        settings = config.workflow.runtime.provider
+        if provider_name != default_provider:
+            # Structured runtime.provider settings apply to the default provider only.
+            return None
+        if provider_name == "copilot" and settings.has_custom_routing():
+            return (
+                "runtime.provider configures BYOK custom routing (base_url / type), "
+                "whose endpoint cannot route Copilot Fusion or Auto tiers"
+            )
+        if provider_name == "aca" and (settings.inner_provider or "copilot") != "copilot":
+            return (
+                f"the aca inner provider is {settings.inner_provider!r}, which cannot honor "
+                "Copilot routing preferences"
+            )
+        return None
 
     # All provider-backed agents that run at workflow scope: top-level agents
     # PLUS for_each inline agents (``ForEachDef.agent``), which inherit the
@@ -3806,6 +3868,44 @@ def _validate_provider_capabilities(
                     f"to a timeout-aware provider, or remove the workflow-level "
                     f"max_session_seconds."
                 )
+
+    # ----- Workflow-level: Copilot routing defaults -----
+    # runtime.default_fusion_tier / default_auto_tier apply only to agents on a
+    # routing-capable provider whose model is fusion / auto. BYOK routing can
+    # never honor them; a default no agent can receive is a warning.
+    routing_defaults = [
+        (name, value, matches)
+        for name, value, matches in (
+            ("default_fusion_tier", config.workflow.runtime.default_fusion_tier, is_fusion_model),
+            ("default_auto_tier", config.workflow.runtime.default_auto_tier, is_auto_model),
+        )
+        if value is not None
+    ]
+    for name, _value, matches in routing_defaults:
+        if default_provider == "copilot" and config.workflow.runtime.provider.has_custom_routing():
+            errors.append(
+                f"Workflow declares 'runtime.{name}' but runtime.provider configures BYOK "
+                f"custom routing (base_url / type), whose endpoint cannot route Copilot "
+                f"Fusion or Auto tiers. Remove one of them."
+            )
+            continue
+        receivers = []
+        for agent in all_llm_agents:
+            if agent.fusion_tier is not None or agent.auto_tier is not None:
+                continue
+            pcaps = _caps_for(_resolved_provider_name(agent, default_provider))
+            if pcaps is None or not pcaps.native_routing_preferences:
+                continue
+            model = agent.model or runtime_default_model
+            if is_jinja_template(model) or matches(model):
+                receivers.append(agent.name)
+        if not receivers:
+            target = "fusion" if name == "default_fusion_tier" else "auto"
+            warnings.append(
+                f"Workflow declares 'runtime.{name}' but no agent runs model '{target}' on a "
+                f"provider that supports Copilot routing preferences without its own "
+                f"fusion_tier/auto_tier, so the default has no effect."
+            )
 
     # ----- Workflow-level: idle_recovery tuning knobs -----
     # runtime.idle_timeout_seconds / runtime.max_idle_recovery_attempts are

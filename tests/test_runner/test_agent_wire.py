@@ -32,6 +32,26 @@ class _V1Request(BaseModel):
     tool_output: dict[str, Any] | None = None
 
 
+class _PreRoutingPayload(BaseModel):
+    """The strict v2 agent payload accepted by runners that predate routing tiers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    model: str | None = None
+    system_prompt: str | None = None
+    output: dict[str, Any] | None = None
+    tools: list[str] | None = None
+    max_agent_iterations: int | None = None
+    max_session_seconds: float | None = None
+    reasoning_effort: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    working_dir: str | None = None
+    retry: dict[str, Any] | None = None
+    context_tier: str | None = None
+
+
 def _spec() -> AgentSpec:
     return AgentSpec(
         name="review",
@@ -53,7 +73,8 @@ def _spec() -> AgentSpec:
 # Requirement: every v2 serializer field is accepted by the current strict request model.
 def test_v2_body_covers_request_and_payload_fields() -> None:
     assert _DEFAULT_PROTOCOL_VERSION == RUNNER_PROTOCOL_VERSION
-    body = agent_spec_to_wire_body(_spec())
+    # Routing fields are sent only when set, so set both to cover every payload key.
+    body = agent_spec_to_wire_body(replace(_spec(), fusion_tier="high", auto_tier="efficiency"))
     assert set(body) == set(RunnerAgentRequest.model_fields)
     parsed = RunnerAgentRequest.model_validate(body)
     assert set(body["agent"]) == set(RunnerAgentPayload.model_fields)
@@ -114,3 +135,35 @@ def test_v1_declared_empty_tools_are_rejected() -> None:
     # Requirement: an older runner must not widen explicit tools: [] to its default catalog.
     with pytest.raises(ValueError, match="v1 cannot honor tools"):
         agent_spec_to_wire_body(replace(_spec(), declared_tools=()), protocol_version=1)
+
+
+def test_unset_routing_fields_are_omitted_for_older_runners() -> None:
+    # Requirement: a request without routing tiers stays acceptable to a strict
+    # runner that predates the fields.
+    body = agent_spec_to_wire_body(_spec())
+
+    assert "fusion_tier" not in body["agent"]
+    assert "auto_tier" not in body["agent"]
+    assert set(body["agent"]) == set(_PreRoutingPayload.model_fields)
+    _PreRoutingPayload.model_validate(body["agent"])
+
+
+@pytest.mark.parametrize(("field", "value"), [("fusion_tier", "max"), ("auto_tier", "efficiency")])
+def test_routing_fields_survive_spec_to_wire_parse(field: str, value: str) -> None:
+    # Requirement: a configured routing preference reaches the strict runner model intact.
+    body = agent_spec_to_wire_body(replace(_spec(), **{field: value}))
+
+    parsed = RunnerAgentRequest.model_validate(body)
+
+    assert getattr(parsed.agent, field) == value
+    other = "auto_tier" if field == "fusion_tier" else "fusion_tier"
+    assert other not in body["agent"]
+    with pytest.raises(ValueError, match="extra"):
+        _PreRoutingPayload.model_validate(body["agent"])
+
+
+@pytest.mark.parametrize("field", ["fusion_tier", "auto_tier"])
+def test_v1_routing_configuration_is_rejected(field: str) -> None:
+    # Requirement: a v1 runner must not silently drop a requested routing preference.
+    with pytest.raises(ValueError, match="v1 cannot honor fusion_tier or auto_tier"):
+        agent_spec_to_wire_body(replace(_spec(), **{field: "high"}), protocol_version=1)

@@ -297,6 +297,36 @@ class TestAcaCodingAgentExample:
         assert "azure-identity" in aca_meta["upstream_pin"]
 
 
+class TestCopilotFusionExample:
+    """`examples/copilot-fusion.yaml`: workflow Fusion defaults plus an Auto override."""
+
+    @property
+    def _workflow_file(self) -> Path:
+        return Path(__file__).parent.parent.parent / "examples" / "copilot-fusion.yaml"
+
+    def test_passes_full_validation_without_routing_warnings(self) -> None:
+        from conductor.config.validator import validate_workflow_config
+
+        config = load_config(self._workflow_file)
+        warnings = validate_workflow_config(config, workflow_path=self._workflow_file)
+
+        assert not any("default_fusion_tier" in warning for warning in warnings)
+
+    def test_demonstrates_explicit_fusion_default_and_auto_override(self) -> None:
+        from conductor.config.schema import AgentDef
+
+        config = load_config(self._workflow_file)
+        runtime = config.workflow.runtime
+        agents = {a.name: a for a in config.agents if isinstance(a, AgentDef)}
+
+        assert runtime.provider.name == "copilot"
+        assert (runtime.default_model, runtime.default_fusion_tier) == ("fusion", "high")
+        assert agents["answer"].model is None and agents["answer"].fusion_tier is None
+        assert (agents["review"].model, agents["review"].auto_tier) == ("auto", "efficiency")
+        # Tool-free, so running the example spends only model quota.
+        assert all(agent.tools == [] for agent in agents.values())
+
+
 class TestSessionKeyExample:
     """`examples/claude-agent-sdk-session-key.yaml`: the runnable demonstration
     of per-agent session continuity.

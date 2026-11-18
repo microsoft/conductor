@@ -239,6 +239,8 @@ class ProviderRegistry:
                 default_reasoning_effort=runtime.default_reasoning_effort,
                 provider_settings=provider_settings,
                 tool_output=runtime.tool_output,
+                default_fusion_tier=runtime.default_fusion_tier,
+                default_auto_tier=runtime.default_auto_tier,
             )
             if managed_workspace is not None:
                 self.register_workspace_provider(managed_workspace, provider)

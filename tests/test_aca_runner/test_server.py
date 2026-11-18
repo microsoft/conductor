@@ -168,6 +168,89 @@ class TestHealth:
 class TestExecuteStreaming:
     """`POST /execute` (E4-T2) — NDJSON event frames + terminal `result`."""
 
+    @pytest.mark.parametrize("verbose", [False, True])
+    async def test_routing_warning_reaches_host_console(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        verbose: bool,
+    ) -> None:
+        from io import StringIO
+        from types import SimpleNamespace
+
+        import httpx
+
+        from conductor.cli.app import verbose_mode
+        from conductor.cli.run import ConsoleEventSubscriber
+        from conductor.config.schema import AgentDef, ProviderSettings
+        from conductor.console import make_console
+        from conductor.events import WorkflowEvent
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        warning = {
+            "agent_name": "implement[task1]",
+            "message": "Fusion degraded: policy[/etc/x]; fallback gpt-5",
+            "reason": "policy[/etc/x]",
+            "fallback_model": "gpt-5",
+            "source_event": "session.fusion_route_failed",
+        }
+
+        async def emit_warning(
+            provider: _FakeCopilotProvider, *_args: Any, event_callback: Any, **_kwargs: Any
+        ) -> AgentOutput:
+            event_callback("agent_routing_warning", warning)
+            return provider._result
+
+        monkeypatch.setattr(_FakeCopilotProvider, "execute", emit_warning)
+        monkeypatch.setattr("conductor.providers.aca.AZURE_IDENTITY_AVAILABLE", True)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "test-token")
+        credential = SimpleNamespace(
+            get_token=AsyncMock(
+                return_value=SimpleNamespace(token="aad-token", expires_on=9999999999)
+            ),
+            close=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            "conductor.providers.aca._AsyncDefaultAzureCredential", lambda: credential
+        )
+        provider = AcaRuntimeProvider(
+            provider_settings=ProviderSettings(
+                name="aca", pool_endpoint="https://pool.example.com", api_version="2025-07-01"
+            )
+        )
+
+        def transport(request: httpx.Request) -> httpx.Response:
+            response = client.post("/execute", json=json.loads(request.content))
+            return httpx.Response(response.status_code, content=response.content)
+
+        provider._http_client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        output = StringIO()
+        monkeypatch.setattr(
+            "conductor.cli.run._verbose_console",
+            make_console(file=output, force_terminal=False, width=160),
+        )
+        subscriber = ConsoleEventSubscriber()
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def on_event(name: str, data: dict[str, Any]) -> None:
+            events.append((name, data))
+            subscriber.on_event(WorkflowEvent(type=name, timestamp=0, data=data))
+
+        token = verbose_mode.set(verbose)
+        try:
+            result = await provider.execute(
+                AgentDef(name="implement", prompt="p"), {}, "p", event_callback=on_event
+            )
+        finally:
+            verbose_mode.reset(token)
+            await provider.close()
+
+        assert result.content == {"summary": "done"}
+        assert events == [("agent_routing_warning", warning)]
+        assert warning["message"] in caplog.text
+        assert (f"WARNING: {warning['message']}" in output.getvalue()) == verbose
+
     def test_mcp_credentials_are_redacted_from_provider_events(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -879,3 +962,95 @@ class TestInnerProviderSettingsAllowlist:
             assert response.status_code == 400
             assert "message" in response.json().get("error", {})
             assert _FakeCopilotProvider.instances == []
+
+
+class TestRoutingPreferences:
+    """Copilot routing preferences reach the inner provider or fail before streaming."""
+
+    def test_health_advertises_routing_feature(self, client: TestClient) -> None:
+        # Requirement: hosts gate tier-bearing requests on this advertisement.
+        from conductor.execution.agent_wire import RUNNER_ROUTING_FEATURE
+
+        features = client.get("/health").json()["features"]
+        assert RUNNER_ROUTING_FEATURE == "copilot_model_routing"
+        assert {"interrupt", RUNNER_ROUTING_FEATURE} <= set(features)
+
+    @pytest.mark.parametrize(
+        ("agent", "field", "value"),
+        [
+            ({"model": "fusion", "fusion_tier": "max"}, "fusion_tier", "max"),
+            ({"model": "auto", "auto_tier": "premium-v2"}, "auto_tier", "premium-v2"),
+        ],
+    )
+    def test_preference_reaches_inner_agent(
+        self, client: TestClient, agent: dict[str, str], field: str, value: str
+    ) -> None:
+        response = client.post("/execute", json=_execute_body(agent={"name": "a", **agent}))
+        assert response.status_code == 200
+        _parse_ndjson(response.text)
+
+        inner = _FakeCopilotProvider.instances[0].execute_calls[0]["agent"]
+        assert getattr(inner, field) == value
+
+    def test_absent_preference_reaches_inner_agent_as_none(self, client: TestClient) -> None:
+        response = client.post("/execute", json=_execute_body())
+        assert response.status_code == 200
+        _parse_ndjson(response.text)
+
+        inner = _FakeCopilotProvider.instances[0].execute_calls[0]["agent"]
+        assert (inner.fusion_tier, inner.auto_tier) == (None, None)
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"agent": {"name": "a", "model": "gpt-4.1", "fusion_tier": "high"}}, "requires"),
+            ({"agent": {"name": "a", "model": "fusion", "auto_tier": "x"}}, "requires"),
+            ({"agent": {"name": "a", "model": "fusion", "fusion_tier": "ultra"}}, "fusion_tier"),
+            (
+                {"agent": {"name": "a", "model": "fusion", "fusion_tier": "{{ tier }}"}},
+                "unresolved",
+            ),
+            (
+                {"agent": {"name": "a", "model": "auto", "auto_tier": "{{ tier }}"}},
+                "unresolved",
+            ),
+            (
+                {
+                    "agent": {
+                        "name": "a",
+                        "model": "auto",
+                        "auto_tier": "{% if true %}efficiency{% endif %}",
+                    }
+                },
+                "unresolved",
+            ),
+            ({"agent": {"name": "a", "model": "auto", "auto_tier": " "}}, "nonblank"),
+            (
+                {"agent": {"name": "a", "model": "auto", "fusion_tier": "high", "auto_tier": "x"}},
+                "mutually exclusive",
+            ),
+            (
+                {
+                    "agent": {"name": "a", "model": "auto", "auto_tier": "x"},
+                    "inner_provider": "openai",
+                },
+                "copilot inner provider",
+            ),
+            (
+                {
+                    "agent": {"name": "a", "model": "fusion", "fusion_tier": "high"},
+                    "inner_provider_settings": {"base_url": "https://byok.example.com"},
+                },
+                "BYOK",
+            ),
+        ],
+    )
+    def test_incompatible_request_is_rejected_before_streaming(
+        self, client: TestClient, overrides: dict[str, Any], message: str
+    ) -> None:
+        response = client.post("/execute", json=_execute_body(**overrides))
+
+        assert response.status_code == 400
+        assert not response.headers["content-type"].startswith("application/x-ndjson")
+        assert message in response.json()["error"]["message"]
+        assert _FakeCopilotProvider.instances == []

@@ -314,6 +314,9 @@ class OutputValidator:
             # transcript, which config/validator.py refuses for concurrent
             # executions) and ``routes``. Add new fields here explicitly.
             settings_dir=None,
+            # fusion_tier / auto_tier are not inherited either: validator.model
+            # may name a model the preference cannot apply to, so the grader
+            # is an auxiliary session that takes only the runtime defaults.
         )
 
     def _parse(self, content: Any) -> tuple[bool, list[str], bool]:

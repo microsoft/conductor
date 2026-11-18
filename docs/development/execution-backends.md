@@ -235,6 +235,17 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
   older strict v2 images reject that field with HTTP 422 even when the workflow does not
   declare `tools: []`. Host upgrades therefore require matching rebuilt Docker and ACA
   runner images, although the protocol remains v2.
+- Optional fields added within v2 are negotiated by `/health` `features`, not by a protocol bump,
+  and are omitted from the body when unset so older strict runners still accept tier-free
+  requests. `agent.fusion_tier` / `agent.auto_tier` (Copilot routing preferences, resolved on the
+  host from the agent and runtime defaults) follow this rule: `agent_spec_to_wire_body` and
+  `request_to_wire_body` send them only when set, protocol v1 refuses them, and the runner
+  advertises `copilot_model_routing` (`conductor.execution.agent_wire.RUNNER_ROUTING_FEATURE`).
+  `DockerRunnerBackend._execute_agent` and `AcaRunnerBackend.run_agent` (profile and legacy, which
+  pre-flights `/health` only when a tier is present) refuse a tier-bearing request to a runner
+  without the feature, with a rebuild instruction, before dispatch. The runner rejects a tier for
+  a non-Copilot inner provider, BYOK `inner_provider_settings.base_url`, or an incompatible model
+  with HTTP 400 before streaming.
   The `/interrupt` endpoint targets specific invocations by `execution_id` without restarting the runner.
 - The Docker interrupt bridge exits 0 for an accepted signal and 3 for HTTP 409;
   other failures remain errors. The host uses these machine outcomes, not stderr
@@ -318,6 +329,8 @@ secret resolution and redaction; the [workflow engine](workflow-engine.md) guide
 - [ ] Bundle content changes keep provenance out of the digest; determinism tests still pass.
 - [ ] Store changes keep lock, sentinel-last and atomic rename ordering.
 - [ ] Protocol change is additive and keeps request `forbid` / response `ignore`.
+- [ ] New optional request field is omitted when unset and gated on a `/health` feature
+      advertisement in both the Docker and ACA backends.
 - [ ] Targeted interrupt uses execution ID routing over `/interrupt`.
 - [ ] Remote secrets enforce reserved name checks and deliver via `env_overlay` to stdio MCP tools only.
 - [ ] New optional environment field is popped from the digest when `None`.
