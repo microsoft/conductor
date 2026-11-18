@@ -102,6 +102,9 @@ def serve() -> None:
                     pass
                 else:
                     error = {"code": -32002, "message": "fixture transient send failure"}
+        elif method == "session.detach":
+            # SDK >= 1.0.33 disconnect raises unless the runtime confirms the detach.
+            result = {"success": True}
         if error is not None:
             send({"jsonrpc": "2.0", "id": request["id"], "error": error})
         else:
