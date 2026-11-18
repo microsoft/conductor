@@ -728,7 +728,7 @@ class TestModelPricingDiagnostics:
         monkeypatch.setattr("conductor.providers.copilot.COPILOT_SDK_AVAILABLE", True)
         provider = _fake_provider(
             ok=True,
-            models=["gpt-5", "gpt-4o"],
+            models=["unpublished-model-xyz", "gpt-4o"],
             pricing=RuntimeError("pricing boom"),
         )
         monkeypatch.setattr(
@@ -738,10 +738,10 @@ class TestModelPricingDiagnostics:
         diag = await d.gather_provider("copilot", list_models=True)
         assert diag.models is not None
         by_id = {m.id: m for m in diag.models}
-        # "gpt-5" has no DEFAULT_PRICING entry, so it genuinely fails to
-        # resolve — pricing_source stays None (distinct from "none").
-        assert by_id["gpt-5"].pricing_source is None
-        assert by_id["gpt-5"].input_per_mtok is None
+        # "unpublished-model-xyz" has no static price anywhere, so it genuinely
+        # fails to resolve — pricing_source stays None (distinct from "none").
+        assert by_id["unpublished-model-xyz"].pricing_source is None
+        assert by_id["unpublished-model-xyz"].input_per_mtok is None
         # "gpt-4o" IS in DEFAULT_PRICING, so the raising hook must still
         # fall through to the table rather than reporting unresolvable.
         assert by_id["gpt-4o"].pricing_source == "table"

@@ -97,6 +97,42 @@ class ModelPricing:
     cache_write_per_mtok: float = 0.0
 
 
+def _llm_prices_pricing(model: str) -> ModelPricing | None:
+    """Look ``model`` up in ``llm-prices``, installed by the ``pricing`` extra.
+
+    llm-prices is a price table read from the providers' pricing pages and
+    re-released when a page changes, so with ``conductor-cli[pricing]`` a new
+    model or a price change does not wait for a Conductor release. It matches
+    exact ids and the dated or prefixed ids providers send back, never a
+    sibling family, so an id it does not carry returns ``None`` and falls
+    through to ``DEFAULT_PRICING``.
+
+    Cache writes use the provider's default lifetime: Anthropic's 5-minute
+    rate, OpenAI's 30-minute rate.
+
+    Args:
+        model: The model name to look up.
+
+    Returns:
+        ModelPricing if the package is installed and carries the model,
+        None otherwise.
+    """
+    try:
+        import llm_prices
+    except ImportError:
+        return None
+
+    price = llm_prices.lookup(model)
+    if price is None or price.input is None or price.output is None:
+        return None
+    return ModelPricing(
+        input_per_mtok=price.input,
+        output_per_mtok=price.output,
+        cache_read_per_mtok=price.cache_read or 0.0,
+        cache_write_per_mtok=price.cache_write.get("5m") or price.cache_write.get("30m") or 0.0,
+    )
+
+
 # Default model table (pricing only).
 # Context-window metadata is sourced from each provider's SDK at runtime via
 # ``AgentProvider.get_max_prompt_tokens()`` — see ``providers/base.py``.
@@ -111,21 +147,52 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "gpt-4o": ModelPricing(input_per_mtok=2.50, output_per_mtok=10.00),
     "gpt-4o-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
     "gpt-4.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-4.1-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
+    "gpt-4.1-mini": ModelPricing(
+        input_per_mtok=0.40,
+        output_per_mtok=1.60,
+        cache_read_per_mtok=0.10,
+    ),
     "gpt-4": ModelPricing(input_per_mtok=30.00, output_per_mtok=60.00),
     "gpt-3.5-turbo": ModelPricing(input_per_mtok=0.50, output_per_mtok=1.50),
-    # GPT-5.x Series (uniform standard rate; mini variants at the mini tier)
-    "gpt-5.5": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.4": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.3-codex": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.2": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.4-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
-    "gpt-5-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
-    # GPT-5.6 variants priced at the existing GPT-5.x family rate (#386).
-    "gpt-5.6-sol": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.6-terra": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.6-luna": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    # GPT-5.x Series
+    "gpt-5.5": ModelPricing(input_per_mtok=5.00, output_per_mtok=30.00, cache_read_per_mtok=0.50),
+    "gpt-5.4": ModelPricing(input_per_mtok=2.50, output_per_mtok=15.00, cache_read_per_mtok=0.25),
+    "gpt-5.3-codex": ModelPricing(
+        input_per_mtok=1.75,
+        output_per_mtok=14.00,
+        cache_read_per_mtok=0.175,
+    ),
+    "gpt-5.2": ModelPricing(input_per_mtok=1.75, output_per_mtok=14.00, cache_read_per_mtok=0.175),
+    "gpt-5.1": ModelPricing(input_per_mtok=1.25, output_per_mtok=10.00, cache_read_per_mtok=0.125),
+    "gpt-5.4-mini": ModelPricing(
+        input_per_mtok=0.75,
+        output_per_mtok=4.50,
+        cache_read_per_mtok=0.075,
+    ),
+    "gpt-5-mini": ModelPricing(
+        input_per_mtok=0.25,
+        output_per_mtok=2.00,
+        cache_read_per_mtok=0.025,
+    ),
+    # GPT-5.6 cache writes are the 30-minute rate, as for gpt-6-astra below.
+    "gpt-5.6-sol": ModelPricing(
+        input_per_mtok=4.00,
+        output_per_mtok=20.00,
+        cache_read_per_mtok=0.40,
+        cache_write_per_mtok=5.00,
+    ),
+    "gpt-5.6-terra": ModelPricing(
+        input_per_mtok=2.00,
+        output_per_mtok=12.00,
+        cache_read_per_mtok=0.20,
+        cache_write_per_mtok=2.50,
+    ),
+    "gpt-5.6-luna": ModelPricing(
+        input_per_mtok=0.20,
+        output_per_mtok=1.20,
+        cache_read_per_mtok=0.02,
+        cache_write_per_mtok=0.25,
+    ),
     "gpt-6-astra": ModelPricing(
         input_per_mtok=10.00,
         output_per_mtok=50.00,
@@ -360,8 +427,9 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     ),
     # Gemini
     "gemini-3.1-pro-preview": ModelPricing(
-        input_per_mtok=1.25,
-        output_per_mtok=5.00,
+        input_per_mtok=2.00,
+        output_per_mtok=12.00,
+        cache_read_per_mtok=0.20,
     ),
     "gemini-3.5-flash": ModelPricing(
         input_per_mtok=0.30,
@@ -380,8 +448,8 @@ def get_pricing(
 
     Resolution order (see #265):
 
-    **workflow ``cost.pricing`` override → provider hook → ``DEFAULT_PRICING``
-    → ``None``.**
+    **workflow ``cost.pricing`` override → provider hook → ``llm-prices``
+    (when the ``pricing`` extra is installed) → ``DEFAULT_PRICING`` → ``None``.**
 
     ``overrides`` (workflow ``cost.pricing``) and ``provider_pricing`` (the
     :meth:`AgentProvider.get_model_pricing` hook, pre-resolved and cached by
@@ -417,6 +485,12 @@ def get_pricing(
     # update. Authoritative for the exact model that was resolved — never warn.
     if provider_pricing and model in provider_pricing:
         return provider_pricing[model]
+
+    # Published rates from the optional llm-prices package beat the static
+    # table, which only changes when someone edits it.
+    published = _llm_prices_pricing(model)
+    if published is not None:
+        return published
 
     # Exact match in the static table.
     if model in DEFAULT_PRICING:

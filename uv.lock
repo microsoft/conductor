@@ -469,6 +469,9 @@ aca = [
 claude-agent-sdk = [
     { name = "claude-agent-sdk" },
 ]
+pricing = [
+    { name = "llm-prices" },
+]
 telemetry = [
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
@@ -480,6 +483,7 @@ tui = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "llm-prices" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -500,6 +504,7 @@ requires-dist = [
     { name = "github-copilot-sdk", specifier = ">=1.0.32" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
+    { name = "llm-prices", marker = "extra == 'pricing'", specifier = ">=1.7.2,<2" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "openai", specifier = ">=2.48.0,<3.0.0" },
     { name = "opentelemetry-api", specifier = ">=1.20" },
@@ -520,10 +525,11 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.30.0" },
     { name = "websockets", specifier = ">=12.0" },
 ]
-provides-extras = ["claude-agent-sdk", "aca", "tui", "telemetry"]
+provides-extras = ["claude-agent-sdk", "aca", "tui", "pricing", "telemetry"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "llm-prices", specifier = ">=1.7.2,<2" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
@@ -1097,6 +1103,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2e/c9/06ea13676ef354f0af6169587ae292d3e2406e212876a413bf9eece4eb23/linkify_it_py-2.1.0.tar.gz", hash = "sha256:43360231720999c10e9328dc3691160e27a718e280673d444c38d7d3aaa3b98b", size = 29158, upload-time = "2026-03-01T07:48:47.683Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b4/de/88b3be5c31b22333b3ca2f6ff1de4e863d8fe45aaea7485f591970ec1d3e/linkify_it_py-2.1.0-py3-none-any.whl", hash = "sha256:0d252c1594ecba2ecedc444053db5d3a9b7ec1b0dd929c8f1d74dce89f86c05e", size = 19878, upload-time = "2026-03-01T07:48:46.098Z" },
+]
+
+[[package]]
+name = "llm-prices"
+version = "1.7.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/3f/25ec8311312412549c7990819d46fde486632e375d8beb946a8ac99933a2/llm_prices-1.7.2.tar.gz", hash = "sha256:62fb52bd4dcac91009213bf17eb01a4c73925cd4c58727c82089ba61b49114f2", size = 92913, upload-time = "2026-11-18T02:10:43.46Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/45/38de51f0ff1ed4c2b8565cb9d100c18562df594758157c0f227888732e53/llm_prices-1.7.2-py3-none-any.whl", hash = "sha256:98167d926155d3fac9aec5e65c042688d4b1c8539c545eefa4ea4b6b60b772a1", size = 79052, upload-time = "2026-11-18T02:10:42.095Z" },
 ]
 
 [[package]]

@@ -703,8 +703,8 @@ class AgentProvider(ABC):
         The :class:`~conductor.engine.usage.UsageTracker` resolves pricing in
         this order:
 
-        **workflow ``cost.pricing`` override → this hook → ``DEFAULT_PRICING`` →
-        ``None``.**
+        **workflow ``cost.pricing`` override → this hook → ``llm-prices``
+        (``pricing`` extra) → ``DEFAULT_PRICING`` → ``None``.**
 
         A provider that knows its own rates (e.g. the Copilot SDK exposes
         per-model billing metadata) should return a

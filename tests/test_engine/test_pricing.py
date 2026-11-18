@@ -1,6 +1,7 @@
 """Unit tests for the pricing module."""
 
 import logging
+import sys
 
 import pytest
 
@@ -11,6 +12,12 @@ from conductor.engine.pricing import (
     calculate_cost,
     get_pricing,
 )
+
+
+@pytest.fixture
+def without_llm_prices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``import llm_prices`` fail, as on an install without the ``pricing`` extra."""
+    monkeypatch.setitem(sys.modules, "llm_prices", None)
 
 
 class TestModelPricing:
@@ -167,12 +174,12 @@ class TestGetPricing:
     @pytest.mark.parametrize(
         ("model", "input_per_mtok", "output_per_mtok"),
         [
-            # GPT-5.x family (standard rate) and mini variants (#266).
-            ("gpt-5.5", 2.00, 8.00),
-            ("gpt-5.4", 2.00, 8.00),
-            ("gpt-5.3-codex", 2.00, 8.00),
-            ("gpt-5-mini", 0.15, 0.60),
-            ("gpt-5.4-mini", 0.15, 0.60),
+            # GPT-5.x family and mini variants (#266).
+            ("gpt-5.5", 5.00, 30.00),
+            ("gpt-5.4", 2.50, 15.00),
+            ("gpt-5.3-codex", 1.75, 14.00),
+            ("gpt-5-mini", 0.25, 2.00),
+            ("gpt-5.4-mini", 0.75, 4.50),
             # Claude families (#266).
             ("claude-opus-4.8", 5.00, 25.00),
             ("claude-opus-4.7", 5.00, 25.00),
@@ -218,13 +225,27 @@ class TestGpt56Pricing:
 
         _FUZZY_MATCH_WARNED.clear()
 
-    @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
-    def test_gpt_56_variants_priced_at_family_rate(self, model: str) -> None:
-        """Each GPT-5.6 id resolves via an exact key at the GPT-5.x family rate."""
+    @pytest.mark.parametrize(
+        ("model", "input_per_mtok", "output_per_mtok"),
+        [
+            ("gpt-5.6-sol", 4.00, 20.00),
+            ("gpt-5.6-terra", 2.00, 12.00),
+            ("gpt-5.6-luna", 0.20, 1.20),
+        ],
+    )
+    def test_gpt_56_variants_priced_at_published_rate(
+        self, model: str, input_per_mtok: float, output_per_mtok: float
+    ) -> None:
+        """Each GPT-5.6 id resolves via an exact key at its own published rate.
+
+        They used to share a 2/8 placeholder, which under-billed Sol's output
+        by 60% and over-billed Luna's input tenfold.
+        """
+        assert model in DEFAULT_PRICING
         pricing = get_pricing(model)
         assert pricing is not None
-        assert pricing.input_per_mtok == 2.00
-        assert pricing.output_per_mtok == 8.00
+        assert pricing.input_per_mtok == input_per_mtok
+        assert pricing.output_per_mtok == output_per_mtok
 
     @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
     def test_gpt_56_variants_do_not_fuzzy_warn(
@@ -247,11 +268,14 @@ class TestGpt56Pricing:
             "mai-code-1-flash-picker",
         ],
     )
+    @pytest.mark.usefixtures("without_llm_prices")
     def test_unconfirmed_models_remain_unpriced(self, model: str) -> None:
-        """These ids are deliberately absent pending a published rate (#386).
+        """These ids are deliberately absent from the static table (#386).
 
         Load-bearing regression guard: it stops a later fuzzy key silently
-        inventing rates for them.
+        inventing rates for them. The ``pricing`` extra may price some of
+        them from a published rate; that path is covered in
+        ``TestLlmPricesLookup``.
         """
         assert get_pricing(model) is None
 
@@ -299,6 +323,7 @@ class TestFuzzyMatchWarnings:
             assert get_pricing("claude-opus-4.123-1m-internal") is None
         assert caplog.records == []
 
+    @pytest.mark.usefixtures("without_llm_prices")
     def test_versioned_suffix_match_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         # Real versioned name (date suffix) should still match and warn.
         with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
@@ -310,6 +335,7 @@ class TestFuzzyMatchWarnings:
         assert "versioned-suffix" in msg
         assert "claude-sonnet-4" in msg
 
+    @pytest.mark.usefixtures("without_llm_prices")
     def test_warning_emitted_only_once_per_model(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
             get_pricing("claude-sonnet-4-20250514")
@@ -317,6 +343,7 @@ class TestFuzzyMatchWarnings:
             get_pricing("claude-sonnet-4-20250514")
         assert len(caplog.records) == 1
 
+    @pytest.mark.usefixtures("without_llm_prices")
     def test_different_models_each_warn_once(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
             get_pricing("claude-sonnet-4-20250514")
@@ -457,25 +484,25 @@ class TestCalculateCost:
     def test_cache_tokens_without_a_cache_rate_bill_at_the_input_rate(self) -> None:
         """A ``0.0`` cache rate means "no published rate", never "free".
 
-        20 of the table's entries (every GPT, o-series and Gemini model) leave
-        both cache rates at the dataclass default while their providers do
-        report cache counts. Subtracting those buckets unconditionally would
-        price the cached majority of a prompt at nothing — the same silent
-        under-billing this function exists to remove, in the other direction.
+        The older GPT and o-series entries leave both cache rates at the
+        dataclass default while their providers do report cache counts.
+        Subtracting those buckets unconditionally would price the cached
+        majority of a prompt at nothing — the same silent under-billing this
+        function exists to remove, in the other direction.
         """
-        pricing = get_pricing("gpt-5.5")
+        pricing = get_pricing("gpt-4-turbo")
         assert pricing is not None
         assert pricing.cache_read_per_mtok == 0.0
 
         cached = calculate_cost(
-            model="gpt-5.5",
+            model="gpt-4-turbo",
             input_tokens=1_000_000,
             output_tokens=0,
             cache_read_tokens=950_000,
         )
-        uncached = calculate_cost(model="gpt-5.5", input_tokens=1_000_000, output_tokens=0)
+        uncached = calculate_cost(model="gpt-4-turbo", input_tokens=1_000_000, output_tokens=0)
         assert cached == uncached
-        assert cached == pytest.approx(2.0, rel=1e-6)
+        assert cached == pytest.approx(10.0, rel=1e-6)
 
     def test_calculate_cost_small_tokens(self) -> None:
         """Test cost calculation with small token counts."""
@@ -628,3 +655,103 @@ def test_claude_5_cache_rates(model: str, cache_read: float, cache_write: float)
     assert pricing is not None
     assert pricing.cache_read_per_mtok == cache_read
     assert pricing.cache_write_per_mtok == cache_write
+
+
+class TestLlmPricesLookup:
+    """Tests for the optional ``pricing`` extra (llm-prices)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned(self) -> None:
+        """Clear the per-process warning de-dupe set between tests."""
+        pricing_module._FUZZY_MATCH_WARNED.clear()
+
+    def test_published_rate_beats_stale_table_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A stale table row does not outlive a published price change."""
+        llm_prices = pytest.importorskip("llm_prices")
+        monkeypatch.setitem(
+            DEFAULT_PRICING, "gpt-5.5", ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00)
+        )
+        published = llm_prices.lookup("gpt-5.5")
+        pricing = get_pricing("gpt-5.5")
+        assert pricing is not None
+        assert pricing.input_per_mtok == published.input
+        assert pricing.output_per_mtok == published.output
+        assert pricing.cache_read_per_mtok == published.cache_read
+
+    @pytest.mark.usefixtures("without_llm_prices")
+    def test_without_extra_uses_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stale = ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00)
+        monkeypatch.setitem(DEFAULT_PRICING, "gpt-5.5", stale)
+        assert get_pricing("gpt-5.5") == stale
+
+    def test_override_and_provider_hook_beat_llm_prices(self) -> None:
+        pytest.importorskip("llm_prices")
+        mine = ModelPricing(input_per_mtok=1.0, output_per_mtok=1.0)
+        assert get_pricing("gpt-5.5", overrides={"gpt-5.5": mine}) == mine
+        assert get_pricing("gpt-5.5", provider_pricing={"gpt-5.5": mine}) == mine
+
+    @pytest.mark.parametrize("model", ["gemini-3.6-flash", "grok-4.5"])
+    def test_published_model_missing_from_table_is_priced(self, model: str) -> None:
+        """Ids the table leaves unpriced (#386) get the provider's published rate."""
+        llm_prices = pytest.importorskip("llm_prices")
+        assert model not in DEFAULT_PRICING
+        published = llm_prices.lookup(model)
+        assert published is not None
+        pricing = get_pricing(model)
+        assert pricing is not None
+        assert pricing.input_per_mtok == published.input
+        assert pricing.output_per_mtok == published.output
+
+    def test_ids_llm_prices_lacks_fall_through_to_table(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Table-only ids (aliases, dotted SDK names) keep their table rows."""
+        pytest.importorskip("llm_prices")
+        row = ModelPricing(input_per_mtok=3.0, output_per_mtok=4.0)
+        monkeypatch.setitem(DEFAULT_PRICING, "conductor-test-only-model", row)
+        assert get_pricing("conductor-test-only-model") == row
+        assert get_pricing("conductor-test-only-model-20990101") == row
+        for model in ("claude-opus-4.6-1m", "claude-haiku-4.5", "gpt-4"):
+            assert get_pricing(model) is not None, model
+
+    def test_anthropic_cache_write_uses_five_minute_rate(self) -> None:
+        pytest.importorskip("llm_prices")
+        pricing = get_pricing("claude-sonnet-4-20250514")
+        assert pricing is not None
+        table_row = DEFAULT_PRICING["claude-sonnet-4"]
+        assert pricing.cache_write_per_mtok == table_row.cache_write_per_mtok
+
+    def test_dated_anthropic_id_resolves_without_fuzzy_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The dated id the API returns has its own row, so no "may be inaccurate" warning."""
+        pytest.importorskip("llm_prices")
+        with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
+            pricing = get_pricing("claude-sonnet-4-20250514")
+        assert pricing is not None
+        assert pricing.input_per_mtok == 3.0
+        assert caplog.records == []
+
+    def test_cross_family_name_still_unpriced(self) -> None:
+        """llm-prices does no prefix matching, so #137 cannot come back through it."""
+        pytest.importorskip("llm_prices")
+        assert get_pricing("claude-opus-4.123-high") is None
+
+    def test_static_table_matches_llm_prices(self) -> None:
+        """Every table row llm-prices also carries has the same input and output rate.
+
+        Catches a drifted row when the llm-prices pin is bumped. When this fails,
+        update the row in ``DEFAULT_PRICING`` to the published rate.
+        """
+        llm_prices = pytest.importorskip("llm_prices")
+        drifted = []
+        for model, row in DEFAULT_PRICING.items():
+            published = llm_prices.lookup(model)
+            if published is None:
+                continue
+            if (row.input_per_mtok, row.output_per_mtok) != (published.input, published.output):
+                drifted.append(
+                    f"{model}: table {row.input_per_mtok}/{row.output_per_mtok}, "
+                    f"published {published.input}/{published.output} ({published.source_url})"
+                )
+        assert drifted == []

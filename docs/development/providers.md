@@ -158,7 +158,8 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
   "fall through to registry/fallback" signal for compaction, not an error.
 - Pricing hook `get_model_pricing(model)` is optional (base returns `None`) and MUST never raise.
   Resolution order in `src/conductor/engine/pricing.py::get_pricing`: workflow `cost.pricing`
-  override, provider hook, `DEFAULT_PRICING`, `None`. The engine resolves each model once via
+  override, provider hook, `llm-prices` (only when the `pricing` extra is installed; exact and
+  provider-alias ids only, no fuzzy match), `DEFAULT_PRICING`, `None`. The engine resolves each model once via
   `WorkflowEngine._ensure_pricing_resolved` before every `UsageTracker.record`. Only Copilot
   implements the hook (see [copilot](providers/copilot.md)). Partial totals MUST surface
   `unpriced_agents` / `has_unpriced` from `src/conductor/engine/usage.py` (`~$X (N agents
