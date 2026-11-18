@@ -11,7 +11,10 @@ from conductor.engine.pricing import (
     ModelPricing,
     calculate_cost,
     get_pricing,
+    pricing_host_for_base_url,
 )
+from conductor.engine.usage import UsageTracker
+from conductor.providers.base import AgentOutput
 
 
 @pytest.fixture
@@ -657,6 +660,112 @@ def test_claude_5_cache_rates(model: str, cache_read: float, cache_write: float)
     assert pricing.cache_write_per_mtok == cache_write
 
 
+@pytest.mark.usefixtures("without_llm_prices")
+@pytest.mark.parametrize(
+    ("model", "cache_read", "cache_write"),
+    [
+        ("gpt-4.1-mini", 0.10, 0.0),
+        ("gpt-5.5", 0.50, 0.0),
+        ("gpt-5.4", 0.25, 0.0),
+        ("gpt-5.3-codex", 0.175, 0.0),
+        ("gpt-5.2", 0.175, 0.0),
+        ("gpt-5.1", 0.125, 0.0),
+        ("gpt-5.4-mini", 0.075, 0.0),
+        ("gpt-5-mini", 0.025, 0.0),
+        ("gpt-5.6-sol", 0.40, 5.00),
+        ("gpt-5.6-terra", 0.20, 2.50),
+        ("gpt-5.6-luna", 0.02, 0.25),
+        ("gemini-3.1-pro-preview", 0.20, 0.0),
+    ],
+)
+def test_static_cache_rates(model: str, cache_read: float, cache_write: float) -> None:
+    """The corrected cache rates hold in the default install, without the extra."""
+    pricing = get_pricing(model)
+    assert pricing == DEFAULT_PRICING[model]
+    assert pricing.cache_read_per_mtok == cache_read
+    assert pricing.cache_write_per_mtok == cache_write
+
+
+@pytest.mark.usefixtures("without_llm_prices")
+@pytest.mark.parametrize(
+    ("model", "cache_read_tokens", "cache_write_tokens", "expected"),
+    [
+        # A fully cached million-token GPT-5.5 prompt: 1M at $0.50, not $5.00.
+        ("gpt-5.5", 1_000_000, 0, 0.50),
+        ("gpt-5.4", 1_000_000, 0, 0.25),
+        ("gpt-5-mini", 1_000_000, 0, 0.025),
+        ("gemini-3.1-pro-preview", 1_000_000, 0, 0.20),
+        # 900k read from cache plus 100k uncached at $5.00: $0.45 + $0.50.
+        ("gpt-5.5", 900_000, 0, 0.95),
+        # GPT-5.6 cache writes at the 30-minute rate.
+        ("gpt-5.6-sol", 0, 1_000_000, 5.00),
+        ("gpt-5.6-terra", 500_000, 500_000, 0.10 + 1.25),
+        ("gpt-5.6-luna", 1_000_000, 0, 0.02),
+    ],
+)
+def test_static_cached_cost(
+    model: str, cache_read_tokens: int, cache_write_tokens: int, expected: float
+) -> None:
+    """Representative cached prompts, priced from the static table alone."""
+    cost = calculate_cost(
+        model,
+        1_000_000,
+        0,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+    assert cost == pytest.approx(expected)
+
+
+class TestPricingHostForBaseUrl:
+    """Which host's published rates an endpoint is billed at."""
+
+    def test_default_endpoint_uses_the_default_host(self) -> None:
+        assert pricing_host_for_base_url(None, "openai") == "openai"
+        assert pricing_host_for_base_url(None, None) is None
+
+    @pytest.mark.parametrize(
+        ("base_url", "host"),
+        [
+            ("https://api.openai.com/v1", "openai"),
+            ("https://openrouter.ai/api/v1", "openrouter"),
+            ("https://api.groq.com/openai/v1", "groq"),
+            ("https://api.together.xyz/v1", "together"),
+            ("https://api.fireworks.ai/inference/v1", "fireworks"),
+            ("https://api.anthropic.com", "anthropic"),
+            ("https://generativelanguage.googleapis.com/v1beta/openai/", "google"),
+            ("HTTPS://OpenRouter.AI/api/v1", "openrouter"),
+        ],
+    )
+    def test_known_hosts(self, base_url: str, host: str) -> None:
+        assert pricing_host_for_base_url(base_url, "openai") == host
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://localhost:11434/v1",
+            "https://my-gateway.example.com/v1",
+            "https://openrouter.ai.example.com/v1",
+            "https://adb-123.azuredatabricks.net/serving-endpoints",
+            "not a url",
+        ],
+    )
+    def test_unknown_endpoints_have_no_host(self, base_url: str) -> None:
+        """A gateway or self-hosted server is never billed at a public host's rate."""
+        assert pricing_host_for_base_url(base_url, "openai") is None
+
+    def test_providers_report_their_endpoint_host(self) -> None:
+        pytest.importorskip("openai")
+        from conductor.providers.openai import OpenAIProvider
+
+        default = OpenAIProvider(api_key="test-key")
+        assert default.pricing_host() == "openai"
+        openrouter = OpenAIProvider(api_key="test-key", base_url="https://openrouter.ai/api/v1")
+        assert openrouter.pricing_host() == "openrouter"
+        gateway = OpenAIProvider(api_key="test-key", base_url="https://gw.example.com/v1")
+        assert gateway.pricing_host() is None
+
+
 class TestLlmPricesLookup:
     """Tests for the optional ``pricing`` extra (llm-prices)."""
 
@@ -671,15 +780,72 @@ class TestLlmPricesLookup:
         monkeypatch.setitem(
             DEFAULT_PRICING, "gpt-5.5", ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00)
         )
-        published = llm_prices.lookup("gpt-5.5")
-        pricing = get_pricing("gpt-5.5")
+        published = llm_prices.lookup_provider("openai", "gpt-5.5")
+        pricing = get_pricing("gpt-5.5", host="openai")
         assert pricing is not None
         assert pricing.input_per_mtok == published.input
         assert pricing.output_per_mtok == published.output
         assert pricing.cache_read_per_mtok == published.cache_read
 
+    def test_hosted_model_is_priced_at_the_serving_host(self) -> None:
+        """Regression: OpenRouter's gpt-oss-20b must not get Groq's rate.
+
+        An unqualified ``llm_prices.lookup("openai/gpt-oss-20b")`` returns
+        Groq's row, which billed 1M in + 1M out at $0.375 instead of
+        OpenRouter's $0.108.
+        """
+        llm_prices = pytest.importorskip("llm_prices")
+        model = "openai/gpt-oss-20b"
+        openrouter = llm_prices.lookup_provider("openrouter", model)
+        groq = llm_prices.lookup_provider("groq", model)
+        assert openrouter is not None and groq is not None
+        assert (openrouter.input, openrouter.output) != (groq.input, groq.output)
+
+        pricing = get_pricing(model, host="openrouter")
+        assert pricing is not None
+        assert (pricing.input_per_mtok, pricing.output_per_mtok) == (
+            openrouter.input,
+            openrouter.output,
+        )
+        pricing = get_pricing(model, host="groq")
+        assert pricing is not None
+        assert (pricing.input_per_mtok, pricing.output_per_mtok) == (groq.input, groq.output)
+
+    @pytest.mark.parametrize("host", [None, "openai", "unknown-host"])
+    def test_hosted_model_without_a_matching_host_stays_unpriced(self, host: str | None) -> None:
+        """No host, or a host that does not sell it: unpriced, never another host's rate."""
+        pytest.importorskip("llm_prices")
+        assert get_pricing("openai/gpt-oss-20b", host=host) is None
+
+    def test_tracker_prices_at_the_host_the_engine_recorded(self) -> None:
+        """The host set by the engine reaches ``get_pricing`` through ``record``."""
+        llm_prices = pytest.importorskip("llm_prices")
+        model = "openai/gpt-oss-20b"
+        output = AgentOutput(
+            content={},
+            raw_response=None,
+            model=model,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+        )
+
+        unhosted = UsageTracker().record("a", output, 0.0)
+        assert unhosted.cost_usd is None
+
+        tracker = UsageTracker()
+        tracker.set_pricing_host(model, "openrouter")
+        usage = tracker.record("a", output, 0.0)
+        openrouter = llm_prices.lookup_provider("openrouter", model)
+        assert usage.cost_usd == pytest.approx(openrouter.input + openrouter.output)
+
     @pytest.mark.usefixtures("without_llm_prices")
     def test_without_extra_uses_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stale = ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00)
+        monkeypatch.setitem(DEFAULT_PRICING, "gpt-5.5", stale)
+        assert get_pricing("gpt-5.5", host="openai") == stale
+
+    def test_without_host_uses_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("llm_prices")
         stale = ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00)
         monkeypatch.setitem(DEFAULT_PRICING, "gpt-5.5", stale)
         assert get_pricing("gpt-5.5") == stale
@@ -687,17 +853,19 @@ class TestLlmPricesLookup:
     def test_override_and_provider_hook_beat_llm_prices(self) -> None:
         pytest.importorskip("llm_prices")
         mine = ModelPricing(input_per_mtok=1.0, output_per_mtok=1.0)
-        assert get_pricing("gpt-5.5", overrides={"gpt-5.5": mine}) == mine
-        assert get_pricing("gpt-5.5", provider_pricing={"gpt-5.5": mine}) == mine
+        assert get_pricing("gpt-5.5", overrides={"gpt-5.5": mine}, host="openai") == mine
+        assert get_pricing("gpt-5.5", provider_pricing={"gpt-5.5": mine}, host="openai") == mine
 
-    @pytest.mark.parametrize("model", ["gemini-3.6-flash", "grok-4.5"])
-    def test_published_model_missing_from_table_is_priced(self, model: str) -> None:
+    @pytest.mark.parametrize(
+        ("model", "host"), [("gemini-3.6-flash", "google"), ("grok-4.5", "xai")]
+    )
+    def test_published_model_missing_from_table_is_priced(self, model: str, host: str) -> None:
         """Ids the table leaves unpriced (#386) get the provider's published rate."""
         llm_prices = pytest.importorskip("llm_prices")
         assert model not in DEFAULT_PRICING
-        published = llm_prices.lookup(model)
+        published = llm_prices.lookup_provider(host, model)
         assert published is not None
-        pricing = get_pricing(model)
+        pricing = get_pricing(model, host=host)
         assert pricing is not None
         assert pricing.input_per_mtok == published.input
         assert pricing.output_per_mtok == published.output
@@ -709,14 +877,18 @@ class TestLlmPricesLookup:
         pytest.importorskip("llm_prices")
         row = ModelPricing(input_per_mtok=3.0, output_per_mtok=4.0)
         monkeypatch.setitem(DEFAULT_PRICING, "conductor-test-only-model", row)
-        assert get_pricing("conductor-test-only-model") == row
-        assert get_pricing("conductor-test-only-model-20990101") == row
-        for model in ("claude-opus-4.6-1m", "claude-haiku-4.5", "gpt-4"):
-            assert get_pricing(model) is not None, model
+        assert get_pricing("conductor-test-only-model", host="openai") == row
+        assert get_pricing("conductor-test-only-model-20990101", host="openai") == row
+        for model, host in (
+            ("claude-opus-4.6-1m", "anthropic"),
+            ("claude-haiku-4.5", "anthropic"),
+            ("gpt-4", "openai"),
+        ):
+            assert get_pricing(model, host=host) is not None, model
 
     def test_anthropic_cache_write_uses_five_minute_rate(self) -> None:
         pytest.importorskip("llm_prices")
-        pricing = get_pricing("claude-sonnet-4-20250514")
+        pricing = get_pricing("claude-sonnet-4-20250514", host="anthropic")
         assert pricing is not None
         table_row = DEFAULT_PRICING["claude-sonnet-4"]
         assert pricing.cache_write_per_mtok == table_row.cache_write_per_mtok
@@ -727,7 +899,7 @@ class TestLlmPricesLookup:
         """The dated id the API returns has its own row, so no "may be inaccurate" warning."""
         pytest.importorskip("llm_prices")
         with caplog.at_level("WARNING", logger="conductor.engine.pricing"):
-            pricing = get_pricing("claude-sonnet-4-20250514")
+            pricing = get_pricing("claude-sonnet-4-20250514", host="anthropic")
         assert pricing is not None
         assert pricing.input_per_mtok == 3.0
         assert caplog.records == []
@@ -735,7 +907,7 @@ class TestLlmPricesLookup:
     def test_cross_family_name_still_unpriced(self) -> None:
         """llm-prices does no prefix matching, so #137 cannot come back through it."""
         pytest.importorskip("llm_prices")
-        assert get_pricing("claude-opus-4.123-high") is None
+        assert get_pricing("claude-opus-4.123-high", host="anthropic") is None
 
     def test_static_table_matches_llm_prices(self) -> None:
         """Every table row llm-prices also carries has the same input and output rate.

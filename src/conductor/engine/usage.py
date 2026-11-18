@@ -175,6 +175,9 @@ class UsageTracker:
         # the exact model string that record() will look up. Sits between the
         # workflow override and the static table in get_pricing's precedence.
         self._provider_pricing: dict[str, ModelPricing] = {}
+        # The host that served each model (AgentProvider.pricing_host), so the
+        # ``pricing`` extra looks the model up at that host's published rate.
+        self._pricing_hosts: dict[str, str] = {}
 
     def set_provider_pricing(self, model: str, pricing: ModelPricing | None) -> None:
         """Cache provider-supplied pricing for ``model`` (no-op when ``None``).
@@ -190,6 +193,21 @@ class UsageTracker:
         """
         if pricing is not None:
             self._provider_pricing[model] = pricing
+
+    def set_pricing_host(self, model: str, host: str | None) -> None:
+        """Remember the host that serves ``model`` (no-op when ``None``).
+
+        Called by the engine alongside :meth:`set_provider_pricing`, so
+        :meth:`record` resolves llm-prices rates for that host only. Without a
+        host, the ``pricing`` extra is skipped for ``model``.
+
+        Args:
+            model: The exact model string that ``record`` will look up.
+            host: The llm-prices provider name from
+                :meth:`AgentProvider.pricing_host`, or ``None``.
+        """
+        if host is not None:
+            self._pricing_hosts[model] = host
 
     def record(
         self,
@@ -242,6 +260,7 @@ class UsageTracker:
                     output.model,
                     self._pricing_overrides,
                     provider_pricing=self._provider_pricing,
+                    host=self._pricing_hosts.get(output.model),
                 ),
             )
 

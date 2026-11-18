@@ -2204,8 +2204,10 @@ resolved in this order (first hit wins):
 3. **Published price table**. With the `pricing` extra installed
    (`pip install 'conductor-cli[pricing]'`), rates come from the
    [llm-prices](https://github.com/Mattbusel/llm-prices) package, which is
-   refreshed from the providers' pricing pages. Ids it does not carry fall
-   through to the built-in table.
+   refreshed from the providers' pricing pages. A model is priced at the host
+   that served it (OpenAI, Anthropic, or the host a custom `base_url` points
+   at, such as OpenRouter or Groq). A gateway or unknown endpoint skips this
+   step. Ids the host does not carry fall through to the built-in table.
 4. **Built-in table** — a static `DEFAULT_PRICING` table of common models.
 5. **Unavailable** — if none of the above match, the agent is **unpriced**.
 

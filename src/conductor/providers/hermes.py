@@ -591,6 +591,12 @@ class HermesProvider(AgentProvider):
         """
         return HERMES_SDK_AVAILABLE
 
+    def pricing_host(self) -> str | None:
+        """The host named by ``base_url``; hermes picks its own endpoint otherwise."""
+        from conductor.engine.pricing import pricing_host_for_base_url
+
+        return pricing_host_for_base_url(self._base_url, default=None)
+
     async def close(self) -> None:
         """No-op — the hermes provider is stateless (no persistent sessions)."""
 

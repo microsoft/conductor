@@ -706,6 +706,12 @@ class OpenAIProvider(AgentProvider):
         del model
         return None
 
+    def pricing_host(self) -> str | None:
+        """OpenAI's API by default; a custom ``base_url`` names its own host."""
+        from conductor.engine.pricing import pricing_host_for_base_url
+
+        return pricing_host_for_base_url(self._base_url, default="openai")
+
     async def _get_mcp_manager_for_cwd(self, resolved_cwd: str) -> MCPManager | None:
         """Return the pooled MCPManager for ``resolved_cwd``, connecting on first use.
 

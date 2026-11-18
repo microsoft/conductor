@@ -748,6 +748,12 @@ class ClaudeProvider(AgentProvider):
         await self._ensure_model_cache()
         return self._resolve_model_cache_value(model, self._max_output_cache)
 
+    def pricing_host(self) -> str | None:
+        """Anthropic's API by default; a custom ``base_url`` names its own host."""
+        from conductor.engine.pricing import pricing_host_for_base_url
+
+        return pricing_host_for_base_url(self._base_url, default="anthropic")
+
     async def list_models(self) -> list[str] | None:
         """Return the model ids advertised by the Anthropic API.
 

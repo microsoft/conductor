@@ -98,7 +98,7 @@ tui = [
 pricing = [
     # Published per-model rates, refreshed from the providers' pricing pages;
     # `engine/pricing.py::get_pricing` consults it before `DEFAULT_PRICING`.
-    "llm-prices>=1.7.2,<2",
+    "llm-prices>=1.8.0,<2",
 ]
 telemetry = [
     "opentelemetry-sdk>=1.20",
@@ -148,7 +148,7 @@ dev = [
     # requiring an end user to install the `tui` extra just to run the suite.
     "textual>=8.0",
     # So the `pricing` extra's lookup path is tested in CI.
-    "llm-prices>=1.7.2,<2",
+    "llm-prices>=1.8.0,<2",
 ]
 
 [tool.ruff]

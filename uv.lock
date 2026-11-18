@@ -504,7 +504,7 @@ requires-dist = [
     { name = "github-copilot-sdk", specifier = ">=1.0.32" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
-    { name = "llm-prices", marker = "extra == 'pricing'", specifier = ">=1.7.2,<2" },
+    { name = "llm-prices", marker = "extra == 'pricing'", specifier = ">=1.8.0,<2" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
     { name = "openai", specifier = ">=2.48.0,<3.0.0" },
     { name = "opentelemetry-api", specifier = ">=1.20" },
@@ -529,7 +529,7 @@ provides-extras = ["claude-agent-sdk", "aca", "tui", "pricing", "telemetry"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "llm-prices", specifier = ">=1.7.2,<2" },
+    { name = "llm-prices", specifier = ">=1.8.0,<2" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
@@ -1107,11 +1107,11 @@ wheels = [
 
 [[package]]
 name = "llm-prices"
-version = "1.7.2"
+version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c6/3f/25ec8311312412549c7990819d46fde486632e375d8beb946a8ac99933a2/llm_prices-1.7.2.tar.gz", hash = "sha256:62fb52bd4dcac91009213bf17eb01a4c73925cd4c58727c82089ba61b49114f2", size = 92913, upload-time = "2026-11-18T02:10:43.46Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0d/08/f11310db506a4ce63e0ea220ede2a61980fd735ec0d232c14d7b9fc8810e/llm_prices-1.8.0.tar.gz", hash = "sha256:3212c251ee3ed66694b2c637dbb7fef4bd296958a3b33f8949a71e3ffe8865cd", size = 98387, upload-time = "2026-11-18T16:27:25.5Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/98/45/38de51f0ff1ed4c2b8565cb9d100c18562df594758157c0f227888732e53/llm_prices-1.7.2-py3-none-any.whl", hash = "sha256:98167d926155d3fac9aec5e65c042688d4b1c8539c545eefa4ea4b6b60b772a1", size = 79052, upload-time = "2026-11-18T02:10:42.095Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/72/5211d6fa7715509835bbd1d498b0469bbe5db260da1394cdb2e54d6ee9aa/llm_prices-1.8.0-py3-none-any.whl", hash = "sha256:9bb73b94bf99a127e1eea60706b1c4672af6315b8980bd7e98bc354d80b6cebd", size = 82123, upload-time = "2026-11-18T16:27:24.079Z" },
 ]
 
 [[package]]

@@ -45,7 +45,7 @@
 #       shell and so ignores UV_NO_MODIFY_PATH).
 #   -Extras <a,b>             OR   $env:CONDUCTOR_INSTALL_EXTRAS
 #       Comma-separated optional extras to install (tui, aca,
-#       claude-agent-sdk). These are *added to* the extras already recorded in
+#       claude-agent-sdk, pricing). These are *added to* the extras already recorded in
 #       the existing install's uv receipt, which are preserved automatically --
 #       `uv tool install --force` rewrites the tool's whole requirement set, so
 #       an upgrade that named no extras used to silently uninstall
@@ -189,8 +189,8 @@ function Test-ExtrasKnown {
     foreach ($name in ($ExtrasList -split ',')) {
         $trimmed = $name.Trim()
         if (-not $trimmed) { continue }
-        if (@('tui', 'aca', 'claude-agent-sdk') -notcontains $trimmed) {
-            Write-Err "unknown extra '$trimmed' (available: tui, aca, claude-agent-sdk)"
+        if (@('tui', 'aca', 'claude-agent-sdk', 'pricing') -notcontains $trimmed) {
+            Write-Err "unknown extra '$trimmed' (available: tui, aca, claude-agent-sdk, pricing)"
         }
     }
 }

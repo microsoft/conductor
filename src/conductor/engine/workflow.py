@@ -44,7 +44,7 @@ from conductor.engine.execution_resolution import ExecutionResolver, ExecutionRe
 from conductor.engine.guidance import GuidanceChannel
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.local_workspace import LocalWorkspacePathMapper
-from conductor.engine.pricing import ModelPricing
+from conductor.engine.pricing import ModelPricing, provider_pricing_host
 from conductor.engine.realm_credentials import resolve_realm_credentials
 from conductor.engine.router import Router, RouteResult
 from conductor.engine.run_manifest import (
@@ -3678,6 +3678,7 @@ class WorkflowEngine:
                 return
             provider = await self._get_provider_for_agent(agent)
             if provider is not None:
+                self.usage_tracker.set_pricing_host(model, provider_pricing_host(provider))
                 try:
                     pricing = await provider.get_model_pricing(model)
                 except Exception as e:
