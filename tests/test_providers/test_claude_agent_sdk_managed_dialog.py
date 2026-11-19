@@ -14,6 +14,8 @@ from conductor.providers.base import AgentProvider
 from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
 from tests.test_providers.managed_claude_sdk_fixture import native_harness
 
+pytest.importorskip("claude_agent_sdk")
+
 pytestmark = [
     pytest.mark.claude_auth_readiness_mocked,
     pytest.mark.skipif(sys.platform != "linux", reason="Native Unix fixture IPC requires Linux"),

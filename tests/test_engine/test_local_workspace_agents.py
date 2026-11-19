@@ -587,6 +587,8 @@ async def test_shared_plugin_mcp_switches_reach_native_provider_wire(
     tmp_path, monkeypatch, provider_name, inline, off_first
 ):
     # Requirement: actual SDK sessions share one staged skill root without sharing MCP grants.
+    if provider_name == "claude-agent-sdk":
+        pytest.importorskip("claude_agent_sdk")
     from conductor.providers import claude_agent_sdk as claude
     from conductor.providers.copilot import CopilotProvider
     from tests.test_providers.managed_claude_sdk_fixture import native_harness
