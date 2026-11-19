@@ -13,7 +13,7 @@ from conductor.engine.pricing import (
     get_pricing,
     pricing_host_for_base_url,
 )
-from conductor.engine.usage import UsageTracker
+from conductor.engine.usage import PricingSource, UsageTracker
 from conductor.providers.base import AgentOutput
 
 
@@ -818,7 +818,7 @@ class TestLlmPricesLookup:
         assert get_pricing("openai/gpt-oss-20b", host=host) is None
 
     def test_tracker_prices_at_the_host_the_engine_recorded(self) -> None:
-        """The host set by the engine reaches ``get_pricing`` through ``record``."""
+        """The host passed with a record reaches ``get_pricing``."""
         llm_prices = pytest.importorskip("llm_prices")
         model = "openai/gpt-oss-20b"
         output = AgentOutput(
@@ -832,9 +832,7 @@ class TestLlmPricesLookup:
         unhosted = UsageTracker().record("a", output, 0.0)
         assert unhosted.cost_usd is None
 
-        tracker = UsageTracker()
-        tracker.set_pricing_host(model, "openrouter")
-        usage = tracker.record("a", output, 0.0)
+        usage = UsageTracker().record("a", output, 0.0, PricingSource(host="openrouter"))
         openrouter = llm_prices.lookup_provider("openrouter", model)
         assert usage.cost_usd == pytest.approx(openrouter.input + openrouter.output)
 

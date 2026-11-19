@@ -24,7 +24,8 @@ from conductor.config.schema import (
 )
 from conductor.engine.pricing import ModelPricing
 from conductor.engine.workflow import WorkflowEngine
-from conductor.providers.base import AgentOutput
+from conductor.exceptions import BudgetExceededError
+from conductor.providers.base import AgentOutput, AgentProvider
 from conductor.providers.copilot import CopilotProvider
 
 # A model deliberately absent from DEFAULT_PRICING so only the provider hook
@@ -196,8 +197,8 @@ async def test_concurrent_same_model_agents_all_priced() -> None:
     agent = config.agents[0]
 
     async def ensure_then_record(name: str) -> float | None:
-        await engine._ensure_pricing_resolved(agent, _UNPRICED_MODEL)
-        return engine.usage_tracker.record(name, _make_output(), elapsed=1.0).cost_usd
+        source = await engine._ensure_pricing_resolved(agent, _UNPRICED_MODEL)
+        return engine.usage_tracker.record(name, _make_output(), 1.0, source).cost_usd
 
     costs = await asyncio.gather(*(ensure_then_record(f"a{i}") for i in range(4)))
 
@@ -330,3 +331,213 @@ async def test_systemic_hook_failure_warns_once(caplog: pytest.LogCaptureFixture
     assert len(warnings) == 1  # latched — only the first failure warns
     assert "pricing hook failed" in warnings[0].getMessage()
     assert engine._pricing_hook_failed_warned is True
+
+
+# A model id that several hosts sell at different rates, and that the static
+# table does not carry, so only the serving host decides its price.
+_SHARED_MODEL = "openai/gpt-oss-20b"
+
+
+class _HostedProvider:
+    """A provider double that reports only the host serving its requests.
+
+    Inherits the base ``get_model_pricing`` (returns ``None``), so the
+    ``pricing`` extra prices each execution at ``pricing_host()``'s rate.
+    ``None`` stands for an endpoint with no known price list (a gateway or a
+    self-hosted server).
+    """
+
+    get_model_pricing = AgentProvider.get_model_pricing
+
+    def __init__(self, host: str | None) -> None:
+        self._host = host
+
+    def pricing_host(self) -> str | None:
+        return self._host
+
+
+def _chain_config(count: int, limits: LimitsConfig) -> WorkflowConfig:
+    """``count`` agents run one after another: a0 -> a1 -> ... -> $end."""
+    agents = [
+        AgentDef(
+            name=f"a{i}",
+            prompt="go",
+            output={"result": OutputField(type="string")},
+            routes=[RouteDef(to=f"a{i + 1}" if i + 1 < count else "$end")],
+        )
+        for i in range(count)
+    ]
+    return WorkflowConfig(
+        workflow=WorkflowDef(name="mixed-hosts", entry_point="a0", limits=limits),
+        agents=agents,
+        output={"done": "true"},
+    )
+
+
+def _mixed_host_engine(
+    providers: list[_HostedProvider],
+    limits: LimitsConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> WorkflowEngine:
+    """An engine whose agent ``a{i}`` is served by ``providers[i]``.
+
+    Every agent reports the same model id with 1M input and 1M output tokens,
+    so each record's cost is exactly the serving host's input plus output rate.
+    """
+    execution = CopilotProvider(mock_handler=lambda *_a, **_kw: {})
+
+    async def fake_execute(*_args: object, **_kwargs: object) -> AgentOutput:
+        return AgentOutput(
+            content={"result": "ok"},
+            raw_response="{}",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            model=_SHARED_MODEL,
+        )
+
+    execution.execute = fake_execute  # type: ignore[assignment]
+    engine = WorkflowEngine(_chain_config(len(providers), limits), execution)
+    serving = {f"a{i}": provider for i, provider in enumerate(providers)}
+
+    async def provider_for(agent: AgentDef) -> _HostedProvider:
+        return serving[agent.name]
+
+    monkeypatch.setattr(engine, "_get_provider_for_agent", provider_for)
+    return engine
+
+
+def _host_cost(host: str | None) -> float | None:
+    """The published cost of 1M input + 1M output tokens at ``host``."""
+    if host is None:
+        return None
+    import llm_prices
+
+    price = llm_prices.lookup_provider(host, _SHARED_MODEL)
+    assert price is not None
+    return price.input + price.output
+
+
+@pytest.fixture
+def shared_model_rates() -> None:
+    """Skip without the ``pricing`` extra; check the hosts really disagree."""
+    pytest.importorskip("llm_prices")
+    openrouter, groq = _host_cost("openrouter"), _host_cost("groq")
+    assert openrouter is not None and groq is not None
+    # The budget cases below need the cheaper host to be clearly cheaper.
+    assert 2 * openrouter < groq
+
+
+_MIXED_ORDERS = [
+    pytest.param(["openrouter", "groq"], id="openrouter-then-groq"),
+    pytest.param(["groq", "openrouter"], id="groq-then-openrouter"),
+    pytest.param(["openrouter", None, "groq"], id="openrouter-unknown-groq"),
+    pytest.param(["groq", None, "openrouter"], id="groq-unknown-openrouter"),
+    pytest.param([None, "openrouter", "groq"], id="unknown-openrouter-groq"),
+    pytest.param([None, "groq", "openrouter"], id="unknown-groq-openrouter"),
+]
+
+
+@pytest.mark.usefixtures("shared_model_rates")
+class TestMixedProviderPricing:
+    """Each execution is priced at the host that served it, in any order.
+
+    Regression: the serving host was cached by model name, so the first
+    provider to resolve a model priced every later execution of it. OpenRouter
+    then Groq recorded the Groq run at OpenRouter's rate ($0.108 instead of
+    $0.375 for 1M + 1M tokens), undercounting spend so a budget could not fire.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hosts", _MIXED_ORDERS)
+    async def test_each_record_priced_at_its_own_host(
+        self, hosts: list[str | None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        providers = [_HostedProvider(host) for host in hosts]
+        engine = _mixed_host_engine(providers, LimitsConfig(max_iterations=10), monkeypatch)
+        await engine.run({})
+
+        records = engine.usage_tracker.get_summary().agents
+        assert [r.agent_name for r in records] == [f"a{i}" for i in range(len(hosts))]
+        for record, host in zip(records, hosts, strict=True):
+            expected = _host_cost(host)
+            if expected is None:
+                # An unknown host stays unpriced; it never borrows a known
+                # host's rate for the same model id.
+                assert record.cost_usd is None, host
+            else:
+                assert record.cost_usd == pytest.approx(expected), host
+
+        usage = engine.get_execution_summary()["usage"]
+        priced = [c for c in map(_host_cost, hosts) if c is not None]
+        assert usage["total_cost_usd"] == pytest.approx(sum(priced))
+        assert usage["unpriced_agent_count"] == hosts.count(None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hosts", _MIXED_ORDERS)
+    async def test_budget_fires_on_the_true_mixed_cost(
+        self, hosts: list[str | None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An enforce budget just under the true total trips on the last agent."""
+        costs = [c for c in map(_host_cost, hosts) if c is not None]
+        total = sum(costs)
+        # Above every earlier prefix of the run, below the full run, so only
+        # the last agent's real cost can cross it.
+        budget = total - 0.5 * min(costs)
+        providers = [_HostedProvider(host) for host in hosts]
+        engine = _mixed_host_engine(
+            providers, LimitsConfig(budget_usd=budget, budget_mode="enforce"), monkeypatch
+        )
+
+        with pytest.raises(BudgetExceededError) as exc_info:
+            await engine.run({})
+
+        assert exc_info.value.spent_usd == pytest.approx(total)
+        assert exc_info.value.current_agent == f"a{len(hosts) - 1}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "hosts",
+        [
+            pytest.param(["groq", None], id="groq-then-unknown"),
+            pytest.param(["openrouter", "groq", None], id="openrouter-groq-unknown"),
+        ],
+    )
+    async def test_unknown_host_never_inherits_a_rate_into_the_budget(
+        self, hosts: list[str | None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unknown host after priced ones must not trip the budget.
+
+        If the unknown endpoint inherited an earlier host's rate for the same
+        model id, spend would pass this budget and the run would stop.
+        """
+        costs = [c for c in map(_host_cost, hosts) if c is not None]
+        total = sum(costs)
+        budget = total + 0.5 * min(costs)
+        providers = [_HostedProvider(host) for host in hosts]
+        engine = _mixed_host_engine(
+            providers, LimitsConfig(budget_usd=budget, budget_mode="enforce"), monkeypatch
+        )
+        await engine.run({})
+
+        summary = engine.usage_tracker.get_summary()
+        assert [r.cost_usd is None for r in summary.agents] == [h is None for h in hosts]
+        assert summary.total_cost_usd == pytest.approx(total)
+
+    @pytest.mark.asyncio
+    async def test_hook_rate_stays_with_the_provider_that_returned_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A provider's own hook rate never prices another provider's execution."""
+
+        class _HookPriced(_HostedProvider):
+            async def get_model_pricing(self, model: str) -> ModelPricing | None:
+                return ModelPricing(input_per_mtok=7.0, output_per_mtok=11.0)
+
+        providers = [_HookPriced(None), _HostedProvider("groq"), _HostedProvider(None)]
+        engine = _mixed_host_engine(providers, LimitsConfig(), monkeypatch)
+        await engine.run({})
+
+        hooked, hosted, unknown = engine.usage_tracker.get_summary().agents
+        assert hooked.cost_usd == pytest.approx(18.0)
+        assert hosted.cost_usd == pytest.approx(_host_cost("groq"))
+        assert unknown.cost_usd is None

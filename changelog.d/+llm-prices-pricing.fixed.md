@@ -4,4 +4,6 @@ tokens instead of $5/$30), and added a `pricing` extra
 (`pip install 'conductor-cli[pricing]'`, or `--extras pricing` with the
 install scripts) that prices models from the llm-prices package at the host
 that served them, so new models and price changes do not wait for a
-Conductor release.
+Conductor release. When two providers serve the same
+model in one run, each execution is priced at its own host's rate, and an
+unknown host stays unpriced.

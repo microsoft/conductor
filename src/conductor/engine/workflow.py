@@ -54,7 +54,7 @@ from conductor.engine.run_manifest import (
     script_step_backends,
 )
 from conductor.engine.secrets import SecretValueCache
-from conductor.engine.usage import UsageTracker, WorkflowUsage
+from conductor.engine.usage import PricingSource, UsageTracker, WorkflowUsage
 from conductor.engine.workspace_claim import WorkspaceClaim, acquire_workspace_claim
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import (
@@ -785,15 +785,16 @@ class WorkflowEngine:
             pricing_overrides=self._build_pricing_overrides(),
         )
 
-        # Models whose provider pricing (the get_model_pricing hook) has been
-        # resolved this run — each distinct model is queried at most once. A
-        # model is added after the resolution attempt completes, whether a price
-        # was cached or the model was left unpriced (see _ensure_pricing_resolved).
-        # See #265.
-        self._pricing_resolved_models: set[str] = set()
-        # Per-model locks that serialize concurrent pricing resolution so
-        # parallel/for-each siblings sharing a model don't race the cache.
-        self._pricing_locks: dict[str, asyncio.Lock] = {}
+        # Pricing resolved this run, keyed by (provider instance, model): each
+        # provider is asked about each model at most once, and two providers
+        # serving the same model id keep separate rates. An entry is stored
+        # after the resolution attempt completes, whether a price was found or
+        # not (see _ensure_pricing_resolved and #265). The provider is held in
+        # the value so its id() cannot be reused while the key exists.
+        self._pricing_resolved: dict[tuple[int, str], tuple[AgentProvider, PricingSource]] = {}
+        # Per-key locks that serialize concurrent pricing resolution so
+        # parallel/for-each siblings sharing a provider and model don't race.
+        self._pricing_locks: dict[tuple[int, str], asyncio.Lock] = {}
         # One-time latch so a systemic pricing-hook failure (e.g. the provider
         # SDK's model listing breaks) is surfaced once per run instead of only
         # at debug level — otherwise table-priced models still show a normal
@@ -3633,97 +3634,105 @@ class WorkflowEngine:
 
     async def _ensure_pricing_resolved(
         self, agent: AgentDef, model: str | None, realm: AgentRealm | None = None
-    ) -> None:
-        """Resolve provider-supplied pricing for ``model`` and cache it.
+    ) -> PricingSource | None:
+        """Resolve how the provider that ran ``agent`` prices ``model``.
 
         Best-effort bridge between the async :meth:`AgentProvider.get_model_pricing`
-        hook and the synchronous :meth:`UsageTracker.record` (see #265). Resolves
-        the agent's provider once per distinct model, stores any returned
-        :class:`ModelPricing` on the tracker so ``record`` can price it, and
-        remembers the attempt — even a ``None`` result — so each model is queried
-        at most once per run. Call it immediately before ``usage_tracker.record``.
+        hook and the synchronous :meth:`UsageTracker.record` (see #265). Returns
+        the serving provider's :class:`PricingSource` (its ``pricing_host()`` and
+        hook rate), which the caller passes to ``record`` for this execution
+        only. Call it immediately before ``usage_tracker.record``.
+
+        Results are cached per ``(provider, model)``, never per model alone: the
+        same model id can be served by several providers in one run (OpenRouter
+        and Groq both sell ``openai/gpt-oss-20b``, at different rates), and a
+        model-keyed cache would price every later execution at the first
+        provider's rate, undercounting cost and letting a budget slip past.
 
         Concurrency: parallel groups and for-each batches run several agents that
-        usually share the same model. A per-model :class:`asyncio.Lock` serializes
-        resolution, and the model is added to ``_pricing_resolved_models`` **only
-        after** the resolution attempt completes (a price cached, or the model
-        left unpriced) — so a sibling coroutine that arrives while the first is
-        still awaiting the hook waits on the lock rather than racing ahead to
-        ``record`` and mis-recording the model as unpriced.
+        usually share a provider and model. A per-key :class:`asyncio.Lock`
+        serializes resolution, and the result is cached **only after** the
+        attempt completes, so a sibling that arrives while the first is still
+        awaiting the hook waits on the lock rather than recording unpriced.
 
         Never raises: pricing metadata is optional and must not interrupt
-        execution. On any failure the model simply stays unpriced (falling
-        through to the static table), which the summary now surfaces.
+        execution. On any failure the execution stays unpriced (falling through
+        to the static table), which the summary surfaces.
 
-        Known limitation: pricing is cached by model *name* only (the sync
-        ``record`` looks up cost by ``output.model`` and has no provider handle),
-        so in the rare case where two providers in one run serve the same model
-        name at different rates, the first to resolve wins for both. This is
-        unreachable today (only ``CopilotProvider`` overrides ``get_model_pricing``;
-        all others inherit the ``None`` base). Revisit — by keying pricing per
-        ``(provider, model)`` or returning the price inline to ``record`` — when a
-        second provider implements the hook. Acceptable for a best-effort estimate.
+        Returns:
+            The pricing source for this execution; an empty one (no host, no
+            rate) when no provider can be resolved; ``None`` for a remote realm
+            or a missing model, where ``record`` keeps its default behavior.
         """
         if realm is not None or not model or not isinstance(model, str):
-            return
-        # Fast path: this model was already attempted this run (price cached, or
-        # deliberately left unpriced).
-        if model in self._pricing_resolved_models:
-            return
+            return None
+        provider = await self._get_provider_for_agent(agent)
+        if provider is None:
+            # Unknown provider: no host and no hook rate, so this execution can
+            # never borrow another provider's price for the same model id.
+            return PricingSource()
+        key = (id(provider), model)
+        # Fast path: this provider was already asked about this model.
+        cached = self._pricing_resolved.get(key)
+        if cached is not None:
+            return cached[1]
         # setdefault has no await, so concurrent callers share one lock instance.
-        lock = self._pricing_locks.setdefault(model, asyncio.Lock())
+        lock = self._pricing_locks.setdefault(key, asyncio.Lock())
         async with lock:
-            # Another coroutine may have resolved this model while we waited.
-            if model in self._pricing_resolved_models:
-                return
-            provider = await self._get_provider_for_agent(agent)
-            if provider is not None:
-                self.usage_tracker.set_pricing_host(model, provider_pricing_host(provider))
-                try:
-                    pricing = await provider.get_model_pricing(model)
-                except Exception as e:
-                    logger.debug(
-                        "get_model_pricing(%r) raised on provider for agent %s: %s",
+            # Another coroutine may have resolved this key while we waited.
+            cached = self._pricing_resolved.get(key)
+            if cached is not None:
+                return cached[1]
+            host = provider_pricing_host(provider)
+            pricing: ModelPricing | None = None
+            try:
+                pricing = await provider.get_model_pricing(model)
+            except Exception as e:
+                logger.debug(
+                    "get_model_pricing(%r) raised on provider for agent %s: %s",
+                    model,
+                    agent.name,
+                    e,
+                )
+                # A raising hook usually means a systemic break (SDK auth /
+                # model-listing failure), which silently degrades pricing for
+                # every model — table-priced models still show a normal cost,
+                # so the breakage is otherwise invisible. Surface it once.
+                if not self._pricing_hook_failed_warned:
+                    self._pricing_hook_failed_warned = True
+                    logger.warning(
+                        "Provider pricing hook failed for model %r (%s); live "
+                        "pricing is unavailable and costs will use the static "
+                        "table or show as unpriced. Further failures are logged "
+                        "at debug level.",
                         model,
-                        agent.name,
                         e,
                     )
-                    # A raising hook usually means a systemic break (SDK auth /
-                    # model-listing failure), which silently degrades pricing for
-                    # every model — table-priced models still show a normal cost,
-                    # so the breakage is otherwise invisible. Surface it once.
-                    if not self._pricing_hook_failed_warned:
-                        self._pricing_hook_failed_warned = True
-                        logger.warning(
-                            "Provider pricing hook failed for model %r (%s); live "
-                            "pricing is unavailable and costs will use the static "
-                            "table or show as unpriced. Further failures are logged "
-                            "at debug level.",
-                            model,
-                            e,
-                        )
-                else:
-                    self.usage_tracker.set_provider_pricing(model, pricing)
-                    # Only track providers that actually implement the hook.
-                    # ``AgentProvider.get_model_pricing`` returns ``None`` by
-                    # design and ``providers/base.py`` documents that as the
-                    # correct behaviour for a provider whose SDK exposes no
-                    # pricing; only Copilot overrides it. Without this check,
-                    # four of the five providers get told their SDK broke for
-                    # doing exactly what the base class prescribes.
-                    #
-                    # Imported here rather than at module scope: the
-                    # top-level import is ``TYPE_CHECKING``-only.
-                    from conductor.providers.base import (
-                        AgentProvider as _AgentProviderBase,
-                    )
+            else:
+                # Keep the model-keyed cache warm for callers that record
+                # without a source (remote realms), as before.
+                self.usage_tracker.set_provider_pricing(model, pricing)
+                # Only track providers that actually implement the hook.
+                # ``AgentProvider.get_model_pricing`` returns ``None`` by
+                # design and ``providers/base.py`` documents that as the
+                # correct behaviour for a provider whose SDK exposes no
+                # pricing; only Copilot overrides it. Without this check,
+                # four of the five providers get told their SDK broke for
+                # doing exactly what the base class prescribes.
+                #
+                # Imported here rather than at module scope: the
+                # top-level import is ``TYPE_CHECKING``-only.
+                from conductor.providers.base import (
+                    AgentProvider as _AgentProviderBase,
+                )
 
-                    if type(provider).get_model_pricing is not _AgentProviderBase.get_model_pricing:
-                        self._note_pricing_hook_result(model, pricing)
-            # Mark resolved only now — after the attempt completes — even on a
-            # provider-None / failure / None result, so it isn't retried on every
-            # record and the model stays unpriced via the static-table fallback.
-            self._pricing_resolved_models.add(model)
+                if type(provider).get_model_pricing is not _AgentProviderBase.get_model_pricing:
+                    self._note_pricing_hook_result(model, pricing)
+            source = PricingSource(host=host, pricing=pricing)
+            # Cache only now, after the attempt completes, even on a failure or
+            # ``None`` result, so the hook isn't retried on every record.
+            self._pricing_resolved[key] = (provider, source)
+            return source
 
     async def _get_context_window_for_agent(
         self, agent: AgentDef, output: AgentOutput | None = None, realm: AgentRealm | None = None
@@ -6103,8 +6112,8 @@ class WorkflowEngine:
         v_cost: float | None = None
         v_billing_mode: BillingMode | None = None
         if outcome.output is not None:
-            await self._ensure_pricing_resolved(agent, outcome.output.model, realm)
-            v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed)
+            v_source = await self._ensure_pricing_resolved(agent, outcome.output.model, realm)
+            v_usage = self.usage_tracker.record(validator_row, outcome.output, _v_elapsed, v_source)
             v_cost = v_usage.cost_usd
             v_billing_mode = v_usage.billing_mode
 
@@ -6209,8 +6218,8 @@ class WorkflowEngine:
         # The re-run succeeded and is now the effective output (recorded under
         # the primary name by the caller). Attribute the now-discarded first
         # attempt to the validator row so its cost isn't lost.
-        await self._ensure_pricing_resolved(agent, output.model, realm)
-        self.usage_tracker.record(validator_row, output, primary_elapsed)
+        pricing_source = await self._ensure_pricing_resolved(agent, output.model, realm)
+        self.usage_tracker.record(validator_row, output, primary_elapsed, pricing_source)
         return new_output
 
     @staticmethod
@@ -7396,10 +7405,12 @@ class WorkflowEngine:
                             _agent_elapsed = _time.time() - _agent_start
 
                         # Record usage and calculate cost
-                        await self._ensure_pricing_resolved(
+                        pricing_source = await self._ensure_pricing_resolved(
                             resolved_agent, output.model, agent_realm
                         )
-                        usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
+                        usage = self.usage_tracker.record(
+                            agent.name, output, _agent_elapsed, pricing_source
+                        )
                         if output.session_seconds is not None:
                             self.usage_tracker.record_sandbox(
                                 f"{agent.name} (sandbox)", output.session_seconds
@@ -8483,8 +8494,12 @@ class WorkflowEngine:
                     _agent_elapsed = _time.time() - _agent_start
 
                 # Record usage and calculate cost
-                await self._ensure_pricing_resolved(resolved_agent, output.model, realm)
-                usage = self.usage_tracker.record(agent.name, output, _agent_elapsed)
+                pricing_source = await self._ensure_pricing_resolved(
+                    resolved_agent, output.model, realm
+                )
+                usage = self.usage_tracker.record(
+                    agent.name, output, _agent_elapsed, pricing_source
+                )
                 if output.session_seconds is not None:
                     self.usage_tracker.record_sandbox(
                         f"{agent.name} (sandbox)", output.session_seconds
@@ -9109,9 +9124,11 @@ class WorkflowEngine:
                     _item_elapsed = _time.time() - _item_start
 
                 # Record usage and calculate cost
-                await self._ensure_pricing_resolved(qualified_agent, output.model, realm)
+                pricing_source = await self._ensure_pricing_resolved(
+                    qualified_agent, output.model, realm
+                )
                 usage = self.usage_tracker.record(
-                    f"{for_each_group.name}[{key}]", output, _item_elapsed
+                    f"{for_each_group.name}[{key}]", output, _item_elapsed, pricing_source
                 )
                 if output.session_seconds is not None:
                     self.usage_tracker.record_sandbox(

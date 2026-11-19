@@ -16,6 +16,28 @@ if TYPE_CHECKING:
     from conductor.providers.base import AgentOutput
 
 
+@dataclass(frozen=True)
+class PricingSource:
+    """How one execution is priced: the provider that served it, resolved.
+
+    The engine resolves this per execution (see
+    ``WorkflowEngine._ensure_pricing_resolved``) and passes it to
+    :meth:`UsageTracker.record`, so two providers serving the same model id in
+    one run are each priced at their own rate rather than whichever resolved
+    first.
+
+    Attributes:
+        host: The llm-prices name of the host that served the request (see
+            :meth:`AgentProvider.pricing_host`), or ``None`` when the endpoint
+            is unknown, in which case llm-prices is skipped.
+        pricing: The serving provider's own rate from
+            :meth:`AgentProvider.get_model_pricing`, or ``None``.
+    """
+
+    host: str | None = None
+    pricing: ModelPricing | None = None
+
+
 @dataclass
 class AgentUsage:
     """Token usage and cost for a single agent execution.
@@ -175,9 +197,6 @@ class UsageTracker:
         # the exact model string that record() will look up. Sits between the
         # workflow override and the static table in get_pricing's precedence.
         self._provider_pricing: dict[str, ModelPricing] = {}
-        # The host that served each model (AgentProvider.pricing_host), so the
-        # ``pricing`` extra looks the model up at that host's published rate.
-        self._pricing_hosts: dict[str, str] = {}
 
     def set_provider_pricing(self, model: str, pricing: ModelPricing | None) -> None:
         """Cache provider-supplied pricing for ``model`` (no-op when ``None``).
@@ -194,26 +213,12 @@ class UsageTracker:
         if pricing is not None:
             self._provider_pricing[model] = pricing
 
-    def set_pricing_host(self, model: str, host: str | None) -> None:
-        """Remember the host that serves ``model`` (no-op when ``None``).
-
-        Called by the engine alongside :meth:`set_provider_pricing`, so
-        :meth:`record` resolves llm-prices rates for that host only. Without a
-        host, the ``pricing`` extra is skipped for ``model``.
-
-        Args:
-            model: The exact model string that ``record`` will look up.
-            host: The llm-prices provider name from
-                :meth:`AgentProvider.pricing_host`, or ``None``.
-        """
-        if host is not None:
-            self._pricing_hosts[model] = host
-
     def record(
         self,
         agent_name: str,
         output: AgentOutput,
         elapsed: float,
+        source: PricingSource | None = None,
     ) -> AgentUsage:
         """Record usage from an agent execution.
 
@@ -221,6 +226,11 @@ class UsageTracker:
             agent_name: Name of the agent that executed.
             output: The agent's output containing token counts.
             elapsed: Execution time in seconds.
+            source: How the provider that served this execution prices it.
+                When given, its host and hook rate apply to this record only,
+                and the per-model cache from :meth:`set_provider_pricing` is
+                not consulted, so another provider's rate for the same model
+                id never leaks in. ``None`` uses that cache and no host.
 
         Returns:
             AgentUsage record with token counts and cost.
@@ -250,6 +260,14 @@ class UsageTracker:
 
         cost = None
         if output.model and isinstance(output.model, str):
+            if source is None:
+                provider_pricing = self._provider_pricing
+                host = None
+            else:
+                provider_pricing = (
+                    {output.model: source.pricing} if source.pricing is not None else None
+                )
+                host = source.host
             cost = calculate_cost(
                 model=output.model,
                 input_tokens=input_tokens,
@@ -259,8 +277,8 @@ class UsageTracker:
                 pricing=get_pricing(
                     output.model,
                     self._pricing_overrides,
-                    provider_pricing=self._provider_pricing,
-                    host=self._pricing_hosts.get(output.model),
+                    provider_pricing=provider_pricing,
+                    host=host,
                 ),
             )
 
