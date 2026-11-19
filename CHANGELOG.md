@@ -11,6 +11,78 @@ Pending changes are collected as fragment files in [`changelog.d/`](changelog.d/
 and compiled into this file at release time.
 
 <!-- towncrier release notes start -->
+## [0.1.46] - 2026-11-19
+
+### Added
+
+- **`reasoning.effort` on `claude-agent-sdk`**: the provider now forwards the
+  resolved effort as `ClaudeAgentOptions.effort`, which reaches the `claude`
+  CLI as `--effort <level>`, and its capability descriptor declares all five
+  levels instead of `None`. This was a hard `conductor validate` error before,
+  so a workflow that wanted per-agent effort on this provider could not be
+  validated at all. `runtime.default_reasoning_effort` now reaches this
+  provider like every other one; a per-agent `reasoning.effort` still wins.
+  Because the CLI silently drops effort on models without it and runs an
+  unsupported `xhigh` or `max` at `high`, the provider refuses those
+  combinations for explicit model ids (for example `xhigh` on the default
+  `claude-sonnet-4-6`). A set level is also pinned in
+  `CLAUDE_CODE_EFFORT_LEVEL`, which the CLI ranks above `--effort`, so an
+  inherited value or a settings tier cannot replace it. Leaving effort unset
+  is unchanged behaviour: nothing is sent and the CLI's own default applies. (#616)
+- Local workflows can opt into retained shared workspaces backed by a mutable
+  copy of their selected run bundle. Supported local scripts, agents, and MCP
+  consumers share the copy, and resume verifies its identity and runtime release
+  before reusing it. (#629)
+- **Copilot Fusion and Auto routing tiers**: Copilot agents can set
+  `fusion_tier` (`standard`, `high` or `max`) with `model: fusion`, or
+  `auto_tier` with `model: auto`, and workflows can set
+  `runtime.default_fusion_tier` or `runtime.default_auto_tier` for every agent on
+  the matching model. An agent's own tier replaces the workflow default, both
+  fields accept `{{ ... }}` templates. Only when neither an agent preference nor
+  a matching workflow default applies is no tier sent, preserving the runtime's
+  default and any tier persisted with a resumed session. An explicit tier fixes
+  the requested routing preference, not model choices or results. The tier reaches
+  create, resume, interrupted-session continuation and dialog sessions, and
+  Docker and ACA execution profiles. Incompatible combinations (a tier on another
+  model or provider, or with BYOK `base_url` routing) fail `conductor validate`
+  and are refused again at run time. Fusion is experimental and depends on your
+  Copilot account and runtime. Fusion turns are reported under the configured
+  selector (`fusion` or `auto`) with an unknown cost unless `cost.pricing` names
+  that selector, rather than priced at the last constituent model's rate.
+  Parse-recovery calls merge model history; follow-ups account only for their
+  own calls while retaining the session's Fusion preference until a replacement
+  is confirmed. See
+  `docs/configuration.md` and `examples/copilot-fusion.yaml`.
+
+  The minimum `github-copilot-sdk` is now 1.0.32. Docker and ACA runner images
+  must be rebuilt to run agents with a routing tier; older images are refused
+  with a rebuild instruction, and agents without a tier still run on them. (#637)
+
+### Fixed
+
+- **Agent execution realms**: explicit `tools: []` now survives the
+  host-to-runner boundary, so Docker and ACA agents no longer receive the inner
+  provider's default MCP catalog. Protocol v1 runners reject this configuration
+  instead of silently widening tool access.
+
+  Host upgrades require rebuilt Docker and ACA runner images with matching
+  Conductor code. Although the protocol remains v2, current hosts send declared
+  `agent.tools` on every v2 request (including `null`), and older strict runner
+  images reject that field with HTTP 422, even when the workflow does not use an
+  empty allowlist. (#634)
+- Corrected the built-in prices for 12 OpenAI and Gemini models that were
+  billing at a placeholder rate (for example `gpt-5.5` at $2/$8 per million
+  tokens instead of $5/$30), and added a `pricing` extra
+  (`pip install 'conductor-cli[pricing]'`, or `--extras pricing` with the
+  install scripts) that prices models from the llm-prices package at the host
+  that served them, so new models and price changes do not wait for a
+  Conductor release. When two providers serve the same
+  model in one run, each execution is priced at its own host's rate, and an
+  unknown host stays unpriced. (#645)
+- **Interrupted agent runs**: partial results from the pydantic-ai provider now
+  report `input_tokens` and `output_tokens` instead of `None`. (#646)
+
+
 ## [0.1.45] - 2026-11-10
 
 ### Fixed
