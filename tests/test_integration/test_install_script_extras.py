@@ -292,6 +292,12 @@ class TestInstallShExtras:
 
         assert run_sh(sh_helpers, "receipt_extras", tools) == "tui"
 
+    def test_the_pricing_extra_is_accepted(self, sh_helpers: Path) -> None:
+        """`pricing` is declared in pyproject.toml, so `--extras pricing` must
+        not be refused as unknown."""
+        assert run_sh(sh_helpers, "validate_extras pricing", sh_helpers.parent) == ""
+        assert run_sh(sh_helpers, "validate_extras tui,pricing", sh_helpers.parent) == ""
+
     def test_an_extra_is_accepted_regardless_of_case(self, sh_helpers: Path) -> None:
         """PowerShell's `-notcontains` is case-insensitive; rejecting `TUI`
         only on POSIX would be a new cross-platform divergence."""
@@ -529,6 +535,23 @@ class TestInstallPs1Extras:
 
         assert run_pwsh("Write-Output ('' -eq (Get-ReceiptExtras))", tool_dir) == "True"
 
+    def test_the_pricing_extra_is_accepted(self, tool_dir: Path) -> None:
+        """`pricing` is declared in pyproject.toml, so `-Extras pricing` must
+        not be refused as unknown."""
+        out = run_pwsh("Test-ExtrasKnown 'tui,pricing'; Write-Output 'accepted'", tool_dir)
+
+        assert out == "accepted"
+
+    def test_an_unknown_extra_is_refused(self, tool_dir: Path) -> None:
+        out = run_pwsh(
+            'function Write-Err { param([string]$Msg) Write-Output "refused: $Msg" }; '
+            "Test-ExtrasKnown 'pricingg'",
+            tool_dir,
+        )
+
+        assert out.startswith("refused: unknown extra 'pricingg'")
+        assert "pricing)" in out
+
     def test_merge_sorts_and_deduplicates(self, tool_dir: Path) -> None:
         out = run_pwsh("Write-Output (Merge-Extras 'tui,aca' ' tui ')", tool_dir)
 
@@ -696,6 +719,13 @@ class TestExtrasDecisionEndToEnd:
         assert "Including extras" not in out
         assert "already installed and up to date" not in out
         assert "conductor-cli[" not in spec
+
+    def test_the_pricing_extra_reaches_the_installer(self, tmp_path: Path) -> None:
+        out, spec = self.run_installer(tmp_path, RECEIPT_TUI, "--extras", "pricing")
+
+        assert "unknown extra" not in out
+        assert "Including extras: pricing,tui" in out
+        assert spec.startswith("conductor-cli[pricing,tui] @ ")
 
     def test_an_unknown_extra_aborts_before_installing(self, tmp_path: Path) -> None:
         out, spec = self.run_installer(tmp_path, RECEIPT_TUI, "--extras", "tuii")

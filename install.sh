@@ -37,7 +37,7 @@
 #       the shell and so ignores UV_NO_MODIFY_PATH).
 #   --extras <a,b>            OR   $CONDUCTOR_INSTALL_EXTRAS
 #       Comma-separated optional extras to install (tui, aca,
-#       claude-agent-sdk). These are *added to* the extras already recorded
+#       claude-agent-sdk, pricing). These are *added to* the extras already recorded
 #       in the existing install's uv receipt, which are preserved
 #       automatically -- `uv tool install --force` rewrites the tool's whole
 #       requirement set, so an upgrade that named no extras used to silently
@@ -469,8 +469,8 @@ validate_extras() {
         [ -n "$_name" ] || continue
         _name=$(printf '%s' "$_name" | tr '[:upper:]' '[:lower:]')
         case "$_name" in
-            tui|aca|claude-agent-sdk) ;;
-            *) error "unknown extra '${_name}' (available: tui, aca, claude-agent-sdk)" ;;
+            tui|aca|claude-agent-sdk|pricing) ;;
+            *) error "unknown extra '${_name}' (available: tui, aca, claude-agent-sdk, pricing)" ;;
         esac
     done
 }

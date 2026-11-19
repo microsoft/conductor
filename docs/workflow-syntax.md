@@ -2201,8 +2201,15 @@ resolved in this order (first hit wins):
    per-model billing metadata, so newly released models are priced without a
    table update. Providers whose SDK exposes no pricing (e.g. the Anthropic API)
    skip this step.
-3. **Built-in table** — a static `DEFAULT_PRICING` table of common models.
-4. **Unavailable** — if none of the above match, the agent is **unpriced**.
+3. **Published price table**. With the `pricing` extra installed
+   (`pip install 'conductor-cli[pricing]'`), rates come from the
+   [llm-prices](https://github.com/Mattbusel/llm-prices) package, which is
+   refreshed from the providers' pricing pages. A model is priced at the host
+   that served it (OpenAI, Anthropic, or the host a custom `base_url` points
+   at, such as OpenRouter or Groq). A gateway or unknown endpoint skips this
+   step. Ids the host does not carry fall through to the built-in table.
+4. **Built-in table** — a static `DEFAULT_PRICING` table of common models.
+5. **Unavailable** — if none of the above match, the agent is **unpriced**.
 
 **Unpriced agents are surfaced, not silently dropped.** When a run mixes priced
 and unpriced agents, the total is shown as a partial (e.g. `Total: ~$0.4200

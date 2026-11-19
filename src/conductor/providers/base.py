@@ -703,8 +703,8 @@ class AgentProvider(ABC):
         The :class:`~conductor.engine.usage.UsageTracker` resolves pricing in
         this order:
 
-        **workflow ``cost.pricing`` override → this hook → ``DEFAULT_PRICING`` →
-        ``None``.**
+        **workflow ``cost.pricing`` override → this hook → ``llm-prices``
+        (``pricing`` extra) → ``DEFAULT_PRICING`` → ``None``.**
 
         A provider that knows its own rates (e.g. the Copilot SDK exposes
         per-model billing metadata) should return a
@@ -728,6 +728,24 @@ class AgentProvider(ABC):
         Returns:
             A :class:`ModelPricing` when the provider can supply rates for
             ``model``, otherwise ``None``.
+        """
+        return None
+
+    def pricing_host(self) -> str | None:
+        """Name the host that bills this provider's requests, or ``None``.
+
+        The ``pricing`` extra (llm-prices) prices a model at the host that
+        served it, because the same model id can sell at different rates on
+        different hosts. Return the llm-prices provider name (``"openai"``,
+        ``"anthropic"``, ``"openrouter"``, ``"groq"``, ...) when the endpoint
+        is known, for example via
+        :func:`~conductor.engine.pricing.pricing_host_for_base_url`. The
+        default ``None`` (a gateway, a proxy, or billing the provider prices
+        itself through :meth:`get_model_pricing`) skips llm-prices, and the
+        static table applies. Must not raise.
+
+        Returns:
+            The llm-prices provider name of the serving host, or ``None``.
         """
         return None
 

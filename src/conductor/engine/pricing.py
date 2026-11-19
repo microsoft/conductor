@@ -6,8 +6,11 @@ and functions to calculate costs based on token usage.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,111 @@ class ModelPricing:
     cache_write_per_mtok: float = 0.0
 
 
+# Hosts whose published rates llm-prices carries, by API hostname. The value is
+# the llm-prices provider name passed to ``lookup_provider``. An endpoint whose
+# host is not listed here (a gateway, a proxy, a self-hosted server) has no
+# known price list, so it gets no llm-prices rate.
+_PRICING_HOSTS: dict[str, str] = {
+    "api.openai.com": "openai",
+    "api.anthropic.com": "anthropic",
+    "generativelanguage.googleapis.com": "google",
+    "openrouter.ai": "openrouter",
+    "api.groq.com": "groq",
+    "api.together.xyz": "together",
+    "api.together.ai": "together",
+    "api.fireworks.ai": "fireworks",
+    "api.deepseek.com": "deepseek",
+    "api.mistral.ai": "mistral",
+    "api.x.ai": "xai",
+    "api.cohere.com": "cohere",
+    "api.cohere.ai": "cohere",
+    "api.perplexity.ai": "perplexity",
+}
+
+
+def pricing_host_for_base_url(base_url: str | None, default: str | None) -> str | None:
+    """Name the host that bills requests sent to ``base_url``.
+
+    Args:
+        base_url: The endpoint a provider sends requests to, or ``None`` when
+            it uses its SDK's default endpoint.
+        default: The host to report when ``base_url`` is ``None`` (the SDK's
+            own API, e.g. ``"openai"``).
+
+    Returns:
+        The llm-prices provider name (``"openai"``, ``"openrouter"``,
+        ``"groq"``, ...), ``default`` when no custom endpoint is set, or
+        ``None`` when the endpoint is not a host with a known price list.
+    """
+    if base_url is None:
+        return default
+    hostname = (urlsplit(base_url.strip()).hostname or "").lower()
+    for known, host in _PRICING_HOSTS.items():
+        if hostname == known or hostname.endswith("." + known):
+            return host
+    return None
+
+
+def provider_pricing_host(provider: Any) -> str | None:
+    """Call ``provider.pricing_host()`` for :func:`get_pricing` (never raises).
+
+    Args:
+        provider: An :class:`~conductor.providers.base.AgentProvider`.
+
+    Returns:
+        The host name when the provider reports one as a string, else ``None``.
+    """
+    try:
+        host = provider.pricing_host()
+    except Exception as e:  # noqa: BLE001 - pricing metadata is best-effort
+        logger.debug("pricing_host() raised on %r: %s", type(provider).__name__, e)
+        return None
+    if inspect.iscoroutine(host):  # a test double's async stub
+        host.close()
+        return None
+    return host if isinstance(host, str) else None
+
+
+def _llm_prices_pricing(host: str, model: str) -> ModelPricing | None:
+    """Look ``model`` up in ``llm-prices`` at the host that served it.
+
+    llm-prices (installed by the ``pricing`` extra) is a price table read from
+    the providers' pricing pages and re-released when a page changes, so with
+    ``conductor-cli[pricing]`` a new model or a price change does not wait for
+    a Conductor release. The lookup is always scoped to ``host``: the same
+    open-weights id sells at different rates on different hosts (OpenRouter's
+    ``openai/gpt-oss-20b`` is a quarter of Groq's price), so a host's model is
+    never priced from another host's row. It matches exact ids and the dated or
+    prefixed ids providers send back, never a sibling family, so an id the host
+    does not carry returns ``None`` and falls through to ``DEFAULT_PRICING``.
+
+    Cache writes use the provider's default lifetime: Anthropic's 5-minute
+    rate, OpenAI's 30-minute rate.
+
+    Args:
+        host: The llm-prices provider name of the serving host.
+        model: The model name to look up.
+
+    Returns:
+        ModelPricing if the package is installed and the host sells the model
+        at a published rate, None otherwise.
+    """
+    try:
+        import llm_prices
+    except ImportError:
+        return None
+
+    price = llm_prices.lookup_provider(host, model)
+    if price is None or price.input is None or price.output is None:
+        return None
+    return ModelPricing(
+        input_per_mtok=price.input,
+        output_per_mtok=price.output,
+        cache_read_per_mtok=price.cache_read or 0.0,
+        cache_write_per_mtok=price.cache_write.get("5m") or price.cache_write.get("30m") or 0.0,
+    )
+
+
 # Default model table (pricing only).
 # Context-window metadata is sourced from each provider's SDK at runtime via
 # ``AgentProvider.get_max_prompt_tokens()`` — see ``providers/base.py``.
@@ -111,21 +219,52 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     "gpt-4o": ModelPricing(input_per_mtok=2.50, output_per_mtok=10.00),
     "gpt-4o-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
     "gpt-4.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-4.1-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
+    "gpt-4.1-mini": ModelPricing(
+        input_per_mtok=0.40,
+        output_per_mtok=1.60,
+        cache_read_per_mtok=0.10,
+    ),
     "gpt-4": ModelPricing(input_per_mtok=30.00, output_per_mtok=60.00),
     "gpt-3.5-turbo": ModelPricing(input_per_mtok=0.50, output_per_mtok=1.50),
-    # GPT-5.x Series (uniform standard rate; mini variants at the mini tier)
-    "gpt-5.5": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.4": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.3-codex": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.2": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.1": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.4-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
-    "gpt-5-mini": ModelPricing(input_per_mtok=0.15, output_per_mtok=0.60),
-    # GPT-5.6 variants priced at the existing GPT-5.x family rate (#386).
-    "gpt-5.6-sol": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.6-terra": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
-    "gpt-5.6-luna": ModelPricing(input_per_mtok=2.00, output_per_mtok=8.00),
+    # GPT-5.x Series
+    "gpt-5.5": ModelPricing(input_per_mtok=5.00, output_per_mtok=30.00, cache_read_per_mtok=0.50),
+    "gpt-5.4": ModelPricing(input_per_mtok=2.50, output_per_mtok=15.00, cache_read_per_mtok=0.25),
+    "gpt-5.3-codex": ModelPricing(
+        input_per_mtok=1.75,
+        output_per_mtok=14.00,
+        cache_read_per_mtok=0.175,
+    ),
+    "gpt-5.2": ModelPricing(input_per_mtok=1.75, output_per_mtok=14.00, cache_read_per_mtok=0.175),
+    "gpt-5.1": ModelPricing(input_per_mtok=1.25, output_per_mtok=10.00, cache_read_per_mtok=0.125),
+    "gpt-5.4-mini": ModelPricing(
+        input_per_mtok=0.75,
+        output_per_mtok=4.50,
+        cache_read_per_mtok=0.075,
+    ),
+    "gpt-5-mini": ModelPricing(
+        input_per_mtok=0.25,
+        output_per_mtok=2.00,
+        cache_read_per_mtok=0.025,
+    ),
+    # GPT-5.6 cache writes are the 30-minute rate, as for gpt-6-astra below.
+    "gpt-5.6-sol": ModelPricing(
+        input_per_mtok=4.00,
+        output_per_mtok=20.00,
+        cache_read_per_mtok=0.40,
+        cache_write_per_mtok=5.00,
+    ),
+    "gpt-5.6-terra": ModelPricing(
+        input_per_mtok=2.00,
+        output_per_mtok=12.00,
+        cache_read_per_mtok=0.20,
+        cache_write_per_mtok=2.50,
+    ),
+    "gpt-5.6-luna": ModelPricing(
+        input_per_mtok=0.20,
+        output_per_mtok=1.20,
+        cache_read_per_mtok=0.02,
+        cache_write_per_mtok=0.25,
+    ),
     "gpt-6-astra": ModelPricing(
         input_per_mtok=10.00,
         output_per_mtok=50.00,
@@ -360,8 +499,9 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     ),
     # Gemini
     "gemini-3.1-pro-preview": ModelPricing(
-        input_per_mtok=1.25,
-        output_per_mtok=5.00,
+        input_per_mtok=2.00,
+        output_per_mtok=12.00,
+        cache_read_per_mtok=0.20,
     ),
     "gemini-3.5-flash": ModelPricing(
         input_per_mtok=0.30,
@@ -375,13 +515,15 @@ def get_pricing(
     overrides: dict[str, ModelPricing] | None = None,
     *,
     provider_pricing: dict[str, ModelPricing] | None = None,
+    host: str | None = None,
 ) -> ModelPricing | None:
     """Get pricing for a model.
 
     Resolution order (see #265):
 
-    **workflow ``cost.pricing`` override → provider hook → ``DEFAULT_PRICING``
-    → ``None``.**
+    **workflow ``cost.pricing`` override → provider hook → ``llm-prices``
+    (when the ``pricing`` extra is installed and ``host`` is known) →
+    ``DEFAULT_PRICING`` → ``None``.**
 
     ``overrides`` (workflow ``cost.pricing``) and ``provider_pricing`` (the
     :meth:`AgentProvider.get_model_pricing` hook, pre-resolved and cached by
@@ -404,6 +546,9 @@ def get_pricing(
         provider_pricing: Optional provider-supplied pricing, resolved via the
             ``get_model_pricing`` hook. Beats the static table so newly-released
             models are priced without a table update.
+        host: The llm-prices name of the host that served the request (see
+            :meth:`AgentProvider.pricing_host`). ``None`` skips llm-prices, so
+            an unknown endpoint is never priced from another host's rates.
 
     Returns:
         ModelPricing if found, None otherwise.
@@ -417,6 +562,14 @@ def get_pricing(
     # update. Authoritative for the exact model that was resolved — never warn.
     if provider_pricing and model in provider_pricing:
         return provider_pricing[model]
+
+    # Published rates from the optional llm-prices package beat the static
+    # table, which only changes when someone edits it. Only for a known host:
+    # an unqualified lookup can return another host's rate for the same id.
+    if host is not None:
+        published = _llm_prices_pricing(host, model)
+        if published is not None:
+            return published
 
     # Exact match in the static table.
     if model in DEFAULT_PRICING:

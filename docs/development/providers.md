@@ -158,8 +158,14 @@ accounting, recovery, and how a new provider is registered. Provider-specific de
   "fall through to registry/fallback" signal for compaction, not an error.
 - Pricing hook `get_model_pricing(model)` is optional (base returns `None`) and MUST never raise.
   Resolution order in `src/conductor/engine/pricing.py::get_pricing`: workflow `cost.pricing`
-  override, provider hook, `DEFAULT_PRICING`, `None`. The engine resolves each model once via
-  `WorkflowEngine._ensure_pricing_resolved` before every `UsageTracker.record`. Only Copilot
+  override, provider hook, `llm-prices` (only when the `pricing` extra is installed and the
+  provider's `pricing_host()` names the serving host; looked up with `lookup_provider(host,
+  model)`, never another host's row, no fuzzy match), `DEFAULT_PRICING`, `None`. A provider
+  whose endpoint is a gateway or unknown host MUST return `None` from `pricing_host()`. The engine resolves each (provider, model) pair once via
+  `WorkflowEngine._ensure_pricing_resolved` and passes the resulting `PricingSource` (host and
+  hook rate) to every `UsageTracker.record`, so two providers serving the same model id are
+  each priced at their own rate. Never cache a host or rate by model name alone; pinned by
+  `tests/test_engine/test_pricing_hook.py::TestMixedProviderPricing`. Only Copilot
   implements the hook (see [copilot](providers/copilot.md)). Partial totals MUST surface
   `unpriced_agents` / `has_unpriced` from `src/conductor/engine/usage.py` (`~$X (N agents
   unpriced)`), never as complete.

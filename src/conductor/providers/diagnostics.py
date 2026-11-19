@@ -679,7 +679,8 @@ async def _resolve_model_pricing(
     """Resolve a model's per-Mtok rates and where they came from (never raises).
 
     Mirrors the cost-resolution chain in ``engine/pricing.py::get_pricing``
-    (workflow override → provider hook → ``DEFAULT_PRICING`` → ``None``),
+    (workflow override → provider hook → ``llm-prices`` for the provider's
+    host → ``DEFAULT_PRICING`` → ``None``),
     minus the workflow override — ``doctor`` has no workflow context.
 
     Note ``get_pricing`` may resolve via its versioned-suffix fuzzy path and
@@ -697,7 +698,7 @@ async def _resolve_model_pricing(
         (with rates ``None`` in the ``"none"`` case), or ``None`` when
         resolution itself failed — distinct from the determined ``"none"``.
     """
-    from conductor.engine.pricing import get_pricing
+    from conductor.engine.pricing import get_pricing, provider_pricing_host
 
     global _pricing_hook_failed_warned
 
@@ -726,7 +727,7 @@ async def _resolve_model_pricing(
     if provider_pricing is not None:
         return provider_pricing.input_per_mtok, provider_pricing.output_per_mtok, "provider"
 
-    table_pricing = get_pricing(model_id)
+    table_pricing = get_pricing(model_id, host=provider_pricing_host(provider))
     if table_pricing is not None:
         return table_pricing.input_per_mtok, table_pricing.output_per_mtok, "table"
 

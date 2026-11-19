@@ -1330,7 +1330,7 @@ support and context-window limits:
 | Default | The model's default reasoning-effort level, or `—` when unknown/not applicable. |
 | Prompt / Output / Context | Maximum prompt (input), output (completion), and total context-window tokens, or `—` when the provider doesn't expose that limit. |
 | Input $/Mtok / Output $/Mtok | Resolved per-million-token input/output rate (USD), or `—` when unpriced; a displayed `0.00` means a genuinely free rate reported by the provider, never "unknown". |
-| Pricing | Where the rate came from (see #386): `provider` (live rate from the provider's `get_model_pricing` hook), `table` (static `DEFAULT_PRICING` fallback), `none` (unpriced — the run's cost summary will show `~$X (N unpriced)`), or `error` when pricing resolution itself failed. |
+| Pricing | Where the rate came from (see #386): `provider` (live rate from the provider's `get_model_pricing` hook), `table` (llm-prices when the `pricing` extra is installed, else the static `DEFAULT_PRICING` fallback), `none` (unpriced — the run's cost summary will show `~$X (N unpriced)`), or `error` when pricing resolution itself failed. |
 
 Coverage varies by provider — every field degrades independently to `n/a` /
 `—` rather than failing the command:

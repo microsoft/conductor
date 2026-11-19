@@ -16,6 +16,28 @@ if TYPE_CHECKING:
     from conductor.providers.base import AgentOutput
 
 
+@dataclass(frozen=True)
+class PricingSource:
+    """How one execution is priced: the provider that served it, resolved.
+
+    The engine resolves this per execution (see
+    ``WorkflowEngine._ensure_pricing_resolved``) and passes it to
+    :meth:`UsageTracker.record`, so two providers serving the same model id in
+    one run are each priced at their own rate rather than whichever resolved
+    first.
+
+    Attributes:
+        host: The llm-prices name of the host that served the request (see
+            :meth:`AgentProvider.pricing_host`), or ``None`` when the endpoint
+            is unknown, in which case llm-prices is skipped.
+        pricing: The serving provider's own rate from
+            :meth:`AgentProvider.get_model_pricing`, or ``None``.
+    """
+
+    host: str | None = None
+    pricing: ModelPricing | None = None
+
+
 @dataclass
 class AgentUsage:
     """Token usage and cost for a single agent execution.
@@ -196,6 +218,7 @@ class UsageTracker:
         agent_name: str,
         output: AgentOutput,
         elapsed: float,
+        source: PricingSource | None = None,
     ) -> AgentUsage:
         """Record usage from an agent execution.
 
@@ -203,6 +226,11 @@ class UsageTracker:
             agent_name: Name of the agent that executed.
             output: The agent's output containing token counts.
             elapsed: Execution time in seconds.
+            source: How the provider that served this execution prices it.
+                When given, its host and hook rate apply to this record only,
+                and the per-model cache from :meth:`set_provider_pricing` is
+                not consulted, so another provider's rate for the same model
+                id never leaks in. ``None`` uses that cache and no host.
 
         Returns:
             AgentUsage record with token counts and cost.
@@ -232,6 +260,14 @@ class UsageTracker:
 
         cost = None
         if output.model and isinstance(output.model, str):
+            if source is None:
+                provider_pricing = self._provider_pricing
+                host = None
+            else:
+                provider_pricing = (
+                    {output.model: source.pricing} if source.pricing is not None else None
+                )
+                host = source.host
             cost = calculate_cost(
                 model=output.model,
                 input_tokens=input_tokens,
@@ -241,7 +277,8 @@ class UsageTracker:
                 pricing=get_pricing(
                     output.model,
                     self._pricing_overrides,
-                    provider_pricing=self._provider_pricing,
+                    provider_pricing=provider_pricing,
+                    host=host,
                 ),
             )
 
