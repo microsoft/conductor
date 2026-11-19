@@ -453,8 +453,8 @@ def _usage_from_result(result: AgentRunResult[Any] | None) -> dict[str, Any] | N
     usage = result.usage
     return {
         "requests": getattr(usage, "requests", None),
-        "request_tokens": getattr(usage, "request_tokens", None),
-        "response_tokens": getattr(usage, "response_tokens", None),
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
         "total_tokens": getattr(usage, "total_tokens", None),
     }
 

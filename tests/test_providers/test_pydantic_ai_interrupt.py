@@ -454,10 +454,12 @@ class TestNormalCompletion:
         usage = outcome.result.usage
         assert outcome.total_usage == {
             "requests": usage.requests,
-            "request_tokens": None,
-            "response_tokens": None,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
             "total_tokens": usage.total_tokens,
         }
+        assert outcome.total_usage["input_tokens"] is not None
+        assert outcome.total_usage["output_tokens"] is not None
 
     @pytest.mark.asyncio
     async def test_noninteractive_emits_awaiting_model_before_each_request(self) -> None:

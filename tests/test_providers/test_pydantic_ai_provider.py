@@ -15,7 +15,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RequestUsage
 
 from conductor.config.schema import AgentDef, OutputField, RetryPolicy
 from conductor.exceptions import ValidationError
@@ -163,6 +166,32 @@ class TestExecuteInterrupt:
 
         assert output.partial is True
         assert output.content == {"result": "partial"}
+
+    async def test_execute_with_interrupt_reports_partial_token_usage(
+        self, provider: ClaudeProvider, no_mcp_manager: Any
+    ) -> None:
+        """Interrupted runs map the model's input/output usage onto AgentOutput."""
+
+        def respond(messages: list[Any], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(
+                parts=[TextPart("partial")],
+                usage=RequestUsage(input_tokens=11, output_tokens=7),
+            )
+
+        agent = AgentDef(name="interrupted", model="test", prompt="do work")
+        signal = asyncio.Event()
+        signal.set()
+
+        with patch(
+            "conductor.providers._pydantic_ai.agent_builder.build_agent",
+            return_value=Agent(model=FunctionModel(respond), output_type=str),
+        ):
+            output = await provider.execute(agent, {}, "do work", interrupt_signal=signal)
+
+        assert output.partial is True
+        assert output.input_tokens == 11
+        assert output.output_tokens == 7
+        assert output.tokens_used == 18
 
 
 class TestRetryHistory:
