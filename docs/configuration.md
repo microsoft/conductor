@@ -395,17 +395,21 @@ workflow:
   runtime:
     provider:
       name: copilot
-      runtime_url: localhost:3000          # "port", "host:port", or a full URL
+      runtime_url: localhost:3000          # "port", "host:port", or "http://host:port"
       runtime_token: ${COPILOT_RUNTIME_TOKEN}   # optional shared secret
     default_model: gpt-4o
 ```
 
-- `runtime_url` — where the running runtime is listening. Accepts a bare
-  `"port"`, `"host:port"`, or a full URL. URL schemes are parsing syntax only:
-  the SDK opens a raw TCP connection and does not provide TLS.
+- `runtime_url` — where the running runtime is listening. Accepts `"port"`,
+  `"host:port"`, `"[ipv6]:port"`, or `"http://host:port"`. The scheme is
+  parsing syntax only: the SDK opens a raw TCP connection and does not provide
+  TLS, so `https://` is rejected.
 - `runtime_token` — the shared secret the runtime was started with, if
   any. Stored as a `SecretStr` (redacted in events/checkpoints/dashboard);
   prefer `${VAR}` interpolation. Requires `runtime_url`.
+- The runtime must speak Copilot SDK protocol 4, which Copilot CLI 1.0.113 and
+  later do. An older runtime fails at connect with a non-retryable
+  "incompatible" error rather than running any agent.
 
 #### Environment variables (zero-YAML)
 

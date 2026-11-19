@@ -37,11 +37,36 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
   dropped: `src/conductor/cli/run.py::_apply_provider_override`.
 - Tests: `tests/test_providers/test_copilot_provider_routing.py`.
 
+### SDK 2.x boundary
+
+- The dependency is `microsoft-copilot-sdk>=2.0.1,<3` (renamed from `github-copilot-sdk`, still
+  imported as `copilot`). SDK 2.x negotiates only SDK protocol 4 (Copilot CLI 1.0.113 and later);
+  1.x negotiates only protocol 3, and the two distributions share the `copilot` package, so one
+  install cannot speak both. A runtime on the other protocol fails `client.start()`;
+  `_start_sdk_client` turns that into a non-retryable `ProviderError` naming the CLI to update.
+- Every client is built with an explicit `mode="coding-agent"` (`_COPILOT_CLIENT_MODE`), the
+  renamed 1.x default, so agents keep the CLI's built-in tools unless `tools:` narrows them.
+- The owned runtime is always `RuntimeConnection.for_spawned_stdio()`, never the SDK 2.x default
+  (in-process FFI). Dead-runtime recovery, managed workspaces and crash isolation need the child
+  process, and the child inherits the environment (`COPILOT_CLI_PATH`, CAPI and integration-id
+  variables). Do not let `COPILOT_SDK_DEFAULT_CONNECTION` or a missing connection select
+  in-process hosting.
+- Session options are built as one flat mapping (create, resume, dialog, and the
+  `_ManagedCopilotSession.resume_kwargs` a managed continuation stores) and translated to SDK 2.x
+  nested groups only at the call by `_sdk_session_options`. A new session option needs an entry
+  there; an unknown key raises instead of being dropped. Custom routing (`provider`) becomes one
+  named BYOK connection (`_BYOK_PROVIDER_NAME`) that is also `inference.default_provider`, with
+  `github.capi.enabled: False`, so every model name reaches the configured endpoint as the 1.x
+  singular `provider` did.
+- Tests: `tests/test_providers/test_copilot_sdk_options.py`.
+
 ### Existing runtime connection
 
-- `runtime_url` (optional `runtime_token`) makes `_build_client` connect with
-  `RuntimeConnection.for_uri(...)` instead of spawning a nested `copilot`. The SDK does not spawn
-  for URI connections and its `stop()` leaves the external server running.
+- `runtime_url` (optional `runtime_token`) makes `_build_client` attach with
+  `RuntimeConnection.for_tcp(host, port, ...)` instead of spawning a nested `copilot`.
+  `_parse_runtime_url` keeps the forms SDK 1.x's `for_uri` accepted (`port`, `host:port`,
+  `[ipv6]:port`, `http://host:port`) and refuses `https://`. The SDK does not spawn for attached
+  connections and its `stop()` leaves the external server running.
 - `_resolve_runtime_connection` reads YAML first, then `COPILOT_PROVIDER_RUNTIME_URL` /
   `COPILOT_PROVIDER_RUNTIME_TOKEN`; the env vars activate the connection on their own (zero-YAML
   path for orchestrators).
@@ -69,10 +94,11 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
   raises a non-retryable `ProviderError`.
 - An externally owned runtime (`runtime_url`) is never respawned: `_spawned_runtime_process` returns
   `None` for it.
-- `_spawned_runtime_process` reads the SDK's `_cli_process` (the spawned child; `None` for URI and
-  FFI modes). `_fix_pipe_blocking_mode` reads `_process` (the transport: a socket wrapper in TCP
-  mode, an FFI adapter with its own `poll()`). Do not unify them onto `_process`; FFI mode would
-  then look like a killable child. A missing `_cli_process` on a started spawned client warns once.
+- `_spawned_runtime_process` reads the SDK's `_cli_process` (the spawned child; `None` for attached
+  TCP and in-process FFI). `_fix_pipe_blocking_mode` reads `_process` (the transport: a socket
+  wrapper in TCP mode, an FFI adapter with its own `poll()`). Do not unify them onto `_process`; FFI
+  mode would then look like a killable child. A missing `_cli_process` on a started spawned client
+  warns once.
 - Tests: `tests/test_providers/test_copilot_runtime_recovery.py`.
 
 ### Per-agent tools allowlist (#585)
@@ -92,8 +118,8 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
 
 ### Routing preferences: Fusion and Auto tiers (#637)
 
-- The SDK floor is `github-copilot-sdk>=1.0.32`, the first release whose `CapiSessionOptions`
-  carries `fusion_tier`. Older SDKs drop unknown `capi` keys silently, so the floor is the guard.
+- `CapiSessionOptions` (sent as `github.capi`) carries `fusion_tier`; SDKs that predate it drop
+  unknown `capi` keys silently, so the SDK floor is the guard.
 - One resolver, `src/conductor/providers/copilot_routing.py::resolve_routing_preference`, owns the
   precedence: an agent `fusion_tier`/`auto_tier` replaces both runtime defaults as a unit and must
   suit the model (`fusion_tier` needs `fusion` or `auto`, `auto_tier` needs `auto`); a default applies
@@ -150,7 +176,8 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
 
 - [ ] New routing field: added to `_check_field_compatibility`, `has_custom_routing` /
       `has_structured_config`, `_resolve_sdk_provider_config`, and the configuration doc table.
-- [ ] Session kwargs change applied to create, resume, and dialog paths.
+- [ ] Session kwargs change applied to create, resume, and dialog paths, and mapped to its SDK
+      option group in `_sdk_session_options`.
 - [ ] Anything touching `_client`/`_started` keeps the invalidate-before-rebuild order.
 - [ ] Allowlist change covered in `tests/test_providers/test_copilot_tools_allowlist.py` for both
       create and resume paths.

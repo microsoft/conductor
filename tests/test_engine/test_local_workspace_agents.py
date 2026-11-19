@@ -718,13 +718,13 @@ async def test_shared_plugin_mcp_switches_reach_native_provider_wire(
                     assert len(by_name) == 2
                     for name in agent_order:
                         config = by_name[provider.get_session_ids()[name]]
-                        assert config["skillDirectories"] == expected_skills
-                        assert "pluginDirectories" not in config
+                        assert config["skills"]["directories"] == expected_skills
+                        assert "directories" not in config.get("plugins", {})
                         assert not config.get("enableConfigDiscovery")
-                        assert set(config["mcpServers"]) == (
+                        assert set(config["mcp"]["servers"]) == (
                             {"workflow-only", "fixture"} if name == "on" else {"workflow-only"}
                         )
-                        assert config["availableTools"] == (
+                        assert config["tools"]["availableTools"] == (
                             ["mcp:fixture-lookup"] if name == "on" else ["view"]
                         )
             finally:

@@ -41,7 +41,7 @@ def install_audit() -> None:
             "platform": sys.platform,
             "windows_version": tuple(sys.getwindowsversion()) if sys.platform == "win32" else None,
             "sdk_versions": {
-                name: version(name) for name in ("claude-agent-sdk", "github-copilot-sdk", "mcp")
+                name: version(name) for name in ("claude-agent-sdk", "microsoft-copilot-sdk", "mcp")
             },
             "file": str(path),
             "sha256": hashlib.sha256(source).hexdigest(),
@@ -179,15 +179,15 @@ def copilot() -> None:
         result: dict[str, Json] = {}
         match request["method"]:
             case "connect":
-                result = {"ok": True, "protocolVersion": 3, "version": "local-fixture"}
+                result = {"ok": True, "protocolVersion": 4, "version": "local-fixture"}
             case "ping":
                 result = {
                     "message": request.get("params", {}).get("message"),
                     "timestamp": 1,
-                    "protocolVersion": 3,
+                    "protocolVersion": 4,
                 }
             case "status.get":
-                result = {"version": "local-fixture", "protocolVersion": 3}
+                result = {"version": "local-fixture", "protocolVersion": 4}
             case "runtime.shutdown":
                 record("shutdown")
             case _:

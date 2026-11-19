@@ -72,23 +72,23 @@ class TestCopilotSessionKwargs:
 
     def test_custom_agents_are_registered(self) -> None:
         kwargs = self._session_kwargs(custom_agents=AGENT_SPECS)
-        assert kwargs["custom_agents"] == AGENT_SPECS
+        assert kwargs["agents"]["definitions"] == AGENT_SPECS
 
     def test_qualified_agent_name_is_preserved(self) -> None:
         # Verified against a live session: the SDK lists `myplug:quokka`
         # among launchable agent types, so the namespace survives.
         kwargs = self._session_kwargs(custom_agents=AGENT_SPECS)
-        assert kwargs["custom_agents"][0]["name"] == "prs:code-reviewer"
+        assert kwargs["agents"]["definitions"][0]["name"] == "prs:code-reviewer"
 
     def test_plugin_mcp_servers_merge_with_workflow_servers(self) -> None:
         kwargs = self._session_kwargs(extra_mcp_servers=PLUGIN_SERVERS)
-        assert set(kwargs["mcp_servers"]) == {"workflow-srv", "plugin-srv"}
+        assert set(kwargs["mcp"]["servers"]) == {"workflow-srv", "plugin-srv"}
 
     def test_plugin_servers_are_stamped_with_the_working_directory(self) -> None:
         # A plugin's stdio server must pick up the agent's cwd exactly as a
         # workflow-declared one does.
         kwargs = self._session_kwargs(extra_mcp_servers=PLUGIN_SERVERS)
-        assert "working_directory" in kwargs["mcp_servers"]["plugin-srv"]
+        assert "working_directory" in kwargs["mcp"]["servers"]["plugin-srv"]
 
     def test_name_collision_is_refused_not_silently_resolved(self) -> None:
         # Dropping one of the two would leave a declared component
@@ -103,12 +103,12 @@ class TestCopilotSessionKwargs:
 
     def test_nothing_registered_when_no_plugins(self) -> None:
         kwargs = self._session_kwargs()
-        assert "custom_agents" not in kwargs
-        assert set(kwargs["mcp_servers"]) == {"workflow-srv"}
+        assert "definitions" not in kwargs.get("agents", {})
+        assert set(kwargs["mcp"]["servers"]) == {"workflow-srv"}
 
     def test_plugin_directories_is_never_used(self) -> None:
         kwargs = self._session_kwargs(custom_agents=AGENT_SPECS, extra_mcp_servers=PLUGIN_SERVERS)
-        assert "plugin_directories" not in kwargs
+        assert "directories" not in kwargs.get("plugins", {})
 
     def test_provider_declares_plugin_support(self) -> None:
         assert CopilotProvider().supports_native_plugins is True
@@ -410,8 +410,8 @@ class TestCopilotResumeCarriesSessionState:
                 custom_agents=AGENT_SPECS,
             )
 
-        assert captured["skill_directories"] == ["/tmp/skills/demo"]
-        assert [spec["name"] for spec in captured["custom_agents"]] == ["prs:code-reviewer"]
+        assert captured["skills"]["directories"] == ["/tmp/skills/demo"]
+        assert [spec["name"] for spec in captured["agents"]["definitions"]] == ["prs:code-reviewer"]
 
 
 class TestPluginCapabilityContractIsEnforced:

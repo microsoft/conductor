@@ -394,7 +394,7 @@ workflow:
     default_model: gpt-5.5
 ```
 
-Copilot is the default provider — `runtime.provider` can be omitted entirely. Requires an active GitHub Copilot subscription and the GitHub CLI authenticated (`gh auth login`).
+Copilot is the default provider — `runtime.provider` can be omitted entirely. Requires an active GitHub Copilot subscription and the GitHub CLI authenticated (`gh auth login`). The Copilot SDK downloads a matching Copilot CLI on first use; if you point `COPILOT_CLI_PATH` at your own CLI instead, it must be Copilot CLI 1.0.113 or later.
 
 ### Using OpenAI
 

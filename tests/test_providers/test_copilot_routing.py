@@ -123,7 +123,7 @@ class TestSessionArguments:
     async def test_agent_fusion_tier_reaches_create_session(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Requirement: an agent Fusion tier is sent as the SDK's capi option.
+        # Requirement: an agent Fusion tier is sent as the SDK's github.capi option.
         client = _FakeClient()
         provider = _provider(client, monkeypatch)
 
@@ -131,7 +131,7 @@ class TestSessionArguments:
 
         (create,) = client.creates
         assert create["model"] == "fusion"
-        assert create["capi"] == {"fusion_tier": "high"}
+        assert create["github"]["capi"] == {"fusion_tier": "high"}
 
     async def test_agent_auto_tier_reaches_create_session(
         self, monkeypatch: pytest.MonkeyPatch
@@ -141,7 +141,7 @@ class TestSessionArguments:
 
         await provider.execute(_agent(model="auto", auto_tier="premium-v2"), {}, "p")
 
-        assert client.creates[0]["capi"] == {"auto_tier": "premium-v2"}
+        assert client.creates[0]["github"]["capi"] == {"auto_tier": "premium-v2"}
 
     async def test_unset_preferences_send_no_capi(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Requirement: omitted preferences leave runtime defaults in place.
@@ -151,7 +151,7 @@ class TestSessionArguments:
         await provider.execute(_agent(model="fusion"), {}, "p")
         await provider.execute(_agent(model="auto"), {}, "p")
 
-        assert all("capi" not in create for create in client.creates)
+        assert all("capi" not in create.get("github", {}) for create in client.creates)
 
     @pytest.mark.parametrize(
         ("model", "defaults", "expected"),
@@ -177,7 +177,7 @@ class TestSessionArguments:
 
         await provider.execute(_agent(model=model), {}, "p")
 
-        assert client.creates[0].get("capi") == expected
+        assert client.creates[0].get("github", {}).get("capi") == expected
 
     async def test_agent_preference_replaces_default_as_a_unit(
         self, monkeypatch: pytest.MonkeyPatch
@@ -188,7 +188,7 @@ class TestSessionArguments:
 
         await provider.execute(_agent(model="auto", fusion_tier="standard"), {}, "p")
 
-        assert client.creates[0]["capi"] == {"fusion_tier": "standard"}
+        assert client.creates[0]["github"]["capi"] == {"fusion_tier": "standard"}
 
     async def test_default_model_selects_fusion_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -199,7 +199,7 @@ class TestSessionArguments:
         await provider.execute(_agent(), {}, "p")
 
         assert client.creates[0]["model"] == "fusion"
-        assert client.creates[0]["capi"] == {"fusion_tier": "high"}
+        assert client.creates[0]["github"]["capi"] == {"fusion_tier": "high"}
 
     @pytest.mark.parametrize("model", ["hydrafusion", "hydrafusion-max"])
     async def test_deprecated_hydrafusion_models_pass_through(
@@ -211,7 +211,7 @@ class TestSessionArguments:
         await provider.execute(_agent(model=model), {}, "p")
 
         assert client.creates[0]["model"] == model
-        assert "capi" not in client.creates[0]
+        assert "capi" not in client.creates[0].get("github", {})
 
     async def test_deprecated_auto_tier_identifier_passes_through(
         self, monkeypatch: pytest.MonkeyPatch
@@ -221,7 +221,7 @@ class TestSessionArguments:
 
         await provider.execute(_agent(model="auto", auto_tier="hydrafusion"), {}, "p")
 
-        assert client.creates[0]["capi"] == {"auto_tier": "hydrafusion"}
+        assert client.creates[0]["github"]["capi"] == {"auto_tier": "hydrafusion"}
 
     async def test_resume_carries_preference(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Requirement: a resumed session receives the same explicit preference.
@@ -233,7 +233,7 @@ class TestSessionArguments:
 
         (resume,) = client.resumes
         assert resume[0] == "persisted"
-        assert resume[1]["capi"] == {"fusion_tier": "max"}
+        assert resume[1]["github"]["capi"] == {"fusion_tier": "max"}
         assert client.creates == []
 
     async def test_resume_without_preference_preserves_persisted_tier(
@@ -246,7 +246,7 @@ class TestSessionArguments:
 
         await provider.execute(_agent(model="fusion"), {}, "p")
 
-        assert "capi" not in client.resumes[0][1]
+        assert "capi" not in client.resumes[0][1].get("github", {})
 
     async def test_dialog_turn_uses_only_matching_defaults(
         self, monkeypatch: pytest.MonkeyPatch
@@ -257,8 +257,8 @@ class TestSessionArguments:
         assert await provider.execute_dialog_turn("sys", "hi") == "reply"
         await provider.execute_dialog_turn("sys", "hi", model="gpt-5")
 
-        assert client.creates[0]["capi"] == {"fusion_tier": "high"}
-        assert "capi" not in client.creates[1]
+        assert client.creates[0]["github"]["capi"] == {"fusion_tier": "high"}
+        assert "capi" not in client.creates[1].get("github", {})
 
     async def test_concurrent_calls_keep_their_own_preferences(
         self, monkeypatch: pytest.MonkeyPatch
@@ -273,7 +273,9 @@ class TestSessionArguments:
             provider.execute(_agent(name="c", model="gpt-5"), {}, "p"),
         )
 
-        by_model = {create["model"]: create.get("capi") for create in client.creates}
+        by_model = {
+            create["model"]: create.get("github", {}).get("capi") for create in client.creates
+        }
         assert by_model == {
             "fusion": {"fusion_tier": "max"},
             "auto": {"auto_tier": "efficiency"},
@@ -319,7 +321,7 @@ class TestRefusals:
 
         await provider.execute(_agent(model="fusion", fusion_tier="high"), {}, "p")
 
-        assert client.creates[0]["capi"] == {"fusion_tier": "high"}
+        assert client.creates[0]["github"]["capi"] == {"fusion_tier": "high"}
 
     async def test_both_defaults_are_rejected(self) -> None:
         with pytest.raises(ValueError, match="mutually exclusive"):
@@ -338,7 +340,7 @@ class TestRefusals:
             await provider.execute(_agent(model="fusion", fusion_tier="high"), {}, "p")
 
         assert client.creates and all(
-            create["capi"] == {"fusion_tier": "high"} for create in client.creates
+            create["github"]["capi"] == {"fusion_tier": "high"} for create in client.creates
         )
 
     async def test_failed_resume_falls_back_with_the_same_preference(
@@ -356,8 +358,8 @@ class TestRefusals:
 
         await provider.execute(_agent(model="auto", auto_tier="efficiency"), {}, "p")
 
-        assert client.resumes[0][1]["capi"] == {"auto_tier": "efficiency"}
-        assert client.creates[0]["capi"] == {"auto_tier": "efficiency"}
+        assert client.resumes[0][1]["github"]["capi"] == {"auto_tier": "efficiency"}
+        assert client.creates[0]["github"]["capi"] == {"auto_tier": "efficiency"}
 
 
 class TestRoutingRejection:
@@ -402,7 +404,10 @@ class TestRoutingRejection:
             output = await provider.send_followup(handle, "more", managed_workspace=workspace)
             assert output.content == {"result": "answer"}
 
-        assert client.resumes == [("retained", kwargs)]
+        expected: dict[str, Any] = {"working_directory": str(tmp_path)}
+        if capi is not None:
+            expected["github"] = {"capi": capi}
+        assert client.resumes == [("retained", expected)]
         assert client.creates == []
         assert client.sessions[0].disconnected
         assert client.sessions[0].prompts == ["more"]
@@ -412,7 +417,7 @@ class TestRoutingRejection:
     async def test_answer_and_idle_cannot_hide_tier_rejection(
         self, monkeypatch: pytest.MonkeyPatch, dialog: bool, fusion: bool
     ) -> None:
-        from copilot.generated.session_events import (
+        from copilot.session_events import (
             AutoTier,
             AutoTierSwitchFailureReason,
             SessionAutoTierSwitchFailedData,
@@ -462,7 +467,7 @@ class TestRoutingRejection:
         else:
             output = await provider.execute(_agent(model="auto"), {}, "p")
             assert output.content == {"result": "answer"}
-        assert "capi" not in client.creates[0]
+        assert "capi" not in client.creates[0].get("github", {})
 
     async def test_rejected_fusion_replacement_does_not_mark_plain_auto_session(
         self, monkeypatch: pytest.MonkeyPatch
@@ -755,7 +760,7 @@ class TestAttribution:
     async def test_resumed_routing_survives_interrupt_and_actual_handle_followup(
         self, monkeypatch: pytest.MonkeyPatch, event_type: str, replacement: str
     ) -> None:
-        from copilot.generated.session_events import AutoTier
+        from copilot.session_events import AutoTier
 
         model_field = "new_model" if event_type == "session.model_change" else "selected_model"
         client = _FakeClient(

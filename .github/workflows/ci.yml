@@ -157,7 +157,7 @@ jobs:
           if [ -n "$removed" ]; then
             echo "Removed bundled CLI: $removed"
           else
-            echo "No bundled CLI present (expected for github-copilot-sdk >=1.0.2)."
+            echo "No bundled CLI present (expected for the pure-Python Copilot SDK wheel)."
           fi
 
       - name: Run tests with coverage

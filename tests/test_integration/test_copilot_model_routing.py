@@ -163,8 +163,8 @@ async def test_yaml_preferences_reach_sdk_sessions(fake_client: _Client, tmp_pat
     await _run(path, {"tier": "x"})
 
     answer, review = fake_client.creates
-    assert (answer["model"], answer["capi"]) == ("fusion", {"fusion_tier": "high"})
-    assert (review["model"], review["capi"]) == ("auto", {"auto_tier": "efficiency"})
+    assert (answer["model"], answer["github"]["capi"]) == ("fusion", {"fusion_tier": "high"})
+    assert (review["model"], review["github"]["capi"]) == ("auto", {"auto_tier": "efficiency"})
 
 
 @pytest.mark.asyncio
@@ -173,7 +173,7 @@ async def test_unset_preferences_are_omitted(fake_client: _Client, tmp_path: Pat
 
     await _run(path, {"tier": "x"})
 
-    assert all("capi" not in create for create in fake_client.creates)
+    assert all("capi" not in create.get("github", {}) for create in fake_client.creates)
 
 
 @pytest.mark.asyncio
@@ -186,7 +186,7 @@ async def test_templated_agent_tier_is_rendered(fake_client: _Client, tmp_path: 
 
     await _run(path, {"tier": "max"})
 
-    assert fake_client.creates[1]["capi"] == {"fusion_tier": "max"}
+    assert fake_client.creates[1]["github"]["capi"] == {"fusion_tier": "max"}
 
 
 @pytest.mark.asyncio

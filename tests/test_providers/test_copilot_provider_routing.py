@@ -27,6 +27,27 @@ def _make_provider(**kwargs: Any) -> CopilotProvider:
     return CopilotProvider(**kwargs)
 
 
+def _spawned_client_kwargs() -> dict[str, Any]:
+    """The ``CopilotClient`` arguments for a nested runtime without telemetry."""
+    from copilot.client import RuntimeConnection
+
+    return {"mode": "coding-agent", "runtime": RuntimeConnection.for_spawned_stdio()}
+
+
+def _byok_provider(session_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return the custom-routing config an SDK 2.x session call carries.
+
+    Custom routing reaches the SDK as one BYOK connection named ``conductor``
+    that is also the default provider, with Copilot API models disabled.
+    """
+    inference = session_kwargs["inference"]
+    assert inference["default_provider"] == "conductor"
+    assert session_kwargs["github"]["capi"]["enabled"] is False
+    (provider,) = inference["providers"]
+    assert provider["name"] == "conductor"
+    return {key: value for key, value in provider.items() if key != "name"}
+
+
 class TestResolveSdkProviderConfig:
     """Unit-tests for ``CopilotProvider._resolve_sdk_provider_config``."""
 
@@ -331,7 +352,7 @@ class TestSessionKwargsPlumbing:
             history=[],
         )
         kwargs = captured["create_session_kwargs"]
-        assert kwargs["provider"] == {
+        assert _byok_provider(kwargs) == {
             "type": "openai",
             "wire_api": "completions",
             "base_url": "http://localhost:11434/v1",
@@ -351,7 +372,8 @@ class TestSessionKwargsPlumbing:
             history=[],
         )
         kwargs = captured["create_session_kwargs"]
-        assert "provider" not in kwargs
+        assert "providers" not in kwargs.get("inference", {})
+        assert "default_provider" not in kwargs.get("inference", {})
 
     @pytest.mark.asyncio
     async def test_execute_attaches_provider_config(self) -> None:
@@ -377,7 +399,7 @@ class TestSessionKwargsPlumbing:
         await provider.execute(agent, context={}, rendered_prompt="hi")
 
         kwargs = captured["create_session_kwargs"]
-        assert kwargs["provider"] == {
+        assert _byok_provider(kwargs) == {
             "type": "openai",
             "wire_api": "completions",
             "base_url": "http://localhost:11434/v1",
@@ -435,7 +457,7 @@ class TestSessionKwargsPlumbing:
 
         client.resume_session.assert_called_once()
         kwargs = client.resume_session.call_args.kwargs
-        assert kwargs["provider"] == {
+        assert _byok_provider(kwargs) == {
             "type": "openai",
             "wire_api": "completions",
             "base_url": "http://localhost:11434/v1",
@@ -669,7 +691,7 @@ class TestResolveRuntimeConnection:
         assert provider._resolve_runtime_connection() == ("host:1", None)
 
     def test_build_client_default_spawns(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """No runtime connection → default ``CopilotClient()`` (spawns runtime)."""
+        """No runtime connection → ``CopilotClient`` spawns a nested stdio runtime."""
         import conductor.providers.copilot as copilot_mod
 
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
@@ -678,14 +700,14 @@ class TestResolveRuntimeConnection:
         monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
         provider = _make_provider()
         assert provider._build_client() is client
-        client_factory.assert_called_once_with()
+        client_factory.assert_called_once_with(**_spawned_client_kwargs())
 
     def test_build_client_connects_to_external_runtime(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With a runtime connection resolved, the client is a URI (external)
-        connection and does not spawn a nested runtime."""
-        from copilot.client import UriRuntimeConnection
+        """With a runtime connection resolved, the client is an attached TCP
+        (external) connection and does not spawn a nested runtime."""
+        from copilot.client import TcpRuntimeConnection
 
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
         s = ProviderSettings.model_validate(
@@ -694,8 +716,8 @@ class TestResolveRuntimeConnection:
         provider = _make_provider(provider_settings=s)
         client = provider._build_client()
         assert client._is_external_server is True
-        assert isinstance(client._connection, UriRuntimeConnection)
-        assert client._connection.url == "localhost:3000"
+        assert isinstance(client._connection, TcpRuntimeConnection)
+        assert (client._connection.host, client._connection.port) == ("localhost", 3000)
         assert client._connection.connection_token == "sek"
 
     def test_empty_env_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -732,7 +754,7 @@ class TestResolveRuntimeConnection:
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
         connection = object()
         runtime_connection = MagicMock()
-        runtime_connection.for_uri.return_value = connection
+        runtime_connection.for_tcp.return_value = connection
         client = object()
         client_factory = MagicMock(return_value=client)
         monkeypatch.setattr(copilot_mod, "RuntimeConnection", runtime_connection)
@@ -747,8 +769,8 @@ class TestResolveRuntimeConnection:
         )
         provider = _make_provider(provider_settings=s, model="ollama/llama3")
         assert provider._build_client() is client
-        runtime_connection.for_uri.assert_called_once_with("host:9000", connection_token=None)
-        client_factory.assert_called_once_with(connection=connection)
+        runtime_connection.for_tcp.assert_called_once_with("host", 9000, connection_token=None)
+        client_factory.assert_called_once_with(mode="coding-agent", runtime=connection)
 
         session_kwargs: dict[str, Any] = {}
         provider._apply_provider_config(session_kwargs)
@@ -758,27 +780,11 @@ class TestResolveRuntimeConnection:
             "api_key": "sk-yaml",
         }
 
-    def test_build_client_raises_when_runtime_connection_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An older-but-present SDK imports ``RuntimeConnection`` as ``None``.
-        With a configured ``runtime_url`` the client build must raise a clear
-        ProviderError rather than an opaque ``AttributeError`` on ``for_uri``."""
-        import conductor.providers.copilot as copilot_mod
-
-        monkeypatch.setattr(copilot_mod, "RuntimeConnection", None)
-        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
-        monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
-        s = ProviderSettings.model_validate({"name": "copilot", "runtime_url": "localhost:3000"})
-        provider = _make_provider(provider_settings=s)
-        with pytest.raises(ProviderError, match="requires a .*RuntimeConnection"):
-            provider._build_client()
-
 
 class TestGithubTokenAuth:
     """Unit-tests for epic E9 (#284): forwarding a ``github_token`` to the
     Copilot SDK in memory, via ``create_session`` / ``resume_session``'s
-    ``github_token`` parameter (the SDK's ``gitHubToken`` RPC payload), so
+    ``github.token`` option (the SDK's ``gitHubToken`` RPC payload), so
     the (nested, spawned) runtime authenticates against Copilot's own model
     routing (Copilot capacity) rather than a BYOK endpoint.
 
@@ -793,10 +799,11 @@ class TestGithubTokenAuth:
     ) -> None:
         """A ``github_token`` must NOT be passed to the ``CopilotClient``
         constructor even when spawning a nested runtime: the SDK exports a
-        constructor-level ``github_token`` as the ``COPILOT_SDK_AUTH_TOKEN``
+        client-level ``github.token`` as the ``COPILOT_SDK_AUTH_TOKEN``
         environment variable on the spawned process, which is not the
-        in-memory delivery this provider requires. The plain, argument-free
-        ``CopilotClient()`` call must be preserved regardless."""
+        in-memory delivery this provider requires. The constructor must keep
+        receiving only the mode and spawned runtime (no ``github`` option)
+        regardless."""
         import conductor.providers.copilot as copilot_mod
 
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
@@ -805,7 +812,7 @@ class TestGithubTokenAuth:
         monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
         provider = _make_provider(github_token="gh-token-value")
         assert provider._build_client() is client
-        client_factory.assert_called_once_with()
+        client_factory.assert_called_once_with(**_spawned_client_kwargs())
 
     def test_apply_github_token_adds_to_session_kwargs_when_spawning(
         self, monkeypatch: pytest.MonkeyPatch
@@ -849,7 +856,7 @@ class TestGithubTokenAuth:
         )
         provider = _make_provider(provider_settings=s, model="ollama/llama3")
         assert provider._build_client() is client
-        client_factory.assert_called_once_with()
+        client_factory.assert_called_once_with(**_spawned_client_kwargs())
 
         session_kwargs: dict[str, Any] = {}
         provider._apply_provider_config(session_kwargs)
@@ -909,22 +916,22 @@ class TestGithubTokenAuth:
     ) -> None:
         """Connecting to an existing runtime (``runtime_url``) authenticates
         via that runtime's own connection; a ``github_token`` is not forwarded
-        to ``RuntimeConnection.for_uri`` or the resulting ``CopilotClient``."""
+        to ``RuntimeConnection.for_tcp`` or the resulting ``CopilotClient``."""
         import conductor.providers.copilot as copilot_mod
 
         monkeypatch.setenv("COPILOT_PROVIDER_RUNTIME_URL", "host:9000")
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_TOKEN", raising=False)
         connection = object()
         runtime_connection = MagicMock()
-        runtime_connection.for_uri.return_value = connection
+        runtime_connection.for_tcp.return_value = connection
         client = object()
         client_factory = MagicMock(return_value=client)
         monkeypatch.setattr(copilot_mod, "RuntimeConnection", runtime_connection)
         monkeypatch.setattr(copilot_mod, "CopilotClient", client_factory)
         provider = _make_provider(github_token="gh-token-value")
         assert provider._build_client() is client
-        runtime_connection.for_uri.assert_called_once_with("host:9000", connection_token=None)
-        client_factory.assert_called_once_with(connection=connection)
+        runtime_connection.for_tcp.assert_called_once_with("host", 9000, connection_token=None)
+        client_factory.assert_called_once_with(mode="coding-agent", runtime=connection)
 
     def test_github_token_stored_without_additional_side_channel(self) -> None:
         """The token is stored on a private attribute only — the provider
