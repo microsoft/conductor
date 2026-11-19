@@ -101,9 +101,11 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        # The telemetry extra lets the OpenTelemetry suite actually run
-        # (`importorskip("opentelemetry.sdk")`) instead of silently skipping.
-        run: uv sync --group dev --extra telemetry
+        # Same extras as ci.yml's test job, so the release gate runs the suite
+        # that passed on the release PR: the claude-agent-sdk and telemetry
+        # extras let those suites (`importorskip("claude_agent_sdk")`,
+        # `importorskip("opentelemetry.sdk")`) run instead of skipping.
+        run: uv sync --group dev --extra claude-agent-sdk --extra telemetry
 
       - name: Run tests
         # Exclude performance tests: they assert wall-clock thresholds (e.g.
