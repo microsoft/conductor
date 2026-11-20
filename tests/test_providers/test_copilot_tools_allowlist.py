@@ -2,7 +2,7 @@
 
 The provider advertises ``workflow_tools_passthrough=True``, so the resolved
 tool list the executor hands to ``execute()`` must reach the SDK as
-``available_tools``. Without it the session falls back to the CLI's full
+``tools.available_tools``. Without it the session falls back to the CLI's full
 catalog (shell, file read/write, web, every MCP server), silently granting
 tools the workflow did not declare.
 """
@@ -105,7 +105,7 @@ async def test_empty_tools_disables_every_tool() -> None:
     await _run(provider, _agent(tools=[]), resolved_tools=[])
 
     # Requirement: ``tools: []`` means no tools at all, built-ins included.
-    assert client.create_session.call_args.kwargs["available_tools"] == []
+    assert client.create_session.call_args.kwargs["tools"]["available_tools"] == []
 
 
 @pytest.mark.asyncio
@@ -115,7 +115,7 @@ async def test_named_tools_are_the_exact_allowlist() -> None:
     await _run(provider, _agent(tools=["view"]), resolved_tools=["view"])
 
     # Requirement: a named list grants exactly those tools and nothing else.
-    assert client.create_session.call_args.kwargs["available_tools"] == ["view"]
+    assert client.create_session.call_args.kwargs["tools"]["available_tools"] == ["view"]
 
 
 @pytest.mark.asyncio
@@ -126,7 +126,7 @@ async def test_omitted_tools_inherit_workflow_level_allowlist() -> None:
     await _run(provider, _agent(tools=None), resolved_tools=["view", "grep"])
 
     # Requirement: inheriting the workflow list restricts the session to it.
-    assert client.create_session.call_args.kwargs["available_tools"] == ["view", "grep"]
+    assert client.create_session.call_args.kwargs["tools"]["available_tools"] == ["view", "grep"]
 
 
 @pytest.mark.asyncio
@@ -137,7 +137,7 @@ async def test_no_tools_declared_anywhere_keeps_cli_default_catalog() -> None:
     await _run(provider, _agent(tools=None), resolved_tools=[])
 
     # Requirement: workflows that never mention tools keep the provider default.
-    assert "available_tools" not in client.create_session.call_args.kwargs
+    assert "available_tools" not in client.create_session.call_args.kwargs.get("tools", {})
 
 
 @pytest.mark.asyncio
@@ -148,7 +148,7 @@ async def test_resumed_session_keeps_the_allowlist() -> None:
     await _run(provider, _agent(tools=[]), resolved_tools=[])
 
     # Requirement: a checkpoint resume must not widen the agent's tools.
-    assert client.resume_session.call_args.kwargs["available_tools"] == []
+    assert client.resume_session.call_args.kwargs["tools"]["available_tools"] == []
     client.create_session.assert_not_called()
 
 
@@ -160,7 +160,7 @@ async def test_resumed_session_keeps_an_inherited_allowlist() -> None:
     await _run(provider, _agent(tools=None), resolved_tools=["view", "grep"])
 
     # Requirement: resuming must not widen an allowlist inherited from the workflow.
-    assert client.resume_session.call_args.kwargs["available_tools"] == ["view", "grep"]
+    assert client.resume_session.call_args.kwargs["tools"]["available_tools"] == ["view", "grep"]
     client.create_session.assert_not_called()
 
 
@@ -176,7 +176,7 @@ async def test_mcp_tool_names_are_translated_for_the_sdk() -> None:
 
     # Requirement: Conductor's ``server__tool`` reaches the SDK as the runtime's
     # ``server-tool``, source-qualified; built-in names are forwarded unchanged.
-    assert client.create_session.call_args.kwargs["available_tools"] == [
+    assert client.create_session.call_args.kwargs["tools"]["available_tools"] == [
         "mcp:web-search-search",
         "view",
     ]
@@ -190,7 +190,9 @@ async def test_resumed_session_translates_mcp_tool_names() -> None:
     await _run(provider, _agent(tools=None), resolved_tools=["web-search__search"])
 
     # Requirement: the resume path uses the same translated allowlist.
-    assert client.resume_session.call_args.kwargs["available_tools"] == ["mcp:web-search-search"]
+    assert client.resume_session.call_args.kwargs["tools"]["available_tools"] == [
+        "mcp:web-search-search"
+    ]
     client.create_session.assert_not_called()
 
 
@@ -207,7 +209,9 @@ async def test_plugin_mcp_tool_names_are_translated() -> None:
     )
 
     # Requirement: plugin-contributed servers translate like workflow servers.
-    assert client.create_session.call_args.kwargs["available_tools"] == ["mcp:ado-get_work_item"]
+    assert client.create_session.call_args.kwargs["tools"]["available_tools"] == [
+        "mcp:ado-get_work_item"
+    ]
 
 
 def test_allowlist_translation_edge_cases() -> None:

@@ -1169,7 +1169,7 @@ class TestCopilotExecuteDialogTurn:
             history=None,
         )
 
-        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
+        assert captured["create_session_kwargs"]["inference"]["context_tier"] == "long_context"
 
     @pytest.mark.asyncio
     async def test_dialog_turn_no_context_tier_means_key_absent(self) -> None:
@@ -1182,7 +1182,7 @@ class TestCopilotExecuteDialogTurn:
             history=None,
         )
 
-        assert "context_tier" not in captured["create_session_kwargs"]
+        assert "context_tier" not in captured["create_session_kwargs"].get("inference", {})
 
     @pytest.mark.asyncio
     async def test_dialog_turn_session_error_wrapped_as_provider_error(self) -> None:
@@ -1305,19 +1305,19 @@ class TestCopilotProviderLargeOutput:
         """Default ToolOutputConfig produces enabled=True and default max_size_bytes."""
         provider = CopilotProvider()
         captured = self._captured_create_session(provider)
-        assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
+        assert captured["tools"]["large_output"] == {"enabled": True, "max_size_bytes": 50000}
 
     def test_disabled_config_forwards_enabled_false(self) -> None:
         """enabled=False is forwarded as enabled=False because the SDK defaults to enabled."""
         provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
         captured = self._captured_create_session(provider)
-        assert captured["large_output"] == {"enabled": False}
+        assert captured["tools"]["large_output"] == {"enabled": False}
 
     def test_spill_to_file_false_maps_to_enabled_false(self) -> None:
         """spill_to_file=False disables large_output handling entirely (SDK limitation)."""
         provider = CopilotProvider(tool_output=ToolOutputConfig(spill_to_file=False))
         captured = self._captured_create_session(provider)
-        assert captured["large_output"] == {"enabled": False}
+        assert captured["tools"]["large_output"] == {"enabled": False}
 
     def test_spill_to_file_false_logs_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
         """Requirement: disabling spill on Copilot silently uncaps tool output.
@@ -1341,7 +1341,7 @@ class TestCopilotProviderLargeOutput:
             tool_output=ToolOutputConfig(spill_dir="/tmp/custom-tool-output")
         )
         captured = self._captured_create_session(provider)
-        assert captured["large_output"] == {
+        assert captured["tools"]["large_output"] == {
             "enabled": True,
             "max_size_bytes": 50000,
             "output_directory": "/tmp/custom-tool-output",
@@ -1351,13 +1351,13 @@ class TestCopilotProviderLargeOutput:
         """Dialog turns also receive the large_output config."""
         provider = CopilotProvider()
         captured = self._captured_dialog_session(provider)
-        assert captured["large_output"] == {"enabled": True, "max_size_bytes": 50000}
+        assert captured["tools"]["large_output"] == {"enabled": True, "max_size_bytes": 50000}
 
     def test_large_output_disabled_forwards_enabled_false_for_dialog_session(self) -> None:
         """enabled=False is forwarded as enabled=False in dialog create_session kwargs."""
         provider = CopilotProvider(tool_output=ToolOutputConfig(enabled=False))
         captured = self._captured_dialog_session(provider)
-        assert captured["large_output"] == {"enabled": False}
+        assert captured["tools"]["large_output"] == {"enabled": False}
 
 
 class TestGetMaxPromptTokens:
@@ -1737,7 +1737,7 @@ class TestReasoningEffort:
     def _make_model(model_id: str, supported: list[str] | None) -> Any:
         from types import SimpleNamespace
 
-        # Mirrors the real github-copilot-sdk ``Model`` shape: reasoning-effort
+        # Mirrors the real Copilot SDK ``Model`` shape: reasoning-effort
         # fields are top level on ``Model``, NOT nested under ``capabilities``
         # (see the fix for the #301 validation-read bug).
         return SimpleNamespace(
@@ -1811,7 +1811,7 @@ class TestReasoningEffort:
             reasoning=ReasoningConfig(effort="high"),
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
-        assert captured["create_session_kwargs"]["reasoning_effort"] == "high"
+        assert captured["create_session_kwargs"]["inference"]["reasoning_effort"] == "high"
 
     @pytest.mark.asyncio
     async def test_runtime_default_used_when_agent_has_none(
@@ -1823,7 +1823,7 @@ class TestReasoningEffort:
         )
         agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
-        assert captured["create_session_kwargs"]["reasoning_effort"] == "medium"
+        assert captured["create_session_kwargs"]["inference"]["reasoning_effort"] == "medium"
 
     @pytest.mark.asyncio
     async def test_per_agent_effort_overrides_runtime_default(
@@ -1840,7 +1840,7 @@ class TestReasoningEffort:
             reasoning=ReasoningConfig(effort="xhigh"),
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
-        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+        assert captured["create_session_kwargs"]["inference"]["reasoning_effort"] == "xhigh"
 
     @pytest.mark.asyncio
     async def test_no_effort_set_means_key_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1848,7 +1848,7 @@ class TestReasoningEffort:
         provider = await self._build_provider(captured, monkeypatch)
         agent = AgentDef(name="planner", model="gpt-4o", prompt="Plan")
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
-        assert "reasoning_effort" not in captured["create_session_kwargs"]
+        assert "reasoning_effort" not in captured["create_session_kwargs"].get("inference", {})
 
     @pytest.mark.asyncio
     async def test_validation_error_when_model_does_not_support_effort(
@@ -1891,7 +1891,7 @@ class TestReasoningEffort:
             reasoning=ReasoningConfig(effort="max"),
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
-        assert captured["create_session_kwargs"]["reasoning_effort"] == "max"
+        assert captured["create_session_kwargs"]["inference"]["reasoning_effort"] == "max"
 
     @pytest.mark.asyncio
     async def test_max_effort_rejected_when_model_lacks_it(
@@ -1943,7 +1943,7 @@ class TestReasoningEffort:
             reasoning=ReasoningConfig(effort="xhigh"),
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
-        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+        assert captured["create_session_kwargs"]["inference"]["reasoning_effort"] == "xhigh"
 
     @pytest.mark.asyncio
     async def test_value_error_from_sdk_parser_skips_validation(
@@ -1974,7 +1974,7 @@ class TestReasoningEffort:
             reasoning=ReasoningConfig(effort="xhigh"),
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Plan")
-        assert captured["create_session_kwargs"]["reasoning_effort"] == "xhigh"
+        assert captured["create_session_kwargs"]["inference"]["reasoning_effort"] == "xhigh"
 
     @pytest.mark.asyncio
     async def test_validation_error_not_retried_in_execute_with_retry(
@@ -2286,7 +2286,7 @@ class TestContextTier:
             context_tier="long_context",
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
-        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
+        assert captured["create_session_kwargs"]["inference"]["context_tier"] == "long_context"
 
     @pytest.mark.asyncio
     async def test_runtime_default_used_when_agent_has_none(
@@ -2298,7 +2298,7 @@ class TestContextTier:
         )
         agent = AgentDef(name="analyze", model="claude-opus-4.8", prompt="Analyze")
         await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
-        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
+        assert captured["create_session_kwargs"]["inference"]["context_tier"] == "long_context"
 
     @pytest.mark.asyncio
     async def test_per_agent_tier_overrides_runtime_default(
@@ -2315,7 +2315,7 @@ class TestContextTier:
             context_tier="default",
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Cheap")
-        assert captured["create_session_kwargs"]["context_tier"] == "default"
+        assert captured["create_session_kwargs"]["inference"]["context_tier"] == "default"
 
     @pytest.mark.asyncio
     async def test_no_tier_set_means_key_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2323,7 +2323,7 @@ class TestContextTier:
         provider = await self._build_provider(captured, monkeypatch)
         agent = AgentDef(name="analyze", model="claude-opus-4.8", prompt="Analyze")
         await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
-        assert "context_tier" not in captured["create_session_kwargs"]
+        assert "context_tier" not in captured["create_session_kwargs"].get("inference", {})
 
     @pytest.mark.asyncio
     async def test_tier_and_reasoning_compose(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2339,8 +2339,8 @@ class TestContextTier:
             reasoning=ReasoningConfig(effort="high"),
         )
         await provider.execute(agent=agent, context={}, rendered_prompt="Analyze")
-        assert captured["create_session_kwargs"]["context_tier"] == "long_context"
-        assert captured["create_session_kwargs"]["reasoning_effort"] == "high"
+        assert captured["create_session_kwargs"]["inference"]["context_tier"] == "long_context"
+        assert captured["create_session_kwargs"]["inference"]["reasoning_effort"] == "high"
 
 
 class TestCopilotProviderResolvedModel:
@@ -2740,9 +2740,9 @@ class TestCopilotProviderResolvedModel:
 
 class TestGithubTokenSessionAuth:
     """A forwarded ``github_token`` must be delivered to the SDK via the
-    ``create_session`` / ``resume_session`` ``github_token`` parameter — the
+    ``create_session`` / ``resume_session`` ``github.token`` option — the
     in-memory ``gitHubToken`` RPC payload — never via the ``CopilotClient``
-    constructor. The SDK forwards a constructor-level ``github_token`` to the
+    constructor. The SDK forwards a client-level ``github.token`` to the
     spawned runtime as a ``COPILOT_SDK_AUTH_TOKEN`` environment variable,
     which does not meet the in-memory delivery requirement (ACA sandbox
     auth, DD4).
@@ -2770,8 +2770,8 @@ class TestGithubTokenSessionAuth:
 
     @pytest.mark.asyncio
     async def test_github_token_forwarded_to_create_session(self) -> None:
-        """execute() forwards ``github_token`` to ``create_session`` as an
-        in-memory payload field."""
+        """execute() forwards ``github_token`` to ``create_session`` as the
+        in-memory ``github.token`` payload field."""
         mock_client = AsyncMock()
         mock_client.create_session = AsyncMock(return_value=self._fake_session())
 
@@ -2788,7 +2788,7 @@ class TestGithubTokenSessionAuth:
             await provider.execute(agent, {}, "Do research")
 
         _, kwargs = mock_client.create_session.call_args
-        assert kwargs["github_token"] == "gh-token-value"
+        assert kwargs["github"]["token"] == "gh-token-value"
 
     @pytest.mark.asyncio
     async def test_no_github_token_omits_key_from_create_session(self) -> None:
@@ -2810,7 +2810,7 @@ class TestGithubTokenSessionAuth:
             await provider.execute(agent, {}, "Do research")
 
         _, kwargs = mock_client.create_session.call_args
-        assert "github_token" not in kwargs
+        assert "token" not in kwargs.get("github", {})
 
     @pytest.mark.asyncio
     async def test_github_token_forwarded_to_resume_session(self) -> None:
@@ -2834,10 +2834,10 @@ class TestGithubTokenSessionAuth:
 
         mock_client.resume_session.assert_called_once_with(
             "sess-old-123",
-            on_permission_request=CopilotProvider._default_permission_handler,
+            permissions={"on_request": CopilotProvider._default_permission_handler},
             working_directory=os.getcwd(),
-            large_output={"enabled": True, "max_size_bytes": 50000},
-            github_token="gh-token-value",
+            tools={"large_output": {"enabled": True, "max_size_bytes": 50000}},
+            github={"token": "gh-token-value"},
         )
         mock_client.create_session.assert_not_called()
 
@@ -2869,7 +2869,7 @@ class TestGithubTokenSessionAuth:
         provider._started = True
 
         await provider.execute_dialog_turn("sys", "hi", [])
-        assert captured["kwargs"]["github_token"] == "gh-token-value"
+        assert captured["kwargs"]["github"]["token"] == "gh-token-value"
 
     @pytest.mark.asyncio
     async def test_github_token_never_forwarded_to_copilot_client_constructor(
@@ -2879,6 +2879,8 @@ class TestGithubTokenSessionAuth:
         constructor, which the SDK exports as the ``COPILOT_SDK_AUTH_TOKEN``
         environment variable on the spawned runtime rather than delivering it
         in memory."""
+        from copilot.client import RuntimeConnection
+
         import conductor.providers.copilot as copilot_mod
 
         monkeypatch.delenv("COPILOT_PROVIDER_RUNTIME_URL", raising=False)
@@ -2888,7 +2890,9 @@ class TestGithubTokenSessionAuth:
 
         provider = CopilotProvider(github_token="gh-token-value")
         assert provider._build_client() is client
-        client_factory.assert_called_once_with()
+        client_factory.assert_called_once_with(
+            mode="coding-agent", runtime=RuntimeConnection.for_spawned_stdio()
+        )
 
     @pytest.mark.asyncio
     async def test_github_token_not_leaked_in_log_records(
@@ -2926,16 +2930,16 @@ class TestPricingSurvivesTheRealSDKShape:
     ``from_dict`` dropped ``tokenPrices``, so the hook returned ``None`` for
     every model while every fake-backed test stayed green.
 
-    These build the model through the SDK's own ``ModelInfo.from_dict``, so the
+    These build the model through the SDK's own ``Model.from_dict``, so the
     parser is the real one and a future SDK that stops carrying the field fails
     here instead of silently reverting cost reporting to the static table.
     """
 
     @staticmethod
     def _model_from_wire(payload: dict[str, Any]) -> Any:
-        from copilot.client import ModelInfo
+        from copilot import Model
 
-        return ModelInfo.from_dict(payload)
+        return Model.from_dict(payload)
 
     @pytest.mark.asyncio
     async def test_the_sdk_still_parses_token_prices(self) -> None:
@@ -2944,7 +2948,7 @@ class TestPricingSurvivesTheRealSDKShape:
             {
                 "id": "claude-opus-5",
                 "name": "Claude Opus 5",
-                # Required by ModelInfo.from_dict; only ``billing`` is under test here.
+                # Required by Model.from_dict; only ``billing`` is under test here.
                 "capabilities": {},
                 "billing": {
                     "multiplier": 1.0,
@@ -2952,7 +2956,7 @@ class TestPricingSurvivesTheRealSDKShape:
                         "batchSize": 1_000,
                         "inputPrice": 1.5,
                         "outputPrice": 7.5,
-                        "cachePrice": 0.15,
+                        "cacheReadPrice": 0.15,
                     },
                 },
             }
@@ -2976,7 +2980,7 @@ class TestPricingSurvivesTheRealSDKShape:
             {
                 "id": "claude-opus-5",
                 "name": "Claude Opus 5",
-                # Required by ModelInfo.from_dict; only ``billing`` is under test here.
+                # Required by Model.from_dict; only ``billing`` is under test here.
                 "capabilities": {},
                 "billing": {
                     "multiplier": 1.0,
@@ -3003,7 +3007,8 @@ class TestPricingSurvivesTheRealSDKShape:
     async def test_cache_rates_come_from_the_non_deprecated_fields(self) -> None:
         """Copilot SDK >=1.0.9 splits the cached-token rate into read and write.
 
-        The hook read only ``cache_price``, which that release deprecates. A
+        The hook read only ``cache_price``, which that release deprecates (and
+        SDK 2.x removes). A
         model shipping just the replacements priced cache reads at $0.00 —
         silently, and with every other figure correct, which is the #386
         failure one field over.
@@ -3036,8 +3041,16 @@ class TestPricingSurvivesTheRealSDKShape:
         assert pricing.cache_write_per_mtok == pytest.approx(18.0)
 
     @pytest.mark.asyncio
-    async def test_the_deprecated_cache_field_still_works(self) -> None:
-        """Kept as a fallback: an older payload must not lose its cache rate."""
+    async def test_the_deprecated_cache_field_fallback_is_safe(self) -> None:
+        """The ``cache_price`` fallback must not break the real SDK 2.x shape.
+
+        SDK 2.x removed ``cache_price`` from ``ModelBillingTokenPrices``, so the
+        real shape can no longer carry the deprecated rate (the fallback itself
+        is covered by ``TestGetModelPricing``). A model without a
+        ``cacheReadPrice`` must still be priced from its other fields, with the
+        cached-read rate defaulting to zero rather than the lookup of the
+        missing attribute raising or discarding the pricing.
+        """
         model = self._model_from_wire(
             {
                 "id": "claude-opus-5",
@@ -3048,7 +3061,7 @@ class TestPricingSurvivesTheRealSDKShape:
                         "batchSize": 1_000,
                         "inputPrice": 1.5,
                         "outputPrice": 7.5,
-                        "cachePrice": 0.15,
+                        "cacheWritePrice": 1.8,
                     }
                 },
             }
@@ -3061,7 +3074,9 @@ class TestPricingSurvivesTheRealSDKShape:
         pricing = await provider.get_model_pricing("claude-opus-5")
 
         assert pricing is not None
-        assert pricing.cache_read_per_mtok == pytest.approx(1.5)
+        assert pricing.input_per_mtok == pytest.approx(15.0)
+        assert pricing.cache_read_per_mtok == 0.0
+        assert pricing.cache_write_per_mtok == pytest.approx(18.0)
 
 
 class TestDefaultPermissionHandler:

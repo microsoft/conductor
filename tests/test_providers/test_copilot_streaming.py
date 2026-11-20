@@ -5,9 +5,9 @@ when the Copilot SDK is configured WITHOUT streaming.
 
 Background
 ----------
-The Copilot SDK's ``create_session`` accepts a ``streaming`` parameter that
-the conductor provider previously did not set, causing the SDK to default to
-non-streaming mode. In non-streaming mode the model must emit its entire
+The Copilot SDK's ``create_session`` accepts a streaming option (``events.streaming``
+in SDK 2.x) that the conductor provider previously did not set, causing the SDK to
+default to non-streaming mode. In non-streaming mode the model must emit its entire
 turn (text + tool_use blocks + arguments) under a single per-turn output
 budget. For agents that issue large tool-call arguments (e.g., ``create``
 with multi-KB ``file_text``), that budget is exhausted mid-JSON and the CLI
@@ -72,7 +72,7 @@ def _build_mocked_provider() -> tuple[CopilotProvider, AsyncMock]:
 
 @pytest.mark.asyncio
 async def test_create_session_called_with_streaming_true() -> None:
-    """``create_session`` must be invoked with ``streaming=True``.
+    """``create_session`` must be invoked with ``events={"streaming": True}``.
 
     Without this kwarg the SDK falls back to non-streaming, which causes
     tool-call argument truncation under output-budget pressure (see module
@@ -90,13 +90,14 @@ async def test_create_session_called_with_streaming_true() -> None:
     mock_client.create_session.assert_called_once()
     kwargs = mock_client.create_session.call_args.kwargs
 
-    assert "streaming" in kwargs, (
-        "create_session must be called with an explicit `streaming` kwarg; "
+    events = kwargs.get("events", {})
+    assert "streaming" in events, (
+        "create_session must be called with an explicit `events.streaming` kwarg; "
         "without it the SDK falls back to non-streaming mode and large "
         "tool-call arguments get silently truncated."
     )
-    assert kwargs["streaming"] is True, (
-        f"streaming must be True (got {kwargs['streaming']!r}). Non-streaming "
+    assert events["streaming"] is True, (
+        f"streaming must be True (got {events['streaming']!r}). Non-streaming "
         "causes the model's per-turn output budget to be exhausted mid-JSON "
         "for large tool calls (e.g. `create` with multi-KB `file_text`)."
     )
@@ -118,5 +119,5 @@ async def test_create_session_preserves_existing_kwargs() -> None:
     # These three are the existing required kwargs; the streaming fix
     # must not regress them.
     assert kwargs.get("model") == "claude-opus-4.7-1m-internal"
-    assert "on_permission_request" in kwargs
+    assert "on_request" in kwargs["permissions"]
     assert "working_directory" in kwargs

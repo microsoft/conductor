@@ -63,7 +63,7 @@ async def test_skill_directories_passed_to_create_session() -> None:
     )
 
     kwargs = captured["create_session_kwargs"]
-    assert kwargs["skill_directories"] == ["/path/to/skill-a", "/path/to/skill-b"]
+    assert kwargs["skills"]["directories"] == ["/path/to/skill-a", "/path/to/skill-b"]
 
 
 @pytest.mark.asyncio
@@ -75,7 +75,7 @@ async def test_skill_directories_absent_when_not_supplied() -> None:
     await provider.execute(agent, context={}, rendered_prompt="hi")
 
     kwargs = captured["create_session_kwargs"]
-    assert "skill_directories" not in kwargs
+    assert "directories" not in kwargs.get("skills", {})
 
 
 @pytest.mark.asyncio
@@ -88,4 +88,4 @@ async def test_empty_skill_directories_not_passed() -> None:
     await provider.execute(agent, context={}, rendered_prompt="hi", skill_directories=[])
 
     kwargs = captured["create_session_kwargs"]
-    assert "skill_directories" not in kwargs
+    assert "directories" not in kwargs.get("skills", {})

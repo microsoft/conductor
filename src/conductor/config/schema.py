@@ -1916,9 +1916,9 @@ class ProviderSettings(BaseModel):
     - String shorthand: ``provider: copilot`` (equivalent to
       ``provider: {name: copilot}``).
     - Object form: configures custom model-provider routing, an existing
-      Copilot runtime connection, or both. Copilot routing fields are forwarded
-      to ``copilot.client.create_session(provider=...)``; runtime fields select
-      how the SDK reaches the Copilot CLI process.
+      Copilot runtime connection, or both. Copilot routing fields become the
+      SDK session's named BYOK provider connection (``inference.providers``);
+      runtime fields select how the SDK reaches the Copilot CLI process.
 
     Custom routing activates only when a routing field is set and fills missing
     values from environment variables (see :meth:`has_custom_routing`). Runtime
@@ -2087,13 +2087,14 @@ class ProviderSettings(BaseModel):
     """Connect to an already-running Copilot runtime instead of spawning a
     nested one. Copilot-only.
 
-    Accepts ``"port"``, ``"host:port"``, or a full URL. When set, the Copilot
-    provider connects to the external runtime via the SDK's
-    ``RuntimeConnection.for_uri(...)`` — no child ``copilot`` process is
-    spawned. Agents share the authenticated runtime process while retaining
-    separate SDK sessions. This is the recommended way to run Conductor inside
-    an external orchestrator that already owns an authenticated
-    ``copilot --headless`` process.
+    Accepts ``"port"``, ``"host:port"``, ``"[ipv6]:port"`` or
+    ``"http://host:port"``. When set, the Copilot provider attaches to the
+    external runtime via the SDK's ``RuntimeConnection.for_tcp(...)`` — no
+    child ``copilot`` process is spawned. The runtime must speak SDK protocol
+    4 (Copilot CLI 1.0.113 or later). Agents share the authenticated runtime
+    process while retaining separate SDK sessions. This is the recommended way
+    to run Conductor inside an external orchestrator that already owns an
+    authenticated ``copilot --headless`` process.
 
     Falls back to the ``COPILOT_PROVIDER_RUNTIME_URL`` environment variable
     when not set in YAML. May be combined with custom model-provider routing:

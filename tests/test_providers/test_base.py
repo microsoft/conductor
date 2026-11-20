@@ -314,8 +314,8 @@ class TestSuppressMcpServersContract:
 
         # Control: both sources reach the session by default.
         default = session_kwargs(extra_mcp_servers=plugin)
-        assert set(default["mcp_servers"]) == {"workflow-srv", "plugin-srv"}
+        assert set(default["mcp"]["servers"]) == {"workflow-srv", "plugin-srv"}
 
         # Suppressed: neither does.
         suppressed = session_kwargs(extra_mcp_servers=plugin, suppress_mcp_servers=True)
-        assert "mcp_servers" not in suppressed or not suppressed["mcp_servers"]
+        assert not suppressed.get("mcp", {}).get("servers")

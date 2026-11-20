@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from copilot.client import RuntimeConnection
 
 from conductor.config.schema import ProviderSettings
 from conductor.providers.copilot import CopilotProvider
@@ -67,11 +68,15 @@ def test_build_client_passes_latched_http_telemetry(
 
     # Then: the SDK gets the run-latched endpoint, protocol, and capture policy.
     client_factory.assert_called_once_with(
-        telemetry={
-            "otlp_endpoint": "http://collector-one:4318",
-            "otlp_protocol": protocol,
-            "capture_content": True,
-        }
+        mode="coding-agent",
+        runtime=RuntimeConnection.for_spawned_stdio(),
+        observability={
+            "telemetry": {
+                "otlp_endpoint": "http://collector-one:4318",
+                "otlp_protocol": protocol,
+                "capture_content": True,
+            }
+        },
     )
     telemetry_provider.shutdown()
 
@@ -93,7 +98,8 @@ def test_build_client_omits_grpc_telemetry_and_warns_once(
     CopilotProvider()._build_client()
 
     # Then: neither constructor receives telemetry and the actionable warning occurs once.
-    assert client_factory.call_args_list == [call(), call()]
+    spawned = call(mode="coding-agent", runtime=RuntimeConnection.for_spawned_stdio())
+    assert client_factory.call_args_list == [spawned, spawned]
     assert (
         sum(
             "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in record.message
@@ -121,8 +127,10 @@ def test_build_client_omits_telemetry_when_otel_sdk_is_disabled(
     # When: a client is built after telemetry setup declined the disabled SDK.
     assert CopilotProvider()._build_client() is client
 
-    # Then: the default SDK constructor remains argument-free.
-    client_factory.assert_called_once_with()
+    # Then: the SDK constructor gets only the spawned-runtime defaults, no observability.
+    client_factory.assert_called_once_with(
+        mode="coding-agent", runtime=RuntimeConnection.for_spawned_stdio()
+    )
 
 
 def test_build_client_warns_again_after_telemetry_reset(
@@ -168,7 +176,7 @@ def test_runtime_connection_never_receives_telemetry(
     )
     connection = object()
     runtime_connection = MagicMock()
-    runtime_connection.for_uri.return_value = connection
+    runtime_connection.for_tcp.return_value = connection
     client = object()
     client_factory = MagicMock(return_value=client)
     monkeypatch.setattr(copilot_mod, "RuntimeConnection", runtime_connection)
@@ -180,6 +188,6 @@ def test_runtime_connection_never_receives_telemetry(
     # When: a telemetry-active provider connects to an external Copilot runtime.
     assert provider._build_client() is client
 
-    # Then: connection construction remains the only SDK constructor argument.
-    client_factory.assert_called_once_with(connection=connection)
+    # Then: the mode and attached connection remain the only SDK constructor arguments.
+    client_factory.assert_called_once_with(mode="coding-agent", runtime=connection)
     telemetry_provider.shutdown()

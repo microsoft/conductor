@@ -208,8 +208,8 @@ async def test_execute_uses_owned_sdk_and_native_shutdown(
     assert methods[0] == "connect" and methods[-1] == "runtime.shutdown"
     assert any(entry["event"] == "shutdown-replied" for entry in wire)
     create = next(entry for entry in wire if entry.get("method") == "session.create")
-    assert create["params"]["availableTools"] == []
-    assert create["params"]["gitHubToken"] == "fixture-session-token"
+    assert create["params"]["tools"]["availableTools"] == []
+    assert create["params"]["github"]["token"] == "fixture-session-token"
     spawn = wire[0]
     assert spawn["cwd"] == definition.working_dir
     assert "--stdio" in spawn["argv"]
@@ -801,7 +801,7 @@ async def test_routing_preference_reaches_wire_and_survives_continuation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # Requirement: the real SDK serializes the preference as camelCase capi on create,
+    # Requirement: the real SDK serializes the preference as camelCase github.capi on create,
     # and a managed continuation resumes with the same effective preference.
     monkeypatch.setenv("COPILOT_FIXTURE_MODE", "interrupt")
     provider = CopilotProvider()
@@ -823,8 +823,8 @@ async def test_routing_preference_reaches_wire_and_survives_continuation(
     create = next(item for item in calls if item["method"] == "session.create")
     resume = next(item for item in calls if item["method"] == "session.resume")
     assert create["params"]["model"] == "fusion"
-    assert create["params"]["capi"] == {"fusionTier": "high"}
-    assert resume["params"]["capi"] == {"fusionTier": "high"}
+    assert create["params"]["github"]["capi"] == {"fusionTier": "high"}
+    assert resume["params"]["github"]["capi"] == {"fusionTier": "high"}
 
 
 async def test_unset_preference_is_absent_from_wire(
@@ -840,4 +840,4 @@ async def test_unset_preference_is_absent_from_wire(
         for item in wire
         if item.get("method") == "session.create"
     )
-    assert "capi" not in create["params"]
+    assert "capi" not in create["params"].get("github", {})

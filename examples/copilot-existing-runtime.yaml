@@ -3,8 +3,9 @@
 # By default conductor's Copilot provider spawns its own nested `copilot`
 # runtime process to execute agents. This example instead points conductor
 # at an EXISTING runtime that some other process started in server mode
-# (e.g. `copilot --headless --port 3000`). Conductor connects to that runtime
-# via the SDK's `RuntimeConnection.for_uri(...)`. Agents share the authenticated
+# (e.g. `copilot --headless --port 3000`). Conductor attaches to that runtime
+# via the SDK's `RuntimeConnection.for_tcp(...)`. The runtime must be Copilot
+# CLI 1.0.113 or later (SDK protocol 4). Agents share the authenticated
 # runtime process but keep separate SDK sessions; no nested `copilot` process
 # is spawned.
 #

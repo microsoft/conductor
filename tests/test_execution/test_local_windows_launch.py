@@ -1200,13 +1200,16 @@ async def test_windows_real_copilot_sdk_preserves_bare_node_prefix_and_appended_
             "copilot", ProcessLaunchSpec(("node", str(script)), env, str(native.work))
         )
         client = CopilotClient(
-            connection=RuntimeConnection.for_stdio(path=launch.argv[0], args=("--literal", "")),
-            working_directory=str(native.work),
-            env=env,
-            github_token="hermetic-token",
-            use_logged_in_user=False,
-            session_idle_timeout_seconds=17,
-            base_directory=str(native.root / "copilot-home"),
+            mode="coding-agent",
+            runtime=RuntimeConnection.for_spawned_stdio(
+                path=launch.argv[0],
+                args=("--literal", ""),
+                env=env,
+                working_directory=str(native.work),
+                session_idle_timeout_seconds=17,
+                base_directory=str(native.root / "copilot-home"),
+            ),
+            github={"token": "hermetic-token", "use_logged_in_user": False},
         )
         try:
             await client.start()
@@ -1223,8 +1226,6 @@ async def test_windows_real_copilot_sdk_preserves_bare_node_prefix_and_appended_
             "",
             "--headless",
             "--no-auto-update",
-            "--log-level",
-            "info",
             "--auth-token-env",
             "COPILOT_SDK_AUTH_TOKEN",
             "--no-auto-login",

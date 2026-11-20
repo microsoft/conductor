@@ -148,7 +148,7 @@ class TestMcpServerWorkingDirectoryStamping:
 
         await _execute(provider, _make_agent("a1", working_dir=str(tmp_path)))
 
-        stamped = captured["mcp_servers"]["fs"]
+        stamped = captured["mcp"]["servers"]["fs"]
         assert stamped["working_directory"] == str(tmp_path)
 
     @pytest.mark.asyncio
@@ -166,9 +166,9 @@ class TestMcpServerWorkingDirectoryStamping:
 
         await _execute(provider, _make_agent("a1", working_dir=str(tmp_path)))
 
-        assert "working_directory" not in captured["mcp_servers"]["remote_http"]
-        assert "working_directory" not in captured["mcp_servers"]["remote_sse"]
-        assert captured["mcp_servers"]["local"]["working_directory"] == str(tmp_path)
+        assert "working_directory" not in captured["mcp"]["servers"]["remote_http"]
+        assert "working_directory" not in captured["mcp"]["servers"]["remote_sse"]
+        assert captured["mcp"]["servers"]["local"]["working_directory"] == str(tmp_path)
 
     @pytest.mark.asyncio
     async def test_local_type_server_stamped(self, tmp_path: Any) -> None:
@@ -183,7 +183,7 @@ class TestMcpServerWorkingDirectoryStamping:
 
         await _execute(provider, _make_agent("a1", working_dir=str(tmp_path)))
 
-        assert captured["mcp_servers"]["fs"]["working_directory"] == str(tmp_path)
+        assert captured["mcp"]["servers"]["fs"]["working_directory"] == str(tmp_path)
 
     @pytest.mark.asyncio
     async def test_shared_mcp_servers_dict_not_mutated(self, tmp_path: Any) -> None:
@@ -237,8 +237,8 @@ class TestResumeWorkingDirectory:
         call = resume_session.call_args
         assert call.args[0] == "sid-old"
         assert call.kwargs["working_directory"] == str(tmp_path)
-        assert call.kwargs["mcp_servers"]["fs"]["working_directory"] == str(tmp_path)
-        assert "working_directory" not in call.kwargs["mcp_servers"]["remote"]
+        assert call.kwargs["mcp"]["servers"]["fs"]["working_directory"] == str(tmp_path)
+        assert "working_directory" not in call.kwargs["mcp"]["servers"]["remote"]
         create_session.assert_not_called()
 
     @pytest.mark.asyncio

@@ -462,9 +462,9 @@ class TestValidatorCopilotRouting:
         session_kwargs = client.create_session.call_args.kwargs
         assert session_kwargs["model"] == grader_model
         if expected_capi is None:
-            assert "capi" not in session_kwargs
+            assert "capi" not in session_kwargs.get("github", {})
         else:
-            assert session_kwargs["capi"] == expected_capi
+            assert session_kwargs["github"]["capi"] == expected_capi
         assert outcome.passed is False
         assert outcome.errored is False
         assert outcome.issues == ["missing edge case"]

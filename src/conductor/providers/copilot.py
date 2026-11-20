@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import ipaddress
 import json
 import logging
 import math
@@ -113,6 +114,148 @@ _MANAGED_COPILOT: ContextVar[_ManagedCopilotInvocation | None] = ContextVar(
 _COPILOT_USD_PER_CREDIT: float = 0.01
 
 
+# SDK 2.x requires an explicit client mode. ``coding-agent`` (renamed from the
+# 1.x default ``copilot-cli``) keeps the CLI's built-in coding tools, which
+# Conductor agents rely on unless their ``tools:`` allowlist narrows them.
+_COPILOT_CLIENT_MODE = "coding-agent"
+
+# Name of the single BYOK connection that ``runtime.provider`` custom routing
+# registers. Must not contain "/" (SDK 2.x qualifies models as ``name/model``).
+_BYOK_PROVIDER_NAME = "conductor"
+
+# Conductor builds each session's options as one flat mapping, which managed
+# continuations also store for a later resume. SDK 2.x groups most of them
+# under nested keyword arguments, so they are translated only at the SDK
+# boundary by ``_sdk_session_options``.
+_SDK_SESSION_ROOT_OPTIONS = frozenset({"model", "working_directory", "system_message"})
+_SDK_SESSION_GROUPED_OPTIONS: dict[str, tuple[str, str]] = {
+    "on_permission_request": ("permissions", "on_request"),
+    "streaming": ("events", "streaming"),
+    "available_tools": ("tools", "available_tools"),
+    "large_output": ("tools", "large_output"),
+    "mcp_servers": ("mcp", "servers"),
+    "skill_directories": ("skills", "directories"),
+    "custom_agents": ("agents", "definitions"),
+    "reasoning_effort": ("inference", "reasoning_effort"),
+    "context_tier": ("inference", "context_tier"),
+    "capi": ("github", "capi"),
+    "github_token": ("github", "token"),
+}
+
+
+def _sdk_session_options(options: dict[str, Any]) -> dict[str, Any]:
+    """Translate Conductor's flat session options to SDK 2.x keyword arguments.
+
+    Used for every ``create_session`` and ``resume_session`` call. The singular
+    1.x ``provider`` option no longer exists: custom routing becomes one named
+    BYOK connection with Copilot API models disabled, and ``byok_model`` is
+    registered on it under its own name and selected as ``conductor/<name>``.
+    SDK 2.x would otherwise read a slash-containing name such as
+    ``org/model`` as a provider prefix, or ``auto`` as Copilot routing.
+    Resume needs the same registration to restore that selection.
+
+    Raises:
+        ValueError: For an option this translation does not know, so a new
+            session option cannot be silently dropped.
+    """
+    translated: dict[str, Any] = {}
+    for key, value in options.items():
+        if key in _SDK_SESSION_ROOT_OPTIONS:
+            translated[key] = value
+        elif key in _SDK_SESSION_GROUPED_OPTIONS:
+            group, name = _SDK_SESSION_GROUPED_OPTIONS[key]
+            translated.setdefault(group, {})[name] = value
+        elif key not in ("provider", "byok_model"):
+            raise ValueError(f"Unsupported Copilot session option: {key!r}")
+    provider = options.get("provider")
+    if provider is not None:
+        inference = translated.setdefault("inference", {})
+        inference["providers"] = [{**provider, "name": _BYOK_PROVIDER_NAME}]
+        inference["default_provider"] = _BYOK_PROVIDER_NAME
+        if model := options.get("byok_model"):
+            inference["models"] = [{"provider": _BYOK_PROVIDER_NAME, "id": model}]
+            if "model" in translated:
+                translated["model"] = f"{_BYOK_PROVIDER_NAME}/{model}"
+        github = translated.setdefault("github", {})
+        github["capi"] = {**(github.get("capi") or {}), "enabled": False}
+    return translated
+
+
+def _parse_runtime_url(url: str) -> tuple[str, int]:
+    """Split a ``runtime_url`` into the host and port SDK 2.x attaches to.
+
+    Accepts the forms SDK 1.x's ``RuntimeConnection.for_uri`` did: ``port``,
+    ``host:port``, ``[ipv6]:port`` and ``http://host:port``. The transport is
+    plaintext TCP, so ``https://`` is refused rather than silently downgraded.
+
+    Raises:
+        ProviderError: If the value is not one of those forms.
+    """
+
+    def invalid(reason: str) -> ProviderError:
+        return ProviderError(
+            f"Invalid runtime_url {url!r}: {reason}",
+            suggestion='Use "port", "host:port", "[ipv6]:port" or "http://host:port".',
+            is_retryable=False,
+        )
+
+    if url.lower().startswith("https://"):
+        raise invalid("the Copilot runtime connection is plaintext TCP, not TLS")
+    address = url[len("http://") :] if url.lower().startswith("http://") else url
+    host = "localhost"
+    if address.isdigit():
+        port_text = address
+    elif address.startswith("["):
+        host, separator, port_text = address[1:].partition("]:")
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            raise invalid("expected [ipv6]:port") from None
+        if not separator:
+            raise invalid("expected [ipv6]:port")
+    else:
+        parts = address.split(":")
+        if len(parts) != 2:
+            raise invalid("expected host:port")
+        host = parts[0] or host
+        port_text = parts[1]
+    if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+        raise invalid("the port must be a number from 1 through 65535")
+    return host, int(port_text)
+
+
+def _protocol_mismatch_error(exc: BaseException) -> ProviderError | None:
+    """Explain a runtime whose SDK protocol this SDK cannot speak, else None.
+
+    SDK 2.x speaks only protocol 4 (Copilot CLI 1.0.113 and later). An older
+    CLI is reached only when ``COPILOT_CLI_PATH`` or ``runtime_url`` points at
+    one; retrying cannot help, so the error is not retryable.
+    """
+    message = str(exc)
+    if "protocol version mismatch" not in message.lower():
+        return None
+    return ProviderError(
+        f"The Copilot runtime is incompatible with this Conductor: {message}",
+        suggestion=(
+            "Conductor uses Copilot SDK 2.x, which needs Copilot CLI 1.0.113 or "
+            "later (SDK protocol 4). Update the CLI that COPILOT_CLI_PATH or "
+            "runtime_url points at, or unset COPILOT_CLI_PATH so the SDK downloads "
+            "a matching CLI."
+        ),
+        is_retryable=False,
+    )
+
+
+async def _start_sdk_client(client: Any) -> None:
+    """Start an SDK client, turning a protocol mismatch into a clear error."""
+    try:
+        await client.start()
+    except RuntimeError as exc:
+        if (mismatch := _protocol_mismatch_error(exc)) is not None:
+            raise mismatch from exc
+        raise
+
+
 def _build_client_telemetry() -> dict[str, Any] | None:
     # Provider registry lifetime is run-scoped; holding a registry across telemetry-state changes is not a supported embedding pattern.
     if not guards.is_telemetry_active():
@@ -159,9 +302,11 @@ _IDLE_IGNORED_EVENTS: frozenset[str] = frozenset(
     }
 )
 
-# Try to import the Copilot SDK
+# Try to import the Copilot SDK (the ``microsoft-copilot-sdk`` distribution,
+# imported as ``copilot``).
 try:
     from copilot import CopilotClient
+    from copilot.client import RuntimeConnection
     from copilot.session import (
         PermissionDecisionUserNotAvailable,
         PermissionHandler,
@@ -172,18 +317,10 @@ try:
 except ImportError:
     COPILOT_SDK_AVAILABLE = False
     CopilotClient = None  # type: ignore[misc, assignment]
+    RuntimeConnection = None  # type: ignore[misc, assignment]
     PermissionHandler = None  # type: ignore[misc, assignment]
     PermissionNoResult = None  # type: ignore[misc, assignment]
     PermissionDecisionUserNotAvailable = None  # type: ignore[misc, assignment]
-
-# RuntimeConnection was added to the SDK after CopilotClient; import it
-# separately so an older-but-present SDK still enables the default nested-spawn
-# provider. A runtime connection is only required when explicitly requested,
-# and that path raises a clear ProviderError if RuntimeConnection is missing.
-try:
-    from copilot.client import RuntimeConnection
-except ImportError:
-    RuntimeConnection = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -553,9 +690,10 @@ class CopilotProvider(AgentProvider):
                 ``None`` to send no value.
             provider_settings: Optional structured provider settings from
                 ``runtime.provider``. When ``has_custom_routing()`` is True,
-                the resolved SDK ``ProviderConfig`` is attached to every
+                the resolved provider config is attached to every
                 ``create_session`` call (both agent execution and dialog
-                turns), enabling custom OpenAI-compatible / Azure / Anthropic
+                turns) as the session's named BYOK connection, enabling custom
+                OpenAI-compatible / Azure / Anthropic
                 endpoints. ``runtime_url`` instead selects an existing Copilot
                 CLI process and can be combined with that routing. Env-var fallbacks
                 (``COPILOT_PROVIDER_BASE_URL`` → ``OPENAI_BASE_URL``,
@@ -567,13 +705,13 @@ class CopilotProvider(AgentProvider):
                 per-result character limit and spill-to-file behavior for MCP
                 tool outputs. ``None`` means the default configuration is used.
             github_token: GitHub token used to authenticate each session with
-                the Copilot SDK in memory, via the ``github_token`` parameter
-                on ``create_session`` / ``resume_session`` (the SDK's
-                ``gitHubToken`` connect payload sent over the RPC channel),
+                the Copilot SDK in memory, via the session-scoped
+                ``github.token`` option on ``create_session`` /
+                ``resume_session`` (sent over the RPC channel),
                 so the runtime uses GitHub Copilot's own model routing
                 (Copilot capacity) rather than a custom endpoint. This is
                 deliberately *not* passed to the ``CopilotClient`` constructor:
-                the SDK forwards a constructor-level ``github_token`` to the
+                the SDK forwards a client-level ``github.token`` to the
                 spawned runtime as a ``COPILOT_SDK_AUTH_TOKEN`` environment
                 variable, which is not the in-memory delivery this provider
                 requires. Applied to every session-creation call site (main
@@ -784,7 +922,10 @@ class CopilotProvider(AgentProvider):
             )
 
     def _resolve_sdk_provider_config(self) -> dict[str, Any] | None:
-        """Build the SDK ``ProviderConfig`` dict to forward, or ``None``.
+        """Build the custom-routing provider config to forward, or ``None``.
+
+        The result is the connection half of an SDK ``NamedProviderConfig``;
+        ``_sdk_session_options`` names it and makes it the session default.
 
         Returns ``None`` when no structured ``runtime.provider`` was
         configured, or when the configured object did not activate custom
@@ -886,22 +1027,26 @@ class CopilotProvider(AgentProvider):
 
         return cfg
 
-    def _apply_provider_config(self, session_kwargs: dict[str, Any]) -> None:
+    def _apply_provider_config(self, session_kwargs: dict[str, Any], model: str) -> None:
         """Attach the resolved SDK provider config to ``session_kwargs``.
 
         Called from every ``create_session`` / ``resume_session`` site (main
         agent execution and dialog turns) so all sessions for this provider
-        instance hit the same endpoint.
+        instance hit the same endpoint. ``model`` is the session's model, which
+        custom routing registers on the connection (see
+        ``_sdk_session_options``); resume carries it because a resumed session
+        must find its registered model again.
         """
         provider_cfg = self._resolve_sdk_provider_config()
         if provider_cfg is not None:
             session_kwargs["provider"] = provider_cfg
+            session_kwargs["byok_model"] = model
 
     def _apply_github_token(self, session_kwargs: dict[str, Any]) -> None:
         """Attach the forwarded GitHub token to a session-creation call.
 
-        Sets ``session_kwargs["github_token"]`` so the SDK includes it in the
-        ``gitHubToken`` field of the in-memory ``create_session`` /
+        Sets ``session_kwargs["github_token"]``, which reaches the SDK as the
+        session's ``github.token`` option in the in-memory ``create_session`` /
         ``resume_session`` RPC payload — per-session authentication that
         never touches the spawned runtime's environment. Called from every
         session-creation site (main agent execution, resume, and dialog
@@ -1429,8 +1574,8 @@ class CopilotProvider(AgentProvider):
         # Use the real Copilot SDK
         if not COPILOT_SDK_AVAILABLE:
             raise ProviderError(
-                "GitHub Copilot SDK is not installed",
-                suggestion="Install with: pip install github-copilot-sdk",
+                "Copilot SDK (microsoft-copilot-sdk) is not installed",
+                suggestion="Install with: pip install microsoft-copilot-sdk",
                 is_retryable=False,
             )
 
@@ -1538,7 +1683,7 @@ class CopilotProvider(AgentProvider):
 
             # Apply custom provider routing (Ollama / vLLM / Azure / etc.)
             # when runtime.provider opted into it.
-            self._apply_provider_config(session_kwargs)
+            self._apply_provider_config(session_kwargs, model)
 
             # Forward a GitHub token in memory (create_session's github_token
             # param) so the session authenticates against Copilot's own
@@ -1642,12 +1787,12 @@ class CopilotProvider(AgentProvider):
                             resume_kwargs["skill_directories"] = list(skill_directories)
                         if custom_agents:
                             resume_kwargs["custom_agents"] = [dict(spec) for spec in custom_agents]
-                        self._apply_provider_config(resume_kwargs)
+                        self._apply_provider_config(resume_kwargs, model)
                         self._apply_github_token(resume_kwargs)
                         if capi is not None:
                             resume_kwargs["capi"] = dict(capi)
                         session = await self._session_client().resume_session(
-                            resume_sid, **resume_kwargs
+                            resume_sid, **_sdk_session_options(resume_kwargs)
                         )
                         logger.info(
                             f"Resumed Copilot session {resume_sid} for agent '{agent.name}'"
@@ -1661,7 +1806,9 @@ class CopilotProvider(AgentProvider):
 
             # Fall back to creating a new session
             if session is None:
-                session = await self._session_client().create_session(**session_kwargs)
+                session = await self._session_client().create_session(
+                    **_sdk_session_options(session_kwargs)
+                )
 
             # Track session ID and resolved cwd for checkpoint persistence
             sid = getattr(session, "session_id", None)
@@ -2417,7 +2564,7 @@ class CopilotProvider(AgentProvider):
 
             async def resume() -> AgentOutput:
                 resumed = await self._session_client().resume_session(
-                    session.session_id, **session.resume_kwargs
+                    session.session_id, **_sdk_session_options(session.resume_kwargs)
                 )
                 return await self.send_followup(
                     resumed,
@@ -3161,7 +3308,7 @@ class CopilotProvider(AgentProvider):
                 self._client = self._build_client()
                 self._owned_legacy_client = self._client
             if not self._started:
-                await self._client.start()
+                await _start_sdk_client(self._client)
                 self._started = True
 
                 # Ensure subprocess pipes are in blocking mode to prevent
@@ -3338,7 +3485,7 @@ class CopilotProvider(AgentProvider):
         self._started = False
 
         new_client = self._build_client()
-        await new_client.start()
+        await _start_sdk_client(new_client)
         self._client = new_client
         self._owned_legacy_client = new_client
         self._started = True
@@ -3348,60 +3495,63 @@ class CopilotProvider(AgentProvider):
         """Construct the Copilot SDK client.
 
         When a runtime connection is resolved (via ``runtime_url`` /
-        ``COPILOT_PROVIDER_RUNTIME_URL``), connect to that already-running
-        runtime instead of spawning a nested ``copilot`` child process. The
-        SDK's ``start()`` skips process spawning for URI connections and its
-        ``stop()`` leaves the externally-owned server running, so Conductor
-        reuses the authenticated runtime process while creating a separate SDK
-        session for each agent.
+        ``COPILOT_PROVIDER_RUNTIME_URL``), attach to that already-running
+        runtime over TCP instead of spawning a nested ``copilot`` child
+        process. The SDK's ``start()`` skips process spawning for attached
+        connections and its ``stop()`` leaves the externally-owned server
+        running, so Conductor reuses the authenticated runtime process while
+        creating a separate SDK session for each agent.
 
-        Otherwise a nested runtime is spawned via ``CopilotClient()`` with
-        optional HTTP OTLP telemetry. A ``github_token`` supplied at
-        construction is deliberately *not* passed here: the SDK's constructor-level
-        ``github_token`` is exported to the spawned runtime as a
-        ``COPILOT_SDK_AUTH_TOKEN`` environment variable, not delivered
-        in-memory. Instead, the token is forwarded per-session via
-        ``_apply_github_token`` on each ``create_session`` / ``resume_session``
-        call, which sends it as the in-memory ``gitHubToken`` RPC payload so
-        the runtime authenticates with it and, with no ``base_url``
-        configured, uses Copilot's own model routing (Copilot capacity)
-        rather than a BYOK endpoint.
+        Otherwise a nested runtime is spawned with
+        ``RuntimeConnection.for_spawned_stdio()`` and optional HTTP OTLP
+        telemetry. SDK 2.x would host the runtime in this process by default;
+        Conductor keeps it in a child process on purpose, because dead-runtime
+        recovery, managed workspaces and crash isolation all depend on owning
+        that process, and the child inherits this process's environment
+        (``COPILOT_CLI_PATH``, CAPI and integration-id variables) as before.
+        A ``github_token`` supplied at construction is deliberately *not*
+        passed here: the SDK's client-level ``github.token`` is exported to the
+        spawned runtime as a ``COPILOT_SDK_AUTH_TOKEN`` environment variable,
+        not delivered in-memory. Instead, the token is forwarded per-session
+        via ``_apply_github_token`` on each ``create_session`` /
+        ``resume_session`` call, which sends it as the session's in-memory
+        ``github.token`` RPC option so the runtime authenticates with it and,
+        with no ``base_url`` configured, uses Copilot's own model routing
+        (Copilot capacity) rather than a BYOK endpoint.
         """
+        assert CopilotClient is not None and RuntimeConnection is not None
         connection = self._resolve_runtime_connection()
         if connection is None:
+            options: dict[str, Any] = {
+                "mode": _COPILOT_CLIENT_MODE,
+                "runtime": RuntimeConnection.for_spawned_stdio(),
+            }
             telemetry = _build_client_telemetry()
             if telemetry is not None:
-                return CopilotClient(
-                    telemetry={
+                options["observability"] = {
+                    "telemetry": {
                         "otlp_endpoint": telemetry["otlp_endpoint"],
                         "otlp_protocol": telemetry["otlp_protocol"],
                         "capture_content": telemetry["capture_content"],
                     }
-                )
-            if guards.is_telemetry_active() and guards.warn_copilot_grpc_once():
+                }
+            elif guards.is_telemetry_active() and guards.warn_copilot_grpc_once():
                 logger.warning(
                     "Copilot native OpenTelemetry spans require HTTP OTLP; set "
                     "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf."
                 )
-            return CopilotClient()
+            return CopilotClient(**options)
 
         url, token = connection
-        if RuntimeConnection is None:
-            raise ProviderError(
-                "Connecting to an existing Copilot runtime (runtime_url) requires a "
-                "Copilot SDK that provides RuntimeConnection, which is unavailable in "
-                "the installed SDK version.",
-                suggestion=(
-                    "Upgrade the copilot SDK, or unset runtime_url / "
-                    "COPILOT_PROVIDER_RUNTIME_URL to spawn a nested runtime instead."
-                ),
-                is_retryable=False,
-            )
+        host, port = _parse_runtime_url(url)
         logger.info(
             "Connecting to existing Copilot runtime at %s (no nested runtime spawned)",
             url,
         )
-        return CopilotClient(connection=RuntimeConnection.for_uri(url, connection_token=token))
+        return CopilotClient(
+            mode=_COPILOT_CLIENT_MODE,
+            runtime=RuntimeConnection.for_tcp(host, port, connection_token=token),
+        )
 
     def _managed_invocation(self) -> _ManagedCopilotInvocation | None:
         invocation = _MANAGED_COPILOT.get()
@@ -3473,14 +3623,14 @@ class CopilotProvider(AgentProvider):
             token = _MANAGED_COPILOT.set(invocation)
             try:
                 assert RuntimeConnection is not None and CopilotClient is not None
-                connection = RuntimeConnection.for_stdio()
+                connection = RuntimeConnection.for_spawned_stdio(working_directory=invocation.cwd)
                 telemetry = _build_client_telemetry()
                 options: dict[str, Any] = {
-                    "connection": connection,
-                    "working_directory": invocation.cwd,
+                    "mode": _COPILOT_CLIENT_MODE,
+                    "runtime": connection,
                 }
                 if telemetry is not None:
-                    options["telemetry"] = telemetry
+                    options["observability"] = {"telemetry": telemetry}
                 elif guards.is_telemetry_active() and guards.warn_copilot_grpc_once():
                     logger.warning(
                         "Copilot native OpenTelemetry spans require HTTP OTLP; set OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf."
@@ -3514,7 +3664,7 @@ class CopilotProvider(AgentProvider):
                             invocation.process = process
 
                 invocation.client._start_cli_server = start_owned_stdio
-                await invocation.client.start()
+                await _start_sdk_client(invocation.client)
                 return await operation()
             finally:
                 # stop() discards the exact JSON-RPC reader references, even
@@ -3800,8 +3950,8 @@ class CopilotProvider(AgentProvider):
 
         if not COPILOT_SDK_AVAILABLE:
             raise ProviderError(
-                "GitHub Copilot SDK is not installed",
-                suggestion="Install with: pip install github-copilot-sdk",
+                "Copilot SDK (microsoft-copilot-sdk) is not installed",
+                suggestion="Install with: pip install microsoft-copilot-sdk",
                 is_retryable=False,
             )
 
@@ -3902,7 +4052,7 @@ class CopilotProvider(AgentProvider):
 
             # Honor the same custom provider routing as agent sessions so
             # dialog turns hit the same endpoint as agent execution.
-            self._apply_provider_config(dialog_kwargs)
+            self._apply_provider_config(dialog_kwargs, dialog_kwargs["model"])
 
             # Forward a GitHub token in memory, same as agent sessions (E9).
             self._apply_github_token(dialog_kwargs)
@@ -3942,7 +4092,9 @@ class CopilotProvider(AgentProvider):
                     "Setting capi=%s for dialog turn (model=%s)", capi, dialog_kwargs["model"]
                 )
 
-            session = await self._session_client().create_session(**dialog_kwargs)
+            session = await self._session_client().create_session(
+                **_sdk_session_options(dialog_kwargs)
+            )
 
             response_content = ""
             done = asyncio.Event()

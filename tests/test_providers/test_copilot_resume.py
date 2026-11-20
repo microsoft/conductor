@@ -164,9 +164,9 @@ class TestSessionResumeFallback:
 
         mock_client.resume_session.assert_called_once_with(
             resumed_sid,
-            on_permission_request=CopilotProvider._default_permission_handler,
+            permissions={"on_request": CopilotProvider._default_permission_handler},
             working_directory=os.getcwd(),
-            large_output={"enabled": True, "max_size_bytes": 50000},
+            tools={"large_output": {"enabled": True, "max_size_bytes": 50000}},
         )
 
         mock_client.create_session.assert_not_called()
@@ -223,9 +223,9 @@ class TestSessionResumeFallback:
 
         mock_client.resume_session.assert_called_once_with(
             resumed_sid,
-            on_permission_request=CopilotProvider._default_permission_handler,
+            permissions={"on_request": CopilotProvider._default_permission_handler},
             working_directory=os.getcwd(),
-            large_output={"enabled": True, "max_size_bytes": 50000},
+            tools={"large_output": {"enabled": True, "max_size_bytes": 50000}},
         )
         mock_client.create_session.assert_not_called()
         assert any(
@@ -273,9 +273,9 @@ class TestSessionResumeFallback:
 
         mock_client.resume_session.assert_called_once_with(
             "stale-sid",
-            on_permission_request=CopilotProvider._default_permission_handler,
+            permissions={"on_request": CopilotProvider._default_permission_handler},
             working_directory=os.getcwd(),
-            large_output={"enabled": True, "max_size_bytes": 50000},
+            tools={"large_output": {"enabled": True, "max_size_bytes": 50000}},
         )
         mock_client.create_session.assert_called_once()
         # Session ID should now reflect the new session

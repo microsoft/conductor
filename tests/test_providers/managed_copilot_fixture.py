@@ -70,7 +70,7 @@ def serve() -> None:
             if os.environ.get("COPILOT_FIXTURE_MODE") == "fail":
                 error = {"code": -32001, "message": "fixture handshake refused"}
             else:
-                result = {"ok": True, "protocolVersion": 3, "version": "local-fixture"}
+                result = {"ok": True, "protocolVersion": 4, "version": "local-fixture"}
         elif method == "session.create":
             sid = params.get("sessionId", uuid4().hex)
             state = sessions / sha256(sid.encode()).hexdigest()
