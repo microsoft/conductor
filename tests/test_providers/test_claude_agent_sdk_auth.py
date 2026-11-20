@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -1004,17 +1005,23 @@ class TestNeutralizedCredentialWarning:
         assert "sk-ant-super-secret" not in joined
         assert "oat" not in joined.split()
 
+    @staticmethod
+    def _conductor_records(caplog) -> list[logging.LogRecord]:
+        # A client leaked by an earlier test can be garbage-collected here; the
+        # anthropic SDK then logs its failed aclose() on this test's loop.
+        return [r for r in caplog.records if r.name.startswith("conductor")]
+
     @pytest.mark.asyncio
     async def test_api_key_mode_does_not_report_its_own_key(self, caplog) -> None:
         with caplog.at_level("WARNING"):
             await self._execute("api_key", {"ANTHROPIC_API_KEY": "sk-ant-fake"})
-        assert not caplog.records
+        assert not self._conductor_records(caplog)
 
     @pytest.mark.asyncio
     async def test_no_warning_when_nothing_conflicts(self, caplog) -> None:
         with caplog.at_level("WARNING"):
             await self._execute("subscription", {"CLAUDE_CODE_USE_VERTEX": "   "})
-        assert not caplog.records
+        assert not self._conductor_records(caplog)
 
 
 @pytest.mark.claude_auth_readiness_mocked
