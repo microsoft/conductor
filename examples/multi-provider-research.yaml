@@ -39,7 +39,7 @@ agents:
   # Research phase - uses Claude for strong reasoning capabilities
   - name: claude_researcher
     provider: claude           # Override: use Claude for this agent
-    model: claude-sonnet-4.5
+    model: claude-sonnet-4-6
     description: Research the topic and identify key concepts
     prompt: |
       Research the following topic and provide a comprehensive summary:
