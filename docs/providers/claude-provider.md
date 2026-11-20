@@ -43,11 +43,11 @@ workflow:
   name: my-workflow
   runtime:
     provider: claude  # Change from 'copilot' to 'claude'
-    default_model: claude-sonnet-4.5
+    default_model: claude-sonnet-4-6
 
 agents:
   - name: assistant
-    model: claude-sonnet-4.5
+    model: claude-sonnet-4-6
     prompt: |
       Answer the following question: {{ workflow.input.question }}
     output:
@@ -195,7 +195,7 @@ workflow:
       name: claude
       base_url: "https://litellm.internal.company.com"
       auth_token: "${GATEWAY_BEARER_TOKEN}"
-    default_model: claude-sonnet-4.5
+    default_model: claude-sonnet-4-6
 
 agents:
   - name: processor
@@ -215,7 +215,7 @@ workflow:
     provider:
       name: claude
       api_key: "${ANTHROPIC_API_KEY}"
-    default_model: claude-sonnet-4.5
+    default_model: claude-sonnet-4-6
 
 agents:
   - name: processor
@@ -232,9 +232,7 @@ Claude offers multiple model tiers optimized for different use cases. All curren
 
 | Model | Best For | Speed | Cost (Input/Output) | Max Output Tokens | Recommended Use |
 |-------|----------|-------|---------------------|-------------------|-----------------|
-| **claude-sonnet-4.5** | General purpose, most workflows | Medium | $3/$15 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | **Default recommendation** - stable, avoids deprecation |
-| claude-sonnet-4.5-20250929 | Latest features, cutting-edge | Medium | $3/$15 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | When you need the newest capabilities |
-| claude-sonnet-4.5-20241022 | Stable, well-tested | Medium | $3/$15 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | Production workloads requiring stability |
+| **claude-sonnet-4-6** | General purpose, most workflows | Medium | $3/$15 per MTok | 16384 default (configurable) | **Conductor default** |
 | claude-opus-4.5 | Complex reasoning, creative tasks | Slowest | $5/$25 per MTok | 16384 default (configurable; model caps are higher — e.g. 64000 on Sonnet 4.5) | Critical analysis, complex decision-making |
 | claude-haiku-4.5 | Simple tasks, high volume | Fastest | $1/$5 per MTok | 4096 | Classification, routing, simple Q&A |
 | claude-3-opus-20240229 | Legacy - complex reasoning | Slow | $15/$75 per MTok | 4096 | Legacy workflows (not recommended) |
@@ -245,8 +243,7 @@ Claude offers multiple model tiers optimized for different use cases. All curren
 
 Claude models follow different naming conventions:
 
-- **Latest stable**: `claude-sonnet-4.5` (recommended for stability)
-- **Claude 4.5 series**: `claude-sonnet-4.5-YYYYMMDD`
+- **Dateless model ID**: `claude-sonnet-4-6`; this identifies a model version, not an evergreen pointer.
 - **Claude 4 series**: `claude-opus-4.5-YYYYMMDD`
 - **Claude 3.x series**: `claude-3-5-sonnet-YYYYMMDD`, `claude-3-opus-YYYYMMDD`
 
@@ -254,10 +251,7 @@ The provider will log available models at startup and warn if your requested mod
 
 ### Choosing a Model
 
-**For most workflows**: Use `claude-sonnet-4.5`
-- Excellent balance of performance and cost
-- Automatic updates to latest stable version
-- No dated model deprecation risk
+**For most workflows**: Use `claude-sonnet-4-6`, the Conductor default. It preserves optional sampling and manual thinking settings used in this guide. Anthropic [retires Sonnet 4.5 and its dateless ID on November 30, 2026](https://platform.claude.com/docs/en/about-claude/model-deprecations#2026-09-30-claude-sonnet-45-model) and recommends Sonnet 5.5. When deciding whether to use 5.5, check its thinking and sampling settings before switching.
 
 **For simple, high-volume tasks**: Use `claude-haiku-4.5`
 - 3-5x faster than Sonnet
@@ -269,10 +263,7 @@ The provider will log available models at startup and warn if your requested mod
 - Better at following complex instructions
 - Worth the cost for critical workflows
 
-**For latest features**: Use dated model like `claude-sonnet-4.5-20250929`
-- Access to newest capabilities
-- More predictable behavior (no automatic updates)
-- May require migration when deprecated
+**For more model choices**: Check the [Anthropic model overview](https://platform.claude.com/docs/en/about-claude/models/overview). If you use a gateway, use the model ID that gateway serves.
 
 ### Example Configuration
 
@@ -280,7 +271,7 @@ The provider will log available models at startup and warn if your requested mod
 workflow:
   runtime:
     provider: claude
-    default_model: claude-sonnet-4.5
+    default_model: claude-sonnet-4-6
 
 agents:
   # Use default model
@@ -355,7 +346,7 @@ workflow:
   name: comprehensive-example
   runtime:
     provider: claude
-    default_model: claude-sonnet-4.5
+    default_model: claude-sonnet-4-6
     temperature: 0.7
     max_tokens: 4096
 
@@ -390,7 +381,7 @@ per agent with an `reasoning.effort` block:
 workflow:
   runtime:
     provider: claude
-    default_model: claude-sonnet-4.5
+    default_model: claude-sonnet-4-6
     default_reasoning_effort: medium
 
 agents:
@@ -490,7 +481,7 @@ curl https://api.anthropic.com/v1/messages \
   -H "x-api-key: $ANTHROPIC_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
-  -d '{"model":"claude-sonnet-4.5","max_tokens":100,"messages":[{"role":"user","content":"Hi"}]}'
+  -d '{"model":"claude-sonnet-4-6","max_tokens":100,"messages":[{"role":"user","content":"Hi"}]}'
 ```
 
 #### 2. Model Not Found
@@ -505,8 +496,7 @@ curl https://api.anthropic.com/v1/messages \
 **Valid model names**:
 ```yaml
 # Good
-default_model: claude-sonnet-4.5
-default_model: claude-sonnet-4.5-20250929
+default_model: claude-sonnet-4-6
 
 # Bad (typos)
 default_model: claude-3.5-sonnet  # Wrong: uses dot instead of dash
@@ -701,7 +691,7 @@ agents:
 
   # General analysis: Sonnet (balanced)
   - name: analyze
-    model: claude-sonnet-4.5
+    model: claude-sonnet-4-6
     prompt: "Analyze the following..."
 
   # Complex reasoning: Opus (only when necessary)
