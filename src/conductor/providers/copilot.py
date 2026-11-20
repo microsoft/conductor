@@ -148,9 +148,11 @@ def _sdk_session_options(options: dict[str, Any]) -> dict[str, Any]:
 
     Used for every ``create_session`` and ``resume_session`` call. The singular
     1.x ``provider`` option no longer exists: custom routing becomes one named
-    BYOK connection that is also the default for unqualified model names, with
-    Copilot API models disabled, so every model name still reaches the
-    configured endpoint as it did with SDK 1.x.
+    BYOK connection with Copilot API models disabled, and ``byok_model`` is
+    registered on it under its own name and selected as ``conductor/<name>``.
+    SDK 2.x would otherwise read a slash-containing name such as
+    ``org/model`` as a provider prefix, or ``auto`` as Copilot routing.
+    Resume needs the same registration to restore that selection.
 
     Raises:
         ValueError: For an option this translation does not know, so a new
@@ -163,13 +165,17 @@ def _sdk_session_options(options: dict[str, Any]) -> dict[str, Any]:
         elif key in _SDK_SESSION_GROUPED_OPTIONS:
             group, name = _SDK_SESSION_GROUPED_OPTIONS[key]
             translated.setdefault(group, {})[name] = value
-        elif key != "provider":
+        elif key not in ("provider", "byok_model"):
             raise ValueError(f"Unsupported Copilot session option: {key!r}")
     provider = options.get("provider")
     if provider is not None:
         inference = translated.setdefault("inference", {})
         inference["providers"] = [{**provider, "name": _BYOK_PROVIDER_NAME}]
         inference["default_provider"] = _BYOK_PROVIDER_NAME
+        if model := options.get("byok_model"):
+            inference["models"] = [{"provider": _BYOK_PROVIDER_NAME, "id": model}]
+            if "model" in translated:
+                translated["model"] = f"{_BYOK_PROVIDER_NAME}/{model}"
         github = translated.setdefault("github", {})
         github["capi"] = {**(github.get("capi") or {}), "enabled": False}
     return translated
@@ -1021,16 +1027,20 @@ class CopilotProvider(AgentProvider):
 
         return cfg
 
-    def _apply_provider_config(self, session_kwargs: dict[str, Any]) -> None:
+    def _apply_provider_config(self, session_kwargs: dict[str, Any], model: str) -> None:
         """Attach the resolved SDK provider config to ``session_kwargs``.
 
         Called from every ``create_session`` / ``resume_session`` site (main
         agent execution and dialog turns) so all sessions for this provider
-        instance hit the same endpoint.
+        instance hit the same endpoint. ``model`` is the session's model, which
+        custom routing registers on the connection (see
+        ``_sdk_session_options``); resume carries it because a resumed session
+        must find its registered model again.
         """
         provider_cfg = self._resolve_sdk_provider_config()
         if provider_cfg is not None:
             session_kwargs["provider"] = provider_cfg
+            session_kwargs["byok_model"] = model
 
     def _apply_github_token(self, session_kwargs: dict[str, Any]) -> None:
         """Attach the forwarded GitHub token to a session-creation call.
@@ -1673,7 +1683,7 @@ class CopilotProvider(AgentProvider):
 
             # Apply custom provider routing (Ollama / vLLM / Azure / etc.)
             # when runtime.provider opted into it.
-            self._apply_provider_config(session_kwargs)
+            self._apply_provider_config(session_kwargs, model)
 
             # Forward a GitHub token in memory (create_session's github_token
             # param) so the session authenticates against Copilot's own
@@ -1777,7 +1787,7 @@ class CopilotProvider(AgentProvider):
                             resume_kwargs["skill_directories"] = list(skill_directories)
                         if custom_agents:
                             resume_kwargs["custom_agents"] = [dict(spec) for spec in custom_agents]
-                        self._apply_provider_config(resume_kwargs)
+                        self._apply_provider_config(resume_kwargs, model)
                         self._apply_github_token(resume_kwargs)
                         if capi is not None:
                             resume_kwargs["capi"] = dict(capi)
@@ -4042,7 +4052,7 @@ class CopilotProvider(AgentProvider):
 
             # Honor the same custom provider routing as agent sessions so
             # dialog turns hit the same endpoint as agent execution.
-            self._apply_provider_config(dialog_kwargs)
+            self._apply_provider_config(dialog_kwargs, dialog_kwargs["model"])
 
             # Forward a GitHub token in memory, same as agent sessions (E9).
             self._apply_github_token(dialog_kwargs)

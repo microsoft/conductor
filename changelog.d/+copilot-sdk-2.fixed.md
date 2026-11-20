@@ -20,6 +20,9 @@ non-retryable error naming the CLI to update instead of retrying; unset
 upgrades replace the old SDK automatically. In an environment you manage
 yourself, `pip uninstall github-copilot-sdk` before upgrading, because both
 distributions install the same `copilot` package. Existing Docker and ACA
-runner images keep their own SDK and CLI pair and keep working; rebuild them
-to move to SDK 2.x, and rebuild any image that supplies its own Copilot CLI
-newer than 1.0.112.
+runner images keep their own SDK and CLI pair and keep working. To move them
+to SDK 2.x, rebuild ACA images with `--build-arg
+CONDUCTOR_VERSION=<release-or-SHA-containing-this-fix>`, because the
+Dockerfile's default pin predates it; custom images must update their
+equivalent version pins. Rebuild that way any image that supplies its own
+Copilot CLI newer than 1.0.112.

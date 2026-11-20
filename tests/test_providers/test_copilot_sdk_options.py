@@ -19,7 +19,7 @@ from copilot.client import (
     SessionSkillOptions,
     SessionToolOptions,
 )
-from copilot.session import NamedProviderConfig
+from copilot.session import NamedProviderConfig, ProviderModelConfig
 
 from conductor.exceptions import ProviderError
 from conductor.providers.copilot import (
@@ -83,7 +83,11 @@ def test_flat_options_map_to_sdk_groups() -> None:
 @pytest.mark.parametrize("method", ["create_session", "resume_session"])
 def test_the_installed_sdk_accepts_every_translated_option(method: str) -> None:
     """Pins the translation to the SDK's own option schema, which rejects unknown keys."""
-    flat = {**_every_flat_option(), "provider": {"type": "openai", "base_url": "http://x/v1"}}
+    flat = {
+        **_every_flat_option(),
+        "provider": {"type": "openai", "base_url": "http://x/v1"},
+        "byok_model": "gpt-5",
+    }
     translated = _sdk_session_options(flat)
     parameters = inspect.signature(getattr(CopilotClient, method)).parameters
     for key, value in translated.items():
@@ -93,20 +97,38 @@ def test_the_installed_sdk_accepts_every_translated_option(method: str) -> None:
     assert translated["github"]["capi"].keys() <= CapiSessionOptions.__annotations__.keys()
     for connection in translated["inference"]["providers"]:
         assert connection.keys() <= NamedProviderConfig.__annotations__.keys()
+    for model in translated["inference"]["models"]:
+        assert model.keys() <= ProviderModelConfig.__annotations__.keys()
 
 
 def test_custom_routing_becomes_the_only_default_connection() -> None:
     provider = {"type": "azure", "base_url": "https://aoai/", "azure": {"api_version": "v1"}}
-    translated = _sdk_session_options({"model": "my-deployment", "provider": provider})
+    translated = _sdk_session_options(
+        {"model": "my-deployment", "provider": provider, "byok_model": "my-deployment"}
+    )
     assert translated == {
-        "model": "my-deployment",
+        "model": "conductor/my-deployment",
         "inference": {
             "providers": [{**provider, "name": "conductor"}],
             "default_provider": "conductor",
+            "models": [{"provider": "conductor", "id": "my-deployment"}],
         },
         "github": {"capi": {"enabled": False}},
     }
     assert "name" not in provider
+
+
+@pytest.mark.parametrize("model", ["meta-llama/Llama-3.1-8B-Instruct", "auto"])
+def test_custom_routing_registers_names_the_sdk_would_reinterpret(model: str) -> None:
+    """A slash prefix would be read as a provider name and ``auto`` as Copilot routing."""
+    provider = {"type": "openai", "base_url": "http://x/v1"}
+    created = _sdk_session_options({"model": model, "provider": provider, "byok_model": model})
+    assert created["model"] == f"conductor/{model}"
+    assert created["inference"]["models"] == [{"provider": "conductor", "id": model}]
+
+    resumed = _sdk_session_options({"provider": provider, "byok_model": model})
+    assert "model" not in resumed
+    assert resumed["inference"]["models"] == [{"provider": "conductor", "id": model}]
 
 
 def test_unknown_session_option_is_refused_not_dropped() -> None:

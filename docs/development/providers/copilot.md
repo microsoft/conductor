@@ -55,9 +55,14 @@ runtime, dead-runtime recovery, usage and pricing, and per-agent tool allowlists
   `_ManagedCopilotSession.resume_kwargs` a managed continuation stores) and translated to SDK 2.x
   nested groups only at the call by `_sdk_session_options`. A new session option needs an entry
   there; an unknown key raises instead of being dropped. Custom routing (`provider`) becomes one
-  named BYOK connection (`_BYOK_PROVIDER_NAME`) that is also `inference.default_provider`, with
-  `github.capi.enabled: False`, so every model name reaches the configured endpoint as the 1.x
-  singular `provider` did.
+  named BYOK connection (`_BYOK_PROVIDER_NAME`) with `github.capi.enabled: False`, and
+  `_apply_provider_config` adds `byok_model`: the session model, registered on that connection
+  under its own name and selected as `conductor/<name>`. Unregistered, SDK 2.x would read a
+  slash-containing name such as `org/model` as a provider prefix and `auto` as Copilot routing;
+  registered, every name reaches the endpoint unchanged as with the 1.x singular `provider`.
+  Resume (checkpoint and managed continuation) must re-send the registration or the persisted
+  selection fails to resolve. `assistant.usage.model` reports the endpoint name, not
+  `conductor/<name>`, so usage attribution and `cost.pricing` keys are unaffected.
 - Tests: `tests/test_providers/test_copilot_sdk_options.py`.
 
 ### Existing runtime connection

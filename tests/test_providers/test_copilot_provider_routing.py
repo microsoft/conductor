@@ -274,19 +274,21 @@ class TestApplyProviderConfig:
     def test_no_settings_leaves_kwargs_unchanged(self) -> None:
         provider = _make_provider()
         kwargs: dict[str, Any] = {"model": "gpt-4o"}
-        provider._apply_provider_config(kwargs)
+        provider._apply_provider_config(kwargs, "gpt-4o")
         assert "provider" not in kwargs
+        assert "byok_model" not in kwargs
 
     def test_custom_routing_attaches_provider_dict(self) -> None:
         s = ProviderSettings(name="copilot", base_url="http://x/v1", api_key="k")
         provider = _make_provider(provider_settings=s, model="m")
         kwargs: dict[str, Any] = {"model": "m"}
-        provider._apply_provider_config(kwargs)
+        provider._apply_provider_config(kwargs, "m")
         assert kwargs["provider"] == {
             "type": "openai",
             "base_url": "http://x/v1",
             "api_key": "k",
         }
+        assert kwargs["byok_model"] == "m"
 
 
 class TestSessionKwargsPlumbing:
@@ -358,6 +360,8 @@ class TestSessionKwargsPlumbing:
             "base_url": "http://localhost:11434/v1",
             "api_key": "sk-dialog",
         }
+        assert kwargs["model"] == "conductor/custom-model"
+        assert kwargs["inference"]["models"] == [{"provider": "conductor", "id": "custom-model"}]
 
     @pytest.mark.asyncio
     async def test_dialog_turn_no_provider_when_default(self) -> None:
@@ -405,6 +409,8 @@ class TestSessionKwargsPlumbing:
             "base_url": "http://localhost:11434/v1",
             "api_key": "sk-execute",
         }
+        assert kwargs["model"] == "conductor/custom-model"
+        assert kwargs["inference"]["models"] == [{"provider": "conductor", "id": "custom-model"}]
 
     @pytest.mark.asyncio
     async def test_resume_attaches_provider_config(self) -> None:
@@ -463,7 +469,57 @@ class TestSessionKwargsPlumbing:
             "base_url": "http://localhost:11434/v1",
             "api_key": "sk-resume",
         }
+        # The resumed selection is only found again if its model is registered.
+        assert kwargs["inference"]["models"] == [{"provider": "conductor", "id": "custom-model"}]
         client.create_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("agent_model", [None, "meta-llama/Llama-3.1-8B-Instruct"])
+    async def test_usage_is_attributed_to_the_endpoint_model_name(
+        self, agent_model: str | None
+    ) -> None:
+        """A BYOK session selects ``conductor/<name>``, but the runtime reports
+        ``assistant.usage.model`` as the endpoint name. Inherited and explicitly
+        configured agents must both report that name, so ``cost.pricing`` keys match."""
+        from types import SimpleNamespace
+
+        from conductor.config.schema import AgentDef
+        from conductor.engine.pricing import ModelPricing
+        from conductor.engine.usage import UsageTracker
+
+        name = "meta-llama/Llama-3.1-8B-Instruct"
+        s = ProviderSettings(name="copilot", base_url="http://localhost:11434/v1", api_key="k")
+        provider = CopilotProvider(provider_settings=s, model=name)
+        provider._started = True
+        handlers: list[Any] = []
+        session = AsyncMock()
+        session.on = handlers.append
+
+        def event(kind: str, **data: Any) -> Any:
+            return SimpleNamespace(type=SimpleNamespace(value=kind), data=SimpleNamespace(**data))
+
+        async def send(prompt: str) -> None:
+            for recorded in (
+                event("session.start", selected_model=f"conductor/{name}"),
+                event("assistant.usage", model=name, input_tokens=1000, output_tokens=500),
+                event("assistant.message", content="ok"),
+                event("session.idle"),
+            ):
+                handlers[0](recorded)
+
+        session.send = send
+        client = AsyncMock()
+        client.create_session = AsyncMock(return_value=session)
+        provider._client = client
+
+        agent = AgentDef(name="solo", model=agent_model, prompt="hi")
+        output = await provider.execute(agent, context={}, rendered_prompt="hi")
+
+        assert output.model == name
+        tracker = UsageTracker(
+            pricing_overrides={name: ModelPricing(input_per_mtok=1.0, output_per_mtok=2.0)}
+        )
+        assert tracker.record("solo", output, elapsed=1.0).cost_usd == pytest.approx(0.002)
 
 
 class TestDescribeProviderRedaction:
@@ -773,7 +829,7 @@ class TestResolveRuntimeConnection:
         client_factory.assert_called_once_with(mode="coding-agent", runtime=connection)
 
         session_kwargs: dict[str, Any] = {}
-        provider._apply_provider_config(session_kwargs)
+        provider._apply_provider_config(session_kwargs, "ollama/llama3")
         assert session_kwargs["provider"] == {
             "type": "openai",
             "base_url": "http://localhost:11434/v1",
@@ -859,7 +915,7 @@ class TestGithubTokenAuth:
         client_factory.assert_called_once_with(**_spawned_client_kwargs())
 
         session_kwargs: dict[str, Any] = {}
-        provider._apply_provider_config(session_kwargs)
+        provider._apply_provider_config(session_kwargs, "ollama/llama3")
         assert session_kwargs["provider"] == {
             "type": "openai",
             "base_url": "http://localhost:11434/v1",
@@ -888,7 +944,7 @@ class TestGithubTokenAuth:
         )
 
         session_kwargs: dict[str, Any] = {}
-        provider._apply_provider_config(session_kwargs)
+        provider._apply_provider_config(session_kwargs, "ollama/llama3")
         provider._apply_github_token(session_kwargs)
 
         assert session_kwargs["provider"] == {
