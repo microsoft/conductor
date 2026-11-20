@@ -2860,6 +2860,7 @@ class TestSkillsWiring:
         setting_sources: list[str] | None = None,
         native_tools: str = "none",
         default_reasoning_effort: str | None = None,
+        system_prompt_preset: str | None = None,
     ):
         captured: dict = {}
 
@@ -2872,6 +2873,7 @@ class TestSkillsWiring:
                 setting_sources=setting_sources,
                 native_tools=native_tools,
                 default_reasoning_effort=default_reasoning_effort,  # type: ignore[arg-type]
+                system_prompt_preset=system_prompt_preset,  # type: ignore[arg-type]
             )
             await provider.execute(
                 agent=agent,
@@ -5428,3 +5430,116 @@ class TestReasoningEffortWiring:
         )
 
         validate_workflow_config(config)  # no raise
+
+
+class TestSystemPromptPresetWiring:
+    """``runtime.provider.system_prompt_preset`` selects the session's system prompt.
+
+    Without it an unset ``system_prompt`` reaches the CLI as ``--system-prompt
+    ""`` -- the SDK's minimal prompt, without the Claude Code coding and safety
+    guidance -- and an agent's ``system_prompt:`` replaces even that. With
+    ``claude_code`` the CLI keeps its own prompt and the agent's text is
+    appended. Assertions go through to argv like the suites above, because the
+    two cases differ only in which flag the SDK emits.
+    """
+
+    _capture_options = staticmethod(TestSkillsWiring._capture_options)
+    _argv = staticmethod(TestSkillsWiring._argv)
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unset_keeps_the_minimal_default(self) -> None:
+        """Byte-identical to before: no preset means the empty prompt flag."""
+        options = await self._capture_options(AgentDef(name="t", prompt="hi"))
+
+        assert options.system_prompt is None
+        argv = self._argv(options)
+        assert argv[argv.index("--system-prompt") + 1] == ""
+        assert "--append-system-prompt" not in argv
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_unset_agent_prompt_still_replaces(self) -> None:
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", system_prompt="You are a reviewer.")
+        )
+
+        assert options.system_prompt == "You are a reviewer."
+        argv = self._argv(options)
+        assert argv[argv.index("--system-prompt") + 1] == "You are a reviewer."
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_preset_without_agent_prompt_sends_no_prompt_flag(self) -> None:
+        """No flag at all is what leaves the CLI on its own Claude Code prompt."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi"), system_prompt_preset="claude_code"
+        )
+
+        assert options.system_prompt == {
+            "type": "preset",
+            "preset": "claude_code",
+            "exclude_dynamic_sections": True,
+        }
+        argv = self._argv(options)
+        assert "--system-prompt" not in argv
+        assert "--append-system-prompt" not in argv
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_preset_appends_the_agent_prompt(self) -> None:
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", system_prompt="You are a reviewer."),
+            system_prompt_preset="claude_code",
+        )
+
+        assert options.system_prompt["append"] == "You are a reviewer."
+        argv = self._argv(options)
+        assert "--system-prompt" not in argv
+        assert argv[argv.index("--append-system-prompt") + 1] == "You are a reviewer."
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_preset_drops_an_empty_agent_prompt(self) -> None:
+        """The SDK keys ``--append-system-prompt`` on the key, not its value."""
+        options = await self._capture_options(
+            AgentDef(name="t", prompt="hi", system_prompt=""),
+            system_prompt_preset="claude_code",
+        )
+
+        assert "append" not in options.system_prompt
+        assert "--append-system-prompt" not in self._argv(options)
+
+    def test_unknown_preset_fails_closed(self) -> None:
+        with (
+            patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True),
+            pytest.raises(ProviderError, match="Unknown system_prompt_preset"),
+        ):
+            ClaudeAgentSdkProvider(system_prompt_preset="claude")  # type: ignore[arg-type]
+
+    async def test_factory_forwards_the_preset(self) -> None:
+        from conductor.config.schema import ProviderSettings, RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(
+            provider=ProviderSettings(name="claude-agent-sdk", system_prompt_preset="claude_code")
+        )
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+
+        assert provider._system_prompt_preset == "claude_code"
+
+    def test_schema_refuses_the_preset_on_other_providers(self) -> None:
+        from pydantic import ValidationError
+
+        from conductor.config.schema import ProviderSettings
+
+        with pytest.raises(ValidationError, match="system_prompt_preset"):
+            ProviderSettings(name="copilot", system_prompt_preset="claude_code")
+
+    def test_preset_keeps_the_settings_object_form(self) -> None:
+        """A set preset is structured config, so it must not collapse to the
+        bare-string shorthand on serialisation and get lost on round-trip."""
+        from conductor.config.schema import ProviderSettings
+
+        settings = ProviderSettings(name="claude-agent-sdk", system_prompt_preset="claude_code")
+
+        dumped = settings.model_dump()
+        assert isinstance(dumped, dict)
+        assert dumped["system_prompt_preset"] == "claude_code"
+        assert ProviderSettings(name="claude-agent-sdk").model_dump() == "claude-agent-sdk"
