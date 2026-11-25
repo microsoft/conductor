@@ -5,9 +5,12 @@ Related: Architecture step 6 of #527 (Containerized script execution)
 
 ## Summary
 
-This design introduces the Docker runner backend for Conductor. The backend executes workflow script steps inside short-lived containers against a run-scoped, shared named volume.
+The Docker runner backend executes workflow script steps and direct stdio MCP
+servers in containers against a run-scoped, shared named volume. Agent steps
+use a separate runner image as described in
+[agent realms](./agent-realms.md).
 
-Workflows declare execution profiles that select the `docker` backend. Conductor collects the workflow file closure into an immutable, content-addressed run bundle (step 4), compiles execution specifications into a deterministic run manifest (step 5), and stages the bundle into a named Docker volume before step execution. Containers run with short-lived lifecycles and share workspace state across steps within the run. Conductor then finalizes and cleans up all managed containers and volumes when the run concludes.
+Workflows declare execution profiles that select the `docker` backend. Conductor collects the workflow file closure into an immutable, content-addressed run bundle (step 4), compiles execution specifications into a deterministic run manifest (step 5), and stages the bundle into a named Docker volume before step execution. Containers share workspace state across steps within the run. Conductor finalizes managed resources when the run concludes, subject to the retention and ownership checks below.
 
 ## Motivation and Purpose
 
@@ -34,6 +37,9 @@ The Docker backend implements the `RunnerBackend` contract defined in `conductor
   * `shared_workspace = True`: Steps within a run share the same named volume workspace.
   * `retained_workspace = True`: Supports retaining and re-attaching named volumes across runs (see [Retained Workspace Lifecycle](./workspace-lifecycle.md)).
   * `snapshots = False`: Mid-run workspace checkpointing is deferred.
+  * `agent = True`: Supports Docker agent execution.
+  * `interrupt`: Available when at least one runner exists and all runners report interrupt support.
+  * `mcp_stdio = True`: Supports direct MCP servers over a Docker stdio target.
 * **CLI transport**: Uses the system `docker` CLI executable directly via `asyncio.subprocess` rather than a Docker Python SDK. This keeps the execution path compatible with the operator's active Docker context, credential helpers, environment variables, and remote `DOCKER_HOST` configurations.
 * **Engine floor**: Requires Docker Engine 20.10 or newer (Docker API 1.41+).
 
@@ -76,6 +82,22 @@ Step working directories resolve against the container volume:
 | POSIX absolute path (e.g. `/app`) | `/app` | Passed verbatim to the container. |
 
 Windows drive letters, backslashes, and empty path strings are rejected during validation and preflight.
+
+Direct MCP servers use the same mapping for the rendered
+`runtime.working_dir`. The directory may have been created by an earlier
+Docker step. Conductor doesn't probe the host for that directory or fall
+back to host execution.
+
+### Direct MCP target
+
+A direct MCP step selects a Docker profile through the ordinary step,
+workflow, and environment precedence chain. Its stdio server runs through
+`docker create --interactive` and `docker start --attach --interactive <id>` in `docker.image`, with the profile's container
+options and the shared volume mounted at `/workspace`. The configured
+server command must be present in that image. An agent `runner_image` isn't
+required. The engine pools matching server, profile, resolved execution,
+lease incarnation, and mapped working directory combinations. See
+[MCP steps](../workflow-syntax.md#mcp-steps) for reuse and call semantics.
 
 ### Temporary File Storage (`tmpfs`)
 
@@ -212,7 +234,8 @@ The profile schema enforces these exclusions with strict Pydantic models (`extra
 ### Operator Trust and Credentials
 
 * **Docker group membership**: Access to the Docker daemon socket grants root-equivalent control over the host system.
-* **Secret injection hygiene**: The effective container environment (declared `env:` overrides merged over the host snapshot only when the step inherits the control environment) is written to a protected temporary file (mode `0600` on POSIX) and passed to `docker create` via `--env-file`. The Docker CLI control environment stays identical for every invocation, so payload variables such as `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, or `HOME` can never redirect container creation to a different daemon or alter client configuration. Plaintext secret values never appear in command-line arguments, process argv, or log output, and the temporary file is removed once `create` completes. Names must not be empty, must not contain `=`, a line break, or NUL, and must not start with `#` (which Docker's env-file parser treats as a comment and silently drops); values must not contain NUL or a line break. These are exactly the entries the env-file line format cannot represent, and they are rejected before `create` names the variable (never its value). Names outside the shell-identifier shape — including host variables every Windows machine sets, such as `CommonProgramFiles(x86)` — are representable and pass through to the container unchanged.
+* **Secret injection hygiene**: The effective container environment is written to a protected temporary file (mode `0600` on POSIX) and passed with `--env-file`. Script steps use their declared `env` and secret deliveries; direct MCP servers use their resolved server `env` and server-scoped secret deliveries. The host snapshot is included in the container payload only when the profile enables inheritance. This delivery doesn't overlay the payload into the Docker CLI environment or put its values in Docker arguments. The CLI keeps the operator's ambient Docker, SSH, proxy, and credential-helper context, including any secret sources already present there. Conductor removes the temporary file after container creation, before start; an unconfirmed MCP env-file cleanup is reported. Names must not be empty, must not contain `=`, a line break, or NUL, and must not start with `#`; values must not contain NUL or a line break. An invalid entry is rejected without printing its value. Names outside the shell-identifier shape, such as `CommonProgramFiles(x86)`, are representable.
+* **Direct MCP diagnostics**: Docker server stderr is suppressed, SDK transport diagnostics are sanitized, and private failure diagnostics contain metadata instead of raw exception text or tracebacks. These rules don't guarantee redaction of arbitrary successful tool results or files that a workflow writes.
 * **Inspect visibility**: Environment variables passed to containers are visible in `docker inspect` output to authorized daemon administrators.
 * **Volume quotas**: Enforcing disk storage quotas on `/workspace` named volumes is the responsibility of the host operator and storage driver.
 
@@ -234,114 +257,41 @@ All Docker resources created by Conductor use predictable naming patterns and me
 * **Named volume**: `conductor-ws-<run_id>`
 * **Execution container**: `conductor-<run_id[:8]>-<sha1(step name or command)[:8]>-<attempt>`
 * **Scratch container**: `conductor-stage-<run_id[:8]>-<uuid6>`
+* **Direct MCP container**: `conductor-mcp-<run_id[:8]>-<uuid>`
 
 The run incarnation is carried as a label rather than a name segment, and the
 step identity travels as a hash so step names cannot inject unsafe characters
-into a container name. Every resource carries tracking labels:
+into a container name. Newly created resources carry tracking labels:
 * `io.conductor.managed = "true"`
 * `io.conductor.run_id = "<run_id>"`
 * `io.conductor.workspace = "<run_id>"`
-* `io.conductor.resource = "exec" | "scratch" | "workspace"`
+* `io.conductor.resource = "exec" | "scratch" | "runner" | "workspace"`
 * `io.conductor.incarnation = "<incarnation>"`
+
+An attached legacy volume can lack the workspace label.
 
 Execution containers additionally carry:
 * `io.conductor.step = "<step name or command>"`
 * `io.conductor.attempt = "<attempt>"`
 
-### Finalization Protocol
+### Finalization protocol
 
-When a workflow run concludes (whether successfully, on failure, or upon cancellation):
+Direct MCP targets are execution containers. Docker reads the private environment file
+at `create`; it is removed before the SDK starts. Conductor verifies the returned full
+container ID, ownership labels, workspace volume and staging marker before handing the
+SDK a non-TTY `start --attach --interactive` command addressed to that ID.
 
-1. `DockerRunnerBackend.finalize_run()` is invoked by the engine.
-2. Conductor inspects all containers associated with the lease, stops running containers, and deletes them.
-3. Conductor removes the named volume `conductor-ws-<run_id>`.
-4. Finalization is fail-closed: it verifies exact label matches and name prefixes before issuing removal commands.
+At teardown the engine closes the SDK connection, then removes the target by ID,
+including peers that ignore EOF. Only then does the backend finalize the lease. The
+ordinary sweep checks labels and names; when this lease recorded a create ID it also
+checks that ID, so a replacement with the same name and labels is left alone.
+Workspace retention is the same as for other Docker steps.
 
-Cleanup is idempotent by `run_id` at three lifecycle levels: attached step cleanup,
-backend-native run finalization, and manual recovery of orphaned resources. Only
-the orphaned level needs an operator recipe; never sweep resources belonging to
-other runs on a shared daemon.
+### Orphaned resource cleanup
 
-### Orphaned Resource Cleanup
-
-If a workflow process is killed abruptly with `SIGKILL`, running containers and
-the named workspace volume may remain. First confirm that this particular run
-has been abandoned and will not be resumed or finalized by a live process.
-While it is live, `conductor status --json` exposes its identifier under
-`running[].run_id` (alongside `workflow`, `pid`, and `event_log`); record that
-value in the CI job before the process exits. For an already-dead run, recover
-the identifier from its event log filename under `$TMPDIR/conductor/`:
-`conductor-<workflow_name>-<YYYYMMDD-HHMMSS>-<run_id>.events.jsonl`.
-Confirm the identifier against the intended run before setting `RUN_ID`; do
-not infer it from a list of unrelated runs. A resumed run may reuse the same
-identifier, so check that no resumed process still owns it.
-
-Set `RUN_ID` to that known, confirmed-abandoned identifier, then list, kill,
-and remove only its containers (including stopped scratch containers), remove
-its named volume explicitly, and verify that both are gone:
-
-```bash
-set -euo pipefail
-: "${RUN_ID:?Set RUN_ID to the confirmed-abandoned run id}"
-docker ps -a --filter label=io.conductor.managed=true \
-  --filter "label=io.conductor.run_id=${RUN_ID}"
-docker ps -q --filter label=io.conductor.managed=true \
-  --filter "label=io.conductor.run_id=${RUN_ID}" |
-  while IFS= read -r container; do docker kill "$container"; done
-docker ps -aq --filter label=io.conductor.managed=true \
-  --filter "label=io.conductor.run_id=${RUN_ID}" |
-  while IFS= read -r container; do docker rm -f "$container"; done
-if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
-  docker volume rm -f "conductor-ws-${RUN_ID}"
-fi
-
-# Both checks must succeed: no containers and no named workspace volume.
-test -z "$(docker ps -aq --filter label=io.conductor.managed=true \
-  --filter "label=io.conductor.run_id=${RUN_ID}")"
-if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
-  printf '%s\n' 'Workspace volume still exists' >&2
-  exit 1
-fi
-```
-
-Do not substitute `docker container prune` or `docker volume prune` for this
-recipe: container prune removes only stopped containers, leaving a running
-orphan; on Docker API 1.42+, volume prune without `--all` removes only
-anonymous volumes, while this backend creates named workspace volumes.
-Label-wide `managed=true` removal and daemon-wide pruning can destroy OTHER
-Conductor runs' state on a shared daemon; use daemon-wide cleanup only on a
-dedicated, disposable daemon with no other runs.
-
-#### Sample CI Cleanup Step
-
-Before teardown, save the job's `running[].run_id` from `conductor status
---json` while its run record still exists: match the record to this job's
-workflow and PID rather than selecting the first entry on a shared runner.
-Persist the value as `CONFIRMED_ABANDONED_RUN_ID` only after confirming that
-the recorded run has terminated and will not be resumed; `if: always()` alone
-does not establish abandonment. Supply that variable to the step below.
-
-```yaml
-- name: Clean up Conductor Docker resources
-  if: always() && env.CONFIRMED_ABANDONED_RUN_ID != ''
-  env:
-    RUN_ID: ${{ env.CONFIRMED_ABANDONED_RUN_ID }}
-  run: |
-    set -euo pipefail
-    : "${RUN_ID:?Missing confirmed-abandoned run id}"
-    docker ps -aq --filter label=io.conductor.managed=true \
-      --filter "label=io.conductor.run_id=${RUN_ID}" |
-      while IFS= read -r container; do docker rm -f "$container"; done
-    if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
-      docker volume rm -f "conductor-ws-${RUN_ID}"
-    fi
-    test -z "$(docker ps -aq --filter label=io.conductor.managed=true \
-      --filter "label=io.conductor.run_id=${RUN_ID}")"
-    if docker volume inspect "conductor-ws-${RUN_ID}" >/dev/null 2>&1; then
-      printf '%s\n' 'Workspace volume still exists' >&2
-      exit 1
-    fi
-```
+If cleanup cannot be confirmed, stop the original controller and inspect container
+IDs, ownership labels and mounts before manual recovery. A run ID is not enough
+to prove ownership. Independent controllers must not use the same workspace concurrently.
 
 ## Resume Semantics and Seeding Asymmetry
 
@@ -361,8 +311,7 @@ Workflows can combine local and Docker script steps across different profiles:
 
 The following capabilities are deferred to future architecture milestones:
 
-1. **Agent execution realms (Step 7)**: Running LLM agent tool loops and MCP servers inside container sandboxes.
-2. **Local bind-mount optimization**: Mounting local workspace directories directly for local development.
-3. **Read-only `/workspace/source` mount**: Providing a separate immutable view of workflow source files alongside a writable output directory.
-4. **Volume snapshot resumption and quotas (Step 8)**: Checkpointing volume states between steps and enforcing volume size limits.
-5. **Configurable pull policy**: Explicit `pull_policy` settings (`always`, `missing`, `never`).
+1. **Local bind-mount optimization**: Mounting local workspace directories directly for local development.
+2. **Read-only `/workspace/source` mount**: Providing a separate immutable view of workflow source files alongside a writable output directory.
+3. **Volume snapshot resumption and quotas (Step 8)**: Checkpointing volume states between steps and enforcing volume size limits.
+4. **Configurable pull policy**: Explicit `pull_policy` settings (`always`, `missing`, `never`).

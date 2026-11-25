@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from conductor.config.environment import (
+    AcaProfileOptions,
     DockerProfileOptions,
     EnvironmentDocument,
     ProfileDefinition,
@@ -17,11 +18,15 @@ from conductor.config.environment import (
 )
 from conductor.config.schema import (
     AgentDef,
+    MCPServerDef,
+    MCPStepDef,
     RestartConfig,
     RouteDef,
     ScriptStepDef,
+    SecretDelivery,
     StepDef,
     StepExecutionConfig,
+    StepSecretRef,
     WorkflowConfig,
     WorkflowDef,
     WorkflowDefaults,
@@ -69,11 +74,26 @@ def _script(name: str, profile: str) -> ScriptStepDef:
     )
 
 
-def _config(*steps: AgentDef | ScriptStepDef) -> WorkflowConfig:
+def _config(*steps: AgentDef | ScriptStepDef | MCPStepDef) -> WorkflowConfig:
     return WorkflowConfig(
         workflow=WorkflowDef(name="docker-validation", entry_point=steps[0].name),
         agents=list(steps),
     )
+
+
+def _mcp_config(profile: str, *, secrets: list[StepSecretRef] | None = None) -> WorkflowConfig:
+    config = _config(
+        MCPStepDef(
+            name="mcp",
+            server="tools",
+            tool="read",
+            timeout=None,
+            execution=StepExecutionConfig(profile=profile, secrets=secrets or []),
+            routes=[RouteDef(to="$end")],
+        )
+    )
+    config.workflow.runtime.mcp_servers["tools"] = MCPServerDef(command="tools")
+    return config
 
 
 def _validate_explicit(config: WorkflowConfig, environment: ResolvedEnvironment) -> list[str]:
@@ -104,6 +124,46 @@ def test_non_script_docker_profile_uses_reserved_step_7_error() -> None:
 
     with pytest.raises(ConfigurationError, match="docker.runner_image"):
         _validate_explicit(config, _environment({"container": _docker()}))
+
+
+def test_docker_mcp_profile_passes_explicit_validation() -> None:
+    # Requirement: static validation accepts direct stdio MCP on a Docker image profile.
+    assert (
+        _validate_explicit(
+            _mcp_config("container"),
+            _environment({"container": _docker()}),
+        )
+        == []
+    )
+
+
+def test_aca_mcp_profile_fails_explicit_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Requirement: static validation mirrors the run-path mcp_stdio capability refusal for ACA.
+    monkeypatch.setitem(BACKEND_CAPABILITY_PROVIDERS, "aca", LocalRunnerBackend())
+    environment = _environment(
+        {
+            "cloud": ProfileDefinition(
+                backend="aca",
+                aca=AcaProfileOptions(pool_endpoint="https://pool.example.test"),
+            )
+        }
+    )
+
+    with pytest.raises(ConfigurationError, match="aca.*mcp_stdio"):
+        _validate_explicit(_mcp_config("cloud"), environment)
+
+
+def test_docker_mcp_step_secrets_remain_refused() -> None:
+    # Requirement: static validation retains the direct MCP step-secret security refusal.
+    secrets = [StepSecretRef(ref="token", scope="mcp", delivery=SecretDelivery(env="TOKEN"))]
+
+    with pytest.raises(ConfigurationError, match="does not support secret delivery"):
+        _validate_explicit(
+            _mcp_config("container", secrets=secrets),
+            _environment({"container": _docker()}),
+        )
 
 
 def test_bare_validate_rejects_non_script_docker_profile_from_discovery(tmp_path: Path) -> None:

@@ -19,6 +19,8 @@ from conductor.execution.types import (
     AgentSpec,
     CommandResult,
     CommandSpec,
+    McpServerSpec,
+    McpStdioTarget,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
@@ -153,6 +155,12 @@ class AcaRunnerBackend:
             agent=True,
             interrupt=self._interrupt_available,
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        """ACA has no direct stdio execution contract."""
+        raise ExecutionSpecError("ACA backend does not support open_mcp_stdio")
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         if run.workspace_persistence is not None:

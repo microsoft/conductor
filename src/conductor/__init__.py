@@ -63,8 +63,22 @@ except Exception as _faulthandler_exc:  # noqa: BLE001 - diagnostics must never 
     except Exception:  # noqa: BLE001 - really, truly must not break startup
         pass
 
-from importlib.metadata import version as _pkg_version
-
-__version__ = _pkg_version("conductor-cli")
+__version__: str
 
 __all__ = ["__version__"]
+
+
+def __getattr__(name: str) -> str:
+    """Resolve metadata only for callers requesting the public package version."""
+    if name != "__version__":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib.metadata import version
+
+    value = version("conductor-cli")
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Keep public exports discoverable without initializing them."""
+    return sorted(globals().keys() | set(__all__))

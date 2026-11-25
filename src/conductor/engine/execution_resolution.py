@@ -182,6 +182,7 @@ class ExecutionResolverSession:
         self._terminal_identities: dict[str, WorkspaceIdentity] = {}
         self._providers: list[AgentProvider] = []
         self._registry: ProviderRegistry | None = None
+        self._lease_releases: dict[WorkspaceLease, dict[int, Callable[[], Awaitable[None]]]] = {}
         self._resource_releases: dict[int, Callable[[], Awaitable[None]]] = {}
         self._resource_tasks: set[asyncio.Future[Any]] = set()
         self._cleanup_task: asyncio.Task[None] | None = None
@@ -257,6 +258,7 @@ class ExecutionResolverSession:
         self._local_consumer = False
         self._providers.clear()
         self._resource_releases.clear()
+        self._lease_releases.clear()
         self._root_run_spec = None
         self._registry = None
         self.root_task = None
@@ -303,18 +305,54 @@ class ExecutionResolverSession:
             assert self._managed_binding is not None
             registry.register_workspace_provider(self._managed_binding.runtime_context, provider)
 
-    def register_resource(self, resource: object, release: Callable[[], Awaitable[None]]) -> None:
+    def register_resource(
+        self,
+        resource: object,
+        release: Callable[[], Awaitable[None]],
+        *,
+        lease: WorkspaceLease | None = None,
+    ) -> None:
         """Account attempted native resources independently of successful caches."""
         if self.sealed:
             raise ExecutionError("Managed root admission is sealed.")
-        self._resource_releases.setdefault(id(resource), release)
+        releases = (
+            self._resource_releases if lease is None else self._lease_releases.setdefault(lease, {})
+        )
+        releases.setdefault(id(resource), release)
 
-    def _track[T](self, task: asyncio.Future[T]) -> asyncio.Future[T]:
+    @property
+    def coordinated(self) -> bool:
+        """Terminal reporting waits for registered workspace consumers."""
+        return self.managed or bool(self._lease_releases)
+
+    async def _release_lease(
+        self, backend: RunnerBackend, lease: WorkspaceLease, outcome: RunOutcome, *, retain: bool
+    ) -> None:
+        releases = self._lease_releases.get(lease, {})
+        if releases:
+            results = await asyncio.gather(
+                *(close() for close in releases.values()), return_exceptions=True
+            )
+            assert self.cleanup_deadline is not None
+            if (
+                self._cleanup_expired.is_set()
+                or asyncio.get_running_loop().time() >= self.cleanup_deadline
+                or any(isinstance(result, BaseException) for result in results)
+            ):
+                self.cleanup_uncertain = True
+                logger.warning("Lease resource cleanup unconfirmed; refusing workspace disposal")
+                return
+        await backend.finalize_run(lease, outcome, retain=retain)
+
+    def _track[T](self, task: asyncio.Future[T], *, mcp: bool = False) -> asyncio.Future[T]:
         self._resource_tasks.add(task)
 
         def finished(owner: asyncio.Future[T]) -> None:
             self._resource_tasks.discard(owner)
             if not owner.cancelled() and (error := owner.exception()) is not None:
+                if mcp:
+                    logger.warning("Docker MCP invocation failed: %s", type(error).__name__)
+                    return
                 logger.warning(
                     "Managed resource finished with an error: %s", self.redactor.scrub(str(error))
                 )
@@ -327,6 +365,7 @@ class ExecutionResolverSession:
         coroutine: Coroutine[Any, Any, T],
         *,
         nested_timeout: asyncio.Timeout | None = None,
+        mcp: bool = False,
     ) -> T:
         """Own a resource leaf, never a detached engine orchestration continuation."""
         if not self.managed:
@@ -334,7 +373,7 @@ class ExecutionResolverSession:
         if self.sealed:
             coroutine.close()
             raise ExecutionError("Managed root admission is sealed.")
-        owner = self._track(asyncio.create_task(coroutine))
+        owner = self._track(asyncio.create_task(coroutine), mcp=mcp)
         try:
             return await asyncio.shield(owner)
         except asyncio.CancelledError:
@@ -354,7 +393,10 @@ class ExecutionResolverSession:
             return
         assert self.cleanup_deadline is not None
         task = self._track(asyncio.create_task(coroutine))
-        await asyncio.wait({task}, timeout=0)
+        # A refused lease release can finish well before expiry. Let the dashboard
+        # drain in the remaining time without extending the root cleanup episode.
+        remaining = max(0, self.cleanup_deadline - asyncio.get_running_loop().time())
+        await asyncio.wait({task}, timeout=0 if self.managed else remaining)
         if not task.done():
             logger.warning("CLI cleanup owner remains pending under the original root deadline")
         elif not task.cancelled():
@@ -362,31 +404,29 @@ class ExecutionResolverSession:
 
     def begin_teardown(self, outcome: RunOutcome, *, retain: bool) -> None:
         """Detach reusable leases and start all cleanup attempts without awaiting joins."""
-        if self._cleanup_task is not None:
+        if self._cleanup_task is not None or not self.coordinated:
             return
         binding = self._managed_binding
-        if binding is None:
-            return
         self._terminal_identities = self.workspace_identities()
         self.sealed = True
         leases, self.leases = self.leases, {}
         invocations = tuple(self._resource_tasks)
-        controller = binding.runtime_context.process_scopes
         loop = asyncio.get_running_loop()
-        earlier = controller.owners.deadline()
         self.cleanup_deadline = loop.time() + 30
-        if earlier is not None:
-            self.cleanup_deadline = min(self.cleanup_deadline, earlier)
-        controller.begin_teardown(deadline=self.cleanup_deadline)
-        native_deadline = controller.owners.deadline()
-        if native_deadline is not None:
-            self.cleanup_deadline = min(self.cleanup_deadline, native_deadline)
-        self._cleanup_timer = loop.call_at(self.cleanup_deadline, self._cleanup_expired.set)
+        if binding is not None:
+            controller = binding.runtime_context.process_scopes
+            earlier = controller.owners.deadline()
+            if earlier is not None:
+                self.cleanup_deadline = min(self.cleanup_deadline, earlier)
+            controller.begin_teardown(deadline=self.cleanup_deadline)
+            native_deadline = controller.owners.deadline()
+            if native_deadline is not None:
+                self.cleanup_deadline = min(self.cleanup_deadline, native_deadline)
+            self._cleanup_timer = loop.call_at(self.cleanup_deadline, self._cleanup_expired.set)
         attempts: set[asyncio.Future[Any]] = set()
         finalized: set[int] = set()
         local = self.backends["local"]
-        local_lease = leases["local"]
-        if self._registry is not None:
+        if binding is not None and self._registry is not None:
             self._registry.account_workspace_cleanup(
                 binding.workspace_root,
                 deadline=self.cleanup_deadline,
@@ -398,13 +438,16 @@ class ExecutionResolverSession:
             if id(backend) in finalized:
                 continue
             finalized.add(id(backend))
-            if backend is local:
+            if binding is not None and backend is local:
                 continue
             attempts.add(
                 self._track(
-                    asyncio.create_task(backend.finalize_run(lease, outcome, retain=retain))
+                    asyncio.create_task(self._release_lease(backend, lease, outcome, retain=retain))
                 )
             )
+        if binding is None:
+            self._cleanup_task = asyncio.create_task(self._finish_lease_releases(attempts))
+            return
         if self._registry is not None:
             attempts.add(
                 self._track(
@@ -424,8 +467,24 @@ class ExecutionResolverSession:
             if not invocation.done():
                 invocation.cancel()
         self._cleanup_task = asyncio.create_task(
-            self._finish_managed(local, local_lease, outcome, retain, attempts)
+            self._finish_managed(local, leases["local"], outcome, retain, attempts)
         )
+
+    async def _finish_lease_releases(self, attempts: set[asyncio.Future[Any]]) -> None:
+        """Observe registered leases within the root budget, without cancelling late owners."""
+        assert self.cleanup_deadline is not None
+        if attempts:
+            _, pending = await asyncio.wait(
+                attempts, timeout=max(0, self.cleanup_deadline - asyncio.get_running_loop().time())
+            )
+            if pending:
+                self._cleanup_expired.set()
+                self.cleanup_uncertain = True
+                logger.warning("Lease cleanup deadline expired; release is unconfirmed")
+        if self.cleanup_uncertain:
+            _QUARANTINED_SECRETS.setdefault(asyncio.get_running_loop(), set()).add(
+                (self.secret_cache, self.redactor)
+            )
 
     async def _finish_managed(
         self,
@@ -457,7 +516,7 @@ class ExecutionResolverSession:
             and not proof_task.cancelled()
             and proof_task.result().status == "released"
         )
-        self.cleanup_uncertain = bool(pending) or not proven
+        self.cleanup_uncertain = self.cleanup_uncertain or bool(pending) or not proven
         if not self.cleanup_uncertain:
             confirmation = self._track(asyncio.create_task(local.confirm_workspace_released(lease)))
             expiry = asyncio.create_task(self._cleanup_expired.wait())
@@ -838,18 +897,20 @@ class ExecutionResolverSession:
         racing cancellation; cancellation is re-raised only after every
         backend has had its chance to finalize.
         """
-        if self.managed:
+        if self.coordinated:
             self.begin_teardown(outcome, retain=retain)
             assert self._cleanup_task is not None
-            managed_cancel: asyncio.CancelledError | None = None
+            cancelled_error: asyncio.CancelledError | None = None
             while not self._cleanup_task.done():
                 try:
                     await asyncio.shield(self._cleanup_task)
                 except asyncio.CancelledError as error:
-                    managed_cancel = managed_cancel or error
+                    cancelled_error = cancelled_error or error
             self._cleanup_task.result()
-            if managed_cancel is not None:
-                raise managed_cancel
+            if not self.managed and self.root_task is None and self._owns_secrets:
+                self.reset_secrets()
+            if cancelled_error is not None:
+                raise cancelled_error
             return
         leases = self.leases
         self.leases = {}

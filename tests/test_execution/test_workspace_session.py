@@ -205,3 +205,94 @@ async def test_late_local_consumer_uses_original_bundle_under_claim(
         await session.finalize_leases("failed", retain=True)
         if claim is not None:
             claim.release()
+
+
+async def test_docker_only_run_resume_use_actual_root_cleanup(tmp_path, monkeypatch):
+    # Requirement: both real engine entry points close SDK and target before Docker finalization.
+    import json
+
+    from conductor.config.environment import EnvironmentDocument, ResolvedEnvironment
+    from conductor.config.schema import WorkflowConfig
+    from conductor.engine.workflow import WorkflowEngine
+    from conductor.events import WorkflowEventEmitter
+    from conductor.mcp.manager import MCPManager
+    from tests.test_mcp.fixtures.docker_realm import create_realm
+
+    realm = create_realm(tmp_path, monkeypatch)
+    monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path / "home"))
+    source = tmp_path / "source"
+    source.mkdir()
+    config = WorkflowConfig.model_validate(
+        {
+            "workflow": {
+                "name": "root-lifecycle",
+                "entry_point": "call",
+                "runtime": {"mcp_servers": {"srv": {"command": "peer"}}},
+            },
+            "agents": [
+                {
+                    "name": "call",
+                    "type": "mcp",
+                    "server": "srv",
+                    "tool": "receive",
+                    "routes": [{"to": "$end"}],
+                }
+            ],
+        }
+    )
+    workflow = source / "workflow.yaml"
+    workflow.write_text(config.model_dump_json())
+    environment = ResolvedEnvironment(
+        document=EnvironmentDocument.model_validate(
+            {
+                "default": "docker",
+                "profiles": {"docker": {"backend": "docker", "docker": {"image": "peer:image"}}},
+            }
+        ),
+        name="root",
+        source="path",
+        path=None,
+        digest="sha256:root",
+    )
+    engine = WorkflowEngine(
+        config,
+        workflow_path=workflow,
+        execution_environment=environment,
+        event_emitter=WorkflowEventEmitter(),
+    )
+    session = engine._execution_session
+    session.backends["docker"] = realm.backend
+    original_close = MCPManager.close
+    original_open = realm.backend.open_mcp_stdio
+    original_finalize = realm.backend.finalize_run
+    order = []
+
+    async def close_manager(manager, *, strict=False):
+        await original_close(manager, strict=strict)
+        order.append("manager")
+
+    async def open_target(spec, lease):
+        target = await original_open(spec, lease)
+
+        async def close_target():
+            assert order[-1] == "manager"
+            order.append("target")
+            await target.aclose()
+
+        return replace(target, aclose=close_target)
+
+    async def finalize(lease, outcome, *, retain=False):
+        assert order[-1] == "target"
+        order.append("finalize")
+        await original_finalize(lease, outcome, retain=retain)
+
+    monkeypatch.setattr(MCPManager, "close", close_manager)
+    monkeypatch.setattr(realm.backend, "open_mcp_stdio", open_target)
+    monkeypatch.setattr(realm.backend, "finalize_run", finalize)
+    await engine.run({})
+    await engine.resume("call")
+    assert order == ["manager", "target", "finalize"] * 2
+    assert engine._mcp_step_managers == {} and not session.quarantined
+    state = json.loads((realm.root / "state.json").read_text())
+    assert state["containers"] == {} and state["volumes"] == {}
+    print({"scenario": "actual-run-resume", "order": order})

@@ -139,6 +139,10 @@ class McpStepTimeoutError(ExecutionError):
     """
 
 
+class _McpToolTransportFailure(RuntimeError):
+    """Private signal for a transport failure from the tool await alone."""
+
+
 class McpStepExecutor:
     """Executes ``type: mcp`` workflow steps.
 
@@ -188,6 +192,8 @@ class McpStepExecutor:
         result = _to_json_safe(rendered, label)
 
         coro = manager.call_tool_structured(agent.server, agent.tool, result)
+        from conductor.mcp.manager import McpTransportError
+
         timeout = agent.timeout
         try:
             if timeout is not None:
@@ -199,6 +205,8 @@ class McpStepExecutor:
                 f"MCP step '{agent.name}' timed out after {timeout}s",
                 agent_name=agent.name,
             ) from None
+        except McpTransportError as error:
+            raise _McpToolTransportFailure("MCP tool transport failed") from error
 
         structured = envelope.get("structured")
         if isinstance(structured, dict):

@@ -274,3 +274,80 @@ async def test_no_log_record_contains_argument_or_exception_values(
     assert "shh" not in caplog.text
     assert "very specific leak text" not in caplog.text
     assert "secret_arg" not in caplog.text
+
+
+@pytest.mark.parametrize("kind", ["end", "broken", "closed", "connection", "rpc_closed"])
+async def test_transport_signal_is_classified_only_at_tool_await(kind) -> None:
+    # Requirement: declared stream failures provide a typed, value-free invalidation signal.
+    import anyio
+    from mcp import McpError
+    from mcp.types import CONNECTION_CLOSED, ErrorData
+
+    errors = {
+        "end": anyio.EndOfStream(),
+        "broken": anyio.BrokenResourceError(),
+        "closed": anyio.ClosedResourceError(),
+        "connection": ConnectionError("private transport value"),
+        "rpc_closed": McpError(ErrorData(code=CONNECTION_CLOSED, message="private RPC value")),
+    }
+    manager = _make_manager()
+    manager._safe_transport_diagnostics["server"] = True
+    manager.sessions["server"].call_tool.side_effect = errors[kind]
+    with pytest.raises(RuntimeError) as caught:
+        await manager.call_tool_structured("server", "my_tool", {})
+    assert type(caught.value).__name__ == "McpTransportError"
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["protocol", "timeout", "cancel"])
+async def test_protocol_and_control_errors_preserve_type_and_session(kind) -> None:
+    # Requirement: ordinary protocol failures and control flow never invalidate a healthy session.
+    import asyncio
+
+    from mcp import McpError
+    from mcp.types import ErrorData
+
+    errors = {
+        "protocol": McpError(ErrorData(code=-32602, message="invalid parameters")),
+        "timeout": TimeoutError(),
+        "cancel": asyncio.CancelledError(),
+    }
+    manager = _make_manager()
+    session = manager.sessions["server"]
+    failure = errors[kind]
+    session.call_tool.side_effect = failure
+    with pytest.raises(type(failure)) as caught:
+        await manager.call_tool_structured("server", "my_tool", {})
+    assert caught.value is failure
+    session.call_tool.side_effect = None
+    session.call_tool.return_value = _make_result(content=[])
+    assert (await manager.call_tool_structured("server", "my_tool", {}))["is_error"] is False
+    assert manager.sessions["server"] is session
+
+
+@pytest.mark.parametrize("stage", ["normalization", "spill"])
+async def test_transport_signal_excludes_normalization_and_spilling(stage, monkeypatch) -> None:
+    # Requirement: a connection-shaped exception outside the tool await keeps its original type.
+    failure = ConnectionError("post-exchange failure")
+    manager = _make_manager(ToolOutputConfig(enabled=True, max_chars=1000, spill_to_file=True))
+    session = manager.sessions["server"]
+
+    class FailedContent:
+        @property
+        def content(self):
+            raise failure
+
+    def failed_spill(*args, **kwargs):
+        raise failure
+
+    with monkeypatch.context() as patcher:
+        if stage == "normalization":
+            session.call_tool.return_value = FailedContent()
+        else:
+            session.call_tool.return_value = _make_result([_text_block("x" * 2000)])
+            patcher.setattr(manager, "_spill_full_output", failed_spill)
+        with pytest.raises(ConnectionError) as caught:
+            await manager.call_tool_structured("server", "my_tool", {})
+        assert caught.value is failure
+    session.call_tool.return_value = _make_result([])
+    assert (await manager.call_tool_structured("server", "my_tool", {}))["content"] == []

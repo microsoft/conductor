@@ -13,8 +13,11 @@ if sys.platform == "win32":
     pytest.skip("PTY tests are Unix-only", allow_module_level=True)
 
 import contextlib  # noqa: E402
+import errno  # noqa: E402
+import json  # noqa: E402
 import os  # noqa: E402
 import pty  # noqa: E402
+import select  # noqa: E402
 import signal  # noqa: E402
 import termios  # noqa: E402
 import time  # noqa: E402
@@ -190,7 +193,7 @@ def test_cli_run_restores_terminal(tmp_path: Path, interrupt: bool) -> None:
     command = [
         sys.executable,
         "-m",
-        "conductor.cli.app",
+        "conductor",
         "--silent",
         "run",
         str(Path("examples/wait-smoke.yaml").resolve()),
@@ -204,27 +207,56 @@ def test_cli_run_restores_terminal(tmp_path: Path, interrupt: bool) -> None:
         os._exit(127)
 
     baseline = termios.tcgetattr(master_fd)
+    output = bytearray()
     interrupted = False
+    completed_pid = 0
     deadline = time.monotonic() + 20
     try:
         while time.monotonic() < deadline:
-            if interrupt and not interrupted and time.monotonic() > deadline - 19:
-                os.write(master_fd, b"\x03")
-                interrupted = True
+            if select.select([master_fd], [], [], 0)[0]:
+                try:
+                    output.extend(os.read(master_fd, 65536))
+                except OSError as exc:
+                    if exc.errno != errno.EIO:  # PTY slave closed at child exit.
+                        raise
             completed_pid, status = os.waitpid(pid, os.WNOHANG)
             if completed_pid:
-                assert os.waitstatus_to_exitcode(status) == 0
+                assert not interrupt or interrupted, (
+                    f"CLI exited before interrupt readiness: {output.decode(errors='replace')}"
+                )
+                assert os.waitstatus_to_exitcode(status) == (130 if interrupt else 0), (
+                    f"interrupted={interrupted}, "
+                    f"terminal_restored={termios.tcgetattr(master_fd) == baseline}\n"
+                    f"{output.decode(errors='replace')}"
+                )
                 break
+            if interrupt and not interrupted:
+                # Requirement: Ctrl+C follows Runner signal setup and listener.start(),
+                # both of which precede the engine's middle wait_started event.
+                for event_log in tmp_dir.glob("conductor/*.events.jsonl"):
+                    # A concurrent write may leave an incomplete final JSONL record.
+                    events = (json.loads(line) for line in event_log.read_text().split("\n")[:-1])
+                    if any(
+                        event["type"] == "wait_started" and event["data"]["agent_name"] == "middle"
+                        for event in events
+                    ):
+                        active = termios.tcgetattr(master_fd)
+                        assert not active[3] & (termios.ICANON | termios.ECHO)
+                        assert active[3] & termios.ISIG
+                        os.write(master_fd, b"\x03")
+                        interrupted = True
+                        break
             time.sleep(0.02)
         else:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            pytest.fail("conductor run did not exit before the PTY test deadline")
+            pytest.fail(
+                f"conductor run did not exit before the PTY test deadline; "
+                f"interrupt_ready={interrupted}\n{output.decode(errors='replace')}"
+            )
 
         assert termios.tcgetattr(master_fd) == baseline
     finally:
-        with contextlib.suppress(OSError, ChildProcessError):
-            os.kill(pid, signal.SIGKILL)
-        with contextlib.suppress(ChildProcessError):
+        if not completed_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
         os.close(master_fd)
