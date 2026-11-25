@@ -757,11 +757,14 @@ async def test_docker_child_namespace_dispatch_and_reuse(realm) -> None:
 
 async def test_docker_cleanup_diagnostic_is_value_free(realm, monkeypatch, caplog) -> None:
     # Requirement: Docker cleanup warnings never publish exception text or rendered cwd values.
+    from conductor.engine.mcp_entry import McpStepEntry
+
     canary = "cleanup-private-canary"
     config = placement_config(cwd=canary)
     async with placement_engine(config, realm) as engine:
         await engine._run_mcp_step(config.agents[0], {})
         entry = next(iter(engine._mcp_step_managers.values()))
+        assert isinstance(entry, McpStepEntry)
         close = entry.manager.close
 
         async def failed_close(*, strict=False):
@@ -772,6 +775,9 @@ async def test_docker_cleanup_diagnostic_is_value_free(realm, monkeypatch, caplo
         await engine._close_mcp_step_managers()
         assert "Docker MCP cleanup is unconfirmed" in caplog.text
         assert canary not in caplog.text
+        # The injected error releases the waiter before the owned target cleanup finishes.
+        assert entry._cleanup is not None
+        await asyncio.wait_for(asyncio.shield(entry._cleanup), timeout=30)
 
 
 def test_docker_diagnostic_write_failure_keeps_suppression_notice(tmp_path, monkeypatch, caplog):
