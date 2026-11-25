@@ -124,15 +124,13 @@ def main() -> int:
         return peer(Path(argv[1]), system_root_carrier="--system-root-carrier" in argv[2:])
     helper = Path(__file__).resolve().parents[2] / "test_execution" / "docker_fake.py"
     state_path = Path(os.environ["FAKE_DOCKER_STATE"])
-    containers = json.loads(state_path.read_text())["containers"] if argv[0] == "start" else {}
-    server = next(
-        (
-            c
-            for c in containers.values()
-            if c["Id"] == argv[-1] and c["Name"].startswith("/conductor-mcp-")
-        ),
-        None,
+    # Direct MCP starts by full ID; scripts start by name.
+    containers = (
+        json.loads(state_path.read_text())["containers"]
+        if argv[:3] == ["start", "--attach", "--interactive"]
+        else {}
     )
+    server = next((c for c in containers.values() if c["Id"] == argv[-1]), None)
     if server is None and argv[0] != "run":
         # Preserve the old helper's empty input and ten-second failure bound in this process.
         def expire_control() -> None:

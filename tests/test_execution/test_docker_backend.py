@@ -1736,7 +1736,7 @@ async def test_mcp_orphan_mismatch_refuses_attach_without_removal(fake_realm, mc
     target = await backend.open_mcp_stdio(mcp_spec, lease)
     await target.aclose()
     await backend.finalize_run(lease, "failed", retain=True)
-    name = f"conductor-mcp-{lease.lease_id[:8]}-{'b' * 32}"
+    name = target.identity
     assert (
         await backend._run_docker(
             (

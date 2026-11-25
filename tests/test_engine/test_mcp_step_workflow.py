@@ -221,7 +221,7 @@ async def test_mcp_only_initialize_failure_retains_history_and_refuses_restage(
     file = Path(workspace_root) / volume / "payload"
     assert file.read_bytes() == b"initialize-mutated\n"
     assert (source / "payload").read_bytes() == b"original bundle bytes\n"
-    launches = list(tmp_path.glob("conductor-mcp-*.launcher.json"))
+    launches = list(tmp_path.glob("conductor-*.launcher.json"))
     assert len(launches) == 1
     launch = LaunchReceipt.model_validate_json(launches[0].read_text())
     peer = PeerReceipt.model_validate_json(

@@ -371,10 +371,10 @@ class DockerRunnerBackend:
         await self._ensure_staged(lease, execution, None)
         await self._ensure_image(execution, None)
         attempt = self._next_attempt(lease)
-        name = f"conductor-mcp-{lease.lease_id[:8]}-{uuid4().hex}"
         command = CommandSpec(
             spec.argv[0], spec.argv[1:], working_dir=spec.working_dir, stdin=b"", name=spec.server
         )
+        name = self._exec_container_name(command, lease, attempt)
         with self._container_env_file(
             self._create_environment(spec, self._cli_env), strict=True
         ) as path:
@@ -1089,6 +1089,11 @@ class DockerRunnerBackend:
         return attempt
 
     @staticmethod
+    def _exec_container_name(spec: CommandSpec, lease: WorkspaceLease, attempt: int) -> str:
+        step_hash = hashlib.sha1((spec.name or spec.command).encode()).hexdigest()[:8]
+        return f"conductor-{lease.lease_id[:8]}-{step_hash}-{attempt}"
+
+    @staticmethod
     def _create_environment(
         spec: CommandSpec | McpServerSpec, snapshot: Mapping[str, str]
     ) -> dict[str, str]:
@@ -1190,8 +1195,7 @@ class DockerRunnerBackend:
             )
         execution = spec.execution
         attempt = self._next_attempt(lease)
-        step_hash = hashlib.sha1((spec.name or spec.command).encode()).hexdigest()[:8]
-        name = f"conductor-{lease.lease_id[:8]}-{step_hash}-{attempt}"
+        name = self._exec_container_name(spec, lease, attempt)
         created = False
         try:
             try:

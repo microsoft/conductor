@@ -184,12 +184,18 @@ async def test_docker_cwd_mapped_key_and_single_render(realm, monkeypatch) -> No
 
 async def test_docker_incarnation_replaces_stale_pool_identity(realm) -> None:
     # Requirement: a fresh backend-issued incarnation never reuses the previous SDK session.
+    from conductor.engine.mcp_entry import McpStepEntry
+    from tests.test_mcp.fixtures.docker_stdio import LaunchReceipt
+
     config = placement_config()
     async with placement_engine(config, realm) as engine:
         await engine._run_mcp_step(config.agents[0], {})
         old_entry = next(iter(engine._mcp_step_managers.values()))
+        assert isinstance(old_entry, McpStepEntry)
         old_lease = engine._execution_session.leases["docker"]
         await old_entry.aclose()
+        (old_receipt,) = realm.root.glob("*.launcher.json")
+        old_launch = LaunchReceipt.model_validate_json(old_receipt.read_text())
         await realm.backend.finalize_run(old_lease, "succeeded")
         new_lease = await realm.backend.prepare_run(realm.run)
         assert old_lease.lease_id == new_lease.lease_id
@@ -198,10 +204,15 @@ async def test_docker_incarnation_replaces_stale_pool_identity(realm) -> None:
         try:
             await engine._run_mcp_step(config.agents[0], {})
             assert len(engine._mcp_step_managers) == 2
-            assert len(list(realm.root.glob("*.launcher.json"))) == 2
         finally:
             await engine._close_mcp_step_managers()
             await realm.backend.finalize_run(new_lease, "succeeded")
+        # Container names can repeat across incarnations; their Docker IDs cannot.
+        launches = [
+            LaunchReceipt.model_validate_json(path.read_text())
+            for path in realm.root.glob("*.launcher.json")
+        ]
+        assert sum(launch.argv[-1] != old_launch.argv[-1] for launch in launches) == 1
 
 
 @pytest.mark.parametrize("at_create", [True, False])

@@ -133,7 +133,7 @@ async def placement_engine(config: WorkflowConfig, realm: _Realm) -> AsyncIterat
                 for volume, labels in state["volumes"].items():
                     assert labels["io.conductor.incarnation"] == lease.incarnation
                     assert (await realm.backend._run_docker(("volume", "rm", "-f", volume)))[0] == 0
-            for path in realm.root.glob("conductor-mcp-*.launcher.json"):
+            for path in realm.root.glob("conductor-*.launcher.json"):
                 launch = LaunchReceipt.model_validate_json(path.read_text())
                 peer = PeerReceipt.model_validate_json(
                     path.with_name(path.name.replace(".launcher.json", ".json")).read_text()

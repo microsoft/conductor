@@ -33,6 +33,8 @@ async def test_open_mcp_builds_shared_workspace_target(
         if "--env-file" in json.loads(line)["argv"]
     )
     create = row["argv"]
+    # Requirement: direct MCP exec names hash the server name, not its executable.
+    assert target.identity == "conductor-mcp-test-a1f13b3b-1"
     identifier = json.loads(store.read_text())["containers"][target.identity]["Id"]
     assert target.args == ("start", "--attach", "--interactive", identifier)
     assert target.cwd is None and target.env == backend._cli_env == row["env"]

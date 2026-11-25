@@ -1667,7 +1667,8 @@ async def test_mcp_cli_orphan_refusal_preserves_exact_existing_container(
         } | {"io.conductor.resource": "exec"}
         if ownership == "mismatched":
             orphan_labels["io.conductor.incarnation"] = "qa-different-incarnation"
-        name = f"conductor-mcp-{live_mcp.run_id[:8]}-{uuid4().hex}"
+        step_hash = hashlib.sha1(b"qa-orphan").hexdigest()[:8]
+        name = f"conductor-{live_mcp.run_id[:8]}-{step_hash}-999"
         argv = ["create", "--name", name]
         for key, value in orphan_labels.items():
             argv.extend(("--label", f"{key}={value}"))
