@@ -547,6 +547,19 @@ def _require_script_backend_capability(key: str, backend_name: str) -> None:
         )
 
 
+def _require_mcp_backend_capability(key: str, backend_name: str) -> None:
+    """Enforce direct stdio support while preserving the local MCP path."""
+    if backend_name == "local":
+        return
+    provider = BACKEND_CAPABILITY_PROVIDERS.get(backend_name)
+    if provider is None or not provider.capabilities().mcp_stdio:
+        raise ConfigurationError(
+            f"MCP step '{key}' resolves to backend '{backend_name}', which does not "
+            "declare the 'mcp_stdio' capability required for direct stdio execution.",
+            suggestion="Use a local or Docker profile with direct MCP stdio support.",
+        )
+
+
 def remote_dialog_error(key: str, backend_name: str) -> str:
     """Name the unsupported boundary shared by compilation and runtime."""
     return (
@@ -1203,6 +1216,9 @@ def compile_run_manifest(
             if execution is not None:
                 assert definition.docker is not None and definition.docker.runner_image is not None
                 execution = execution.model_copy(update={"image": definition.docker.runner_image})
+        elif isinstance(step, MCPStepDef):
+            _require_mcp_backend_capability(key, backend_name)
+            execution = resolve_execution_spec(definition)
         else:
             if backend_name != "local":
                 raise ConfigurationError(

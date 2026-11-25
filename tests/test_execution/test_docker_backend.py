@@ -559,16 +559,86 @@ async def test_timeout_with_unconfirmed_termination_warns_and_preserves_outcome(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # Requirement: failed kill and rm leave timeout data intact and identify the live container.
+    from collections.abc import Awaitable
+
+    from conductor.execution import docker
+
     _backend, log = fake_docker
     monkeypatch.setenv("FAKE_DOCKER_SCENARIO", "termination-fails")
     monkeypatch.setenv("FAKE_DOCKER_DELAY_COMMAND", "start --attach")
-    monkeypatch.setenv("FAKE_DOCKER_DELAY", "30")
-    backend = DockerRunnerBackend("docker")
-    lease = await _lease(backend)
-    result = await backend.run_command(
-        CommandSpec(command="sleep", timeout=0.05, execution=_minimal()), lease
+    connected: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = (
+        asyncio.get_running_loop().create_future()
     )
+    native_start: list[str] = []
+    reaped: list[asyncio.subprocess.Process] = []
+    wait_for = asyncio.wait_for
+    kill_and_reap = docker._kill_and_reap
+
+    def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connected.set_result((reader, writer))
+
+    async def after_native_start[T](pending: Awaitable[T], timeout: float | None) -> T:
+        if timeout == 0.05:
+            # The budget measures the running scenario, not Python/shim startup.
+            reader, _writer = await wait_for(asyncio.shield(connected), 10)
+            native_start.extend((await wait_for(reader.readline(), 10)).decode().strip().split())
+        return await wait_for(pending, timeout)
+
+    async def observe_reap(
+        process: asyncio.subprocess.Process,
+        communicate_task: asyncio.Task[tuple[bytes, bytes]],
+    ) -> bool:
+        absorbed = await kill_and_reap(process, communicate_task)
+        assert process.returncode is not None and communicate_task.done()
+        assert not communicate_task.cancelled() and communicate_task.exception() is None
+        reaped.append(process)
+        return absorbed
+
+    async with await asyncio.start_server(accept, "127.0.0.1", 0) as server:
+        monkeypatch.setenv("FAKE_DOCKER_DELAY_READY_PORT", str(server.sockets[0].getsockname()[1]))
+        backend = DockerRunnerBackend("docker")
+        lease = await _lease(backend)
+        monkeypatch.setattr(asyncio, "wait_for", after_native_start)
+        monkeypatch.setattr(docker, "_kill_and_reap", observe_reap)
+        try:
+            result = await wait_for(
+                backend.run_command(
+                    CommandSpec(command="sleep", timeout=0.05, execution=_minimal()), lease
+                ),
+                20,
+            )
+            assert connected.done() and len(native_start) == 2, "Native start readiness missing"
+            assert len(reaped) == 1
+            reader, _writer = connected.result()
+            try:
+                assert await wait_for(reader.read(), 10) == b""
+            except ConnectionResetError as exc:
+                # Requirement: a reaped Windows peer may close with ERROR_NETNAME_DELETED.
+                if not (sys.platform == "win32" and exc.winerror == 64):
+                    raise
+        finally:
+            primary = sys.exception()
+            if connected.done() and not connected.cancelled():
+                _reader, writer = connected.result()
+                try:
+                    writer.close()
+                    try:
+                        await wait_for(writer.wait_closed(), 10)
+                    except ConnectionResetError as exc:
+                        if not (
+                            sys.platform == "win32" and exc.winerror == 64 and len(reaped) == 1
+                        ):
+                            raise
+                finally:
+                    # Requirement: observer teardown must preserve the original failure.
+                    if primary is not None:
+                        raise primary
+    assert len(reaped) == 1
+    if sys.platform != "win32":
+        assert reaped[0].pid == int(native_start[0])
     name = next(row["argv"][-1] for row in _records(log) if row["argv"][0] == "start")
+    assert native_start[1] == name
+    assert [row["argv"] for row in _records(log) if row["argv"][0] == "kill"] == [["kill", name]]
     assert result.outcome == "timed_out"
     assert "kill denied" in caplog.text and "remove denied" in caplog.text
     assert f"container={name}" in caplog.text
@@ -1635,3 +1705,125 @@ async def test_retain_skips_volume_removal_but_reclaims_containers(
     assert any(argv[:3] == ["rm", "-f", "conductor-orphan"] for argv in commands)
     assert not any(argv[:2] == ["volume", "rm"] for argv in commands)
     assert (store / "volumes/conductor-ws-keep").exists()
+
+
+@pytest.mark.parametrize("retain", [False, True])
+async def test_mcp_orphan_cleanup_only_verified_ids(fake_realm, mcp_run, retain):
+    # Requirement: terminal owners permit reclaiming verified MCP orphans under ordinary retention.
+    backend, log, store = fake_realm
+    lease = await backend.prepare_run(mcp_run)
+    from conductor.execution.types import McpServerSpec
+
+    target = await backend.open_mcp_stdio(
+        McpServerSpec("peer", ("peer",), {}, execution=_minimal()), lease
+    )
+    identifier = target.args[-1]
+    before = len(log.read_text().splitlines())
+    await backend.finalize_run(lease, "failed", retain=retain)
+
+    after = json.loads(store.read_text())
+    assert after["containers"] == {}
+    assert bool(after["volumes"]) is retain
+    rows = [json.loads(line)["argv"] for line in log.read_text().splitlines()[before:]]
+    removals = [row for row in rows if row[0] == "rm"]
+    assert removals == [["rm", "-f", identifier]]
+
+
+async def test_mcp_orphan_mismatch_refuses_attach_without_removal(fake_realm, mcp_run, mcp_spec):
+    # Requirement: retained resources block attachment without adoption, cleanup, or staging.
+    backend, log, store = fake_realm
+    lease = await backend.prepare_run(mcp_run)
+    target = await backend.open_mcp_stdio(mcp_spec, lease)
+    await target.aclose()
+    await backend.finalize_run(lease, "failed", retain=True)
+    name = target.identity
+    assert (
+        await backend._run_docker(
+            (
+                "create",
+                "--name",
+                name,
+                *backend._label_args(
+                    backend._labels(lease, "exec") | {"io.conductor.incarnation": "old"}
+                ),
+                "--entrypoint",
+                "peer",
+                "peer:image",
+            )
+        )
+    )[0] == 0
+    before = len(log.read_text().splitlines())
+    other = DockerRunnerBackend("docker")
+    with pytest.raises(WorkspaceAttachError, match="ownership|surviving"):
+        await other.attach_run(
+            mcp_run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+        )
+    after = [json.loads(line)["argv"] for line in log.read_text().splitlines()[before:]]
+    assert not any(row[0] in {"cp", "start", "run", "rm"} for row in after)
+    assert name in json.loads(store.read_text())["containers"]
+
+
+async def test_mcp_cleanup_complete_proof_allows_retained_attach(fake_realm, mcp_run, mcp_spec):
+    # Requirement: confirmed cleanup removes the target and resumes the same staged volume.
+    backend, log, store = fake_realm
+    lease = await backend.prepare_run(mcp_run)
+    target = await backend.open_mcp_stdio(mcp_spec, lease)
+    target.mark_launch_attempted()
+    assert (await backend._run_docker(target.args))[0] == 0
+    await target.validate_started()
+    await target.aclose()
+    old = json.loads(store.read_text())
+    assert old["containers"] == {}
+    first_id = target.args[-1]
+    await backend.finalize_run(lease, "failed", retain=True)
+    before = len(log.read_text().splitlines())
+    other = DockerRunnerBackend("docker")
+    resumed = await other.attach_run(
+        mcp_run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation), expect_staged=True
+    )
+    target = await other.open_mcp_stdio(mcp_spec, resumed)
+    new = json.loads(store.read_text())
+    assert target.args[-1] != first_id
+    assert new["volumes"] == old["volumes"]
+    target.mark_launch_attempted()
+    assert (await other._run_docker(target.args))[0] == 0
+    await target.validate_started()
+    await target.aclose()
+    await other.finalize_run(resumed, "succeeded")
+    later = [json.loads(line)["argv"] for line in log.read_text().splitlines()[before:]]
+    assert not any(row[:2] == ["cp", "-a"] for row in later)
+    final = json.loads(store.read_text())
+    assert final["volumes"] == {} and final["containers"] == {}
+
+
+@pytest.mark.parametrize("phase", ["volume", "pull"])
+async def test_non_mcp_attach_and_pull_keep_daemon_diagnostics(fake_realm, mcp_run, phase):
+    # Requirement: ordinary Docker attach/script diagnostics retain their existing detail.
+    backend, log, store = fake_realm
+    run = replace(mcp_run, workspace_persistence="on-failure")
+    lease = await backend.prepare_run(run)
+    other = DockerRunnerBackend("docker")
+    other._cli_env["FAKE_DOCKER_SCENARIO"] = f"attach-{phase}-error"
+    before = len(log.read_text().splitlines())
+    original = json.loads(store.read_text())
+    if phase == "volume":
+        with pytest.raises(WorkspaceAttachError, match="SECRET_DAEMON_VALUE"):
+            await other.attach_run(
+                run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+            )
+    else:
+        attached = await other.attach_run(
+            run, WorkspaceIdentity("docker", lease.lease_id, lease.incarnation)
+        )
+        diagnostics = []
+        result = await other.run_command(
+            CommandSpec("true", execution=_minimal()), attached, diagnostics=diagnostics.append
+        )
+        assert result.outcome == "start_failed"
+        assert result.start_error is not None
+        assert "SECRET_DAEMON_VALUE" in result.start_error.message
+        assert any("SECRET_DAEMON_VALUE" in line for line in diagnostics)
+    assert json.loads(store.read_text()) == original
+    rows = [json.loads(line)["argv"] for line in log.read_text().splitlines()[before:]]
+    assert not any(row[0] in {"create", "run", "start", "rm"} for row in rows)
+    assert not any(row[:2] == ["volume", "rm"] for row in rows)

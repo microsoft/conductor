@@ -55,9 +55,12 @@ from conductor.engine.run_manifest import (
     manifest_semantic_digest,
 )
 from conductor.exceptions import ConfigurationError
+from conductor.execution import errors as execution_errors
 from conductor.execution.types import (
     CommandResult,
     CommandSpec,
+    McpServerSpec,
+    McpStdioTarget,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
@@ -118,6 +121,11 @@ class _NoBatchBackend:
             shared_workspace=False,
             snapshots=False,
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        raise execution_errors.ExecutionSpecError("Test backend does not support direct stdio")
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         raise NotImplementedError

@@ -27,9 +27,12 @@ from conductor.config.schema import (
 from conductor.engine.execution_resolution import BACKEND_FACTORIES
 from conductor.engine.run_manifest import BACKEND_CAPABILITY_PROVIDERS
 from conductor.engine.workflow import WorkflowEngine
+from conductor.execution import errors as execution_errors
 from conductor.execution.types import (
     CommandResult,
     CommandSpec,
+    McpServerSpec,
+    McpStdioTarget,
     RunnerCapabilities,
     RunOutcome,
     RunSpec,
@@ -48,6 +51,11 @@ class _DockerBackend:
             shared_workspace=True,
             snapshots=False,
         )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        raise execution_errors.ExecutionSpecError("Test backend does not support direct stdio")
 
     async def prepare_run(self, run: RunSpec) -> WorkspaceLease:
         return WorkspaceLease(lease_id=run.run_id, backend="docker", incarnation="test")

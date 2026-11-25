@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePath
 from typing import cast
 from uuid import uuid4
@@ -30,6 +30,7 @@ from uuid import uuid4
 from conductor.exceptions import ConfigurationError
 from conductor.execution.agent_wire import RUNNER_ROUTING_FEATURE
 from conductor.execution.docker_agent import InterruptOutcome, stream_agent
+from conductor.execution.docker_mcp import verify_container
 from conductor.execution.docker_paths import map_agent_paths
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
@@ -39,6 +40,8 @@ from conductor.execution.types import (
     BundleRef,
     CommandResult,
     CommandSpec,
+    McpServerSpec,
+    McpStdioTarget,
     ResolvedExecutionSpec,
     RunnerCapabilities,
     RunOutcome,
@@ -88,6 +91,7 @@ class _LeaseState:
     attached: bool = False
     staged: bool = False
     expect_staged: bool = False
+    confirmed_ids: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -343,6 +347,95 @@ class DockerRunnerBackend:
             agent=True,
             interrupt=interrupt,
             retained_workspace=True,
+            mcp_stdio=True,
+        )
+
+    async def open_mcp_stdio(
+        self, spec: McpServerSpec, lease: WorkspaceLease | None
+    ) -> McpStdioTarget:
+        """Create a workspace consumer; the SDK only attaches to its immutable ID."""
+        if lease is None or lease.backend != "docker":
+            raise ExecutionSpecError("Docker MCP requires a Docker workspace lease")
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is None or state.run.bundle is None:
+            raise ExecutionSpecError("Docker MCP requires a prepared bundle lease")
+        execution = spec.execution
+        if execution is None or not execution.image:
+            raise ExecutionSpecError("Docker MCP requires an execution specification")
+        if not spec.argv or not spec.argv[0] or any("\0" in arg for arg in spec.argv):
+            raise ExecutionSpecError("Docker MCP requires a valid server argv")
+        binary = self._resolved_binary()
+        if binary is None:
+            raise ExecutionSpecError("Docker MCP CLI is unavailable")
+        await self._verify_attached_volume(lease)
+        await self._ensure_staged(lease, execution, None)
+        await self._ensure_image(execution, None)
+        attempt = self._next_attempt(lease)
+        command = CommandSpec(
+            spec.argv[0], spec.argv[1:], working_dir=spec.working_dir, stdin=b"", name=spec.server
+        )
+        name = self._exec_container_name(command, lease, attempt)
+        with self._container_env_file(
+            self._create_environment(spec, self._cli_env), strict=True
+        ) as path:
+            argv = self._create_argv(command, lease, execution, name, attempt, path)
+            rc, output, _stderr = await self._run_docker(argv)
+            identifier = output.strip()
+            if rc or not re.fullmatch(r"[0-9a-f]{64}", identifier):
+                raise ExecutionSpecError("Docker MCP create did not confirm a container ID")
+            # Keep the create receipt even if unlinking the env-file or inspection fails.
+            state.confirmed_ids[name] = identifier
+        labels = self._labels(lease, "exec") | {
+            "io.conductor.step": spec.server,
+            "io.conductor.attempt": str(attempt),
+        }
+        closing: asyncio.Task[bool] | None = None
+
+        async def close() -> None:
+            nonlocal closing
+            if closing is None:
+                closing = asyncio.create_task(
+                    self._cleanup_container(lease, identifier, kill=False)
+                )
+            try:
+                removed = await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                await _await_task_cleanup(cast(asyncio.Task[object], closing))
+                raise
+            if not removed:
+                raise ExecutionSpecError("Docker MCP cleanup unconfirmed")
+
+        # Before inspect succeeds, only the regular label/name/ID sweep may remove it.
+        await verify_container(self._run_docker, identifier, name, labels)
+        try:
+            await self._verify_created_volume(lease)
+        except BaseException:
+            # The label-verified create ID remains visible to the sweep if removal fails.
+            with contextlib.suppress(ExecutionSpecError):
+                await close()
+            raise
+        attempted = False
+
+        def mark_launch_attempted() -> None:
+            nonlocal attempted
+            if attempted or closing is not None or self._lease_key(lease) in self._closed_leases:
+                raise ExecutionSpecError("Docker MCP launch attempt is already consumed")
+            attempted = True
+
+        async def validate_started() -> None:
+            if not attempted or closing is not None:
+                raise ExecutionSpecError("Docker MCP launch is not active")
+            await verify_container(self._run_docker, identifier, name, labels)
+            await self._verify_created_volume(lease)
+
+        return McpStdioTarget(
+            binary,
+            ("start", "--attach", "--interactive", identifier),
+            dict(self._cli_env),
+            name,
+            close,
+            mark_launch_attempted,
+            validate_started,
         )
 
     async def run_agent(
@@ -996,7 +1089,14 @@ class DockerRunnerBackend:
         return attempt
 
     @staticmethod
-    def _create_environment(spec: CommandSpec, snapshot: Mapping[str, str]) -> dict[str, str]:
+    def _exec_container_name(spec: CommandSpec, lease: WorkspaceLease, attempt: int) -> str:
+        step_hash = hashlib.sha1((spec.name or spec.command).encode()).hexdigest()[:8]
+        return f"conductor-{lease.lease_id[:8]}-{step_hash}-{attempt}"
+
+    @staticmethod
+    def _create_environment(
+        spec: CommandSpec | McpServerSpec, snapshot: Mapping[str, str]
+    ) -> dict[str, str]:
         # On Windows the host env is case-insensitive while the container's
         # Linux env is case-sensitive; a spec.env key differing from a host
         # variable only by case replaces it here (see the Windows environment
@@ -1010,7 +1110,7 @@ class DockerRunnerBackend:
 
     @staticmethod
     @contextlib.contextmanager
-    def _container_env_file(env: Mapping[str, str]) -> Iterator[str]:
+    def _container_env_file(env: Mapping[str, str], *, strict: bool = False) -> Iterator[str]:
         for name, value in env.items():
             if not name or name.startswith("#") or _ENV_NAME_FORBIDDEN.search(name) is not None:
                 raise ExecutionSpecError(f"invalid container environment variable name: {name}")
@@ -1030,6 +1130,8 @@ class DockerRunnerBackend:
                 try:
                     _unlink_with_retry(Path(path))
                 except OSError as exc:
+                    if strict:
+                        raise
                     logger.warning("Could not remove Docker container env file %s: %s", path, exc)
 
     def _create_argv(
@@ -1093,8 +1195,7 @@ class DockerRunnerBackend:
             )
         execution = spec.execution
         attempt = self._next_attempt(lease)
-        step_hash = hashlib.sha1((spec.name or spec.command).encode()).hexdigest()[:8]
-        name = f"conductor-{lease.lease_id[:8]}-{step_hash}-{attempt}"
+        name = self._exec_container_name(spec, lease, attempt)
         created = False
         try:
             try:
@@ -1210,6 +1311,8 @@ class DockerRunnerBackend:
         )
 
     async def _cleanup_container(self, lease: WorkspaceLease, name: str, *, kill: bool) -> bool:
+        state = self._lease_states.get(self._lease_key(lease))
+        confirmed_id = state is not None and name in state.confirmed_ids.values()
         failures: list[str] = []
         absent = False
         if kill:
@@ -1223,7 +1326,18 @@ class DockerRunnerBackend:
                 failures.append(f"kill: {_bounded(str(exc))}")
         try:
             rc, _stdout, stderr = await self._run_docker(("rm", "-f", name))
-            removed = rc == 0 or (rc != _CLI_TIMEOUT_RC and "no such container" in stderr.lower())
+            missing = "no such container" in stderr.lower()
+            if confirmed_id:
+                missing = (
+                    re.fullmatch(
+                        r"(?:error response from daemon: |error: )?no such (?:container|object): "
+                        + re.escape(name),
+                        stderr.strip(),
+                        re.IGNORECASE,
+                    )
+                    is not None
+                )
+            removed = rc == 0 or (rc != _CLI_TIMEOUT_RC and missing)
             if not removed:
                 failures.append(f"rm -f: {_bounded(stderr)} (exit {rc})")
         except Exception as exc:
@@ -1235,7 +1349,7 @@ class DockerRunnerBackend:
                 "Manual cleanup: docker rm -f %s",
                 lease.lease_id,
                 name,
-                _bounded("; ".join(failures)),
+                "removal not confirmed" if confirmed_id else _bounded("; ".join(failures)),
                 name,
             )
         return removed or absent
@@ -1344,7 +1458,6 @@ class DockerRunnerBackend:
             await _await_task_cleanup(cast(asyncio.Task[object], task))
         cancelled = caller is not None and caller.cancelling() > cancelling_before
         self._attempts.pop(key, None)
-        self._lease_states.pop(key, None)
         cleanup_task = asyncio.create_task(
             self._finalize_resources(lease, retain=True)
             if retain
@@ -1357,6 +1470,8 @@ class DockerRunnerBackend:
             cancelled = True
         except Exception as exc:
             self._warn_cleanup(lease, str(exc))
+        finally:
+            self._lease_states.pop(key, None)
         if cancelled:
             raise asyncio.CancelledError
 
@@ -1406,6 +1521,18 @@ class DockerRunnerBackend:
         valid_labels = valid_resource and all(labels.get(k) == v for k, v in expected.items())
         if not valid_labels or not isinstance(name, str) or _CONTAINER_NAME.match(name) is None:
             self._warn_cleanup(lease, f"container {candidate} failed label/name verification")
+            return
+        state = self._lease_states.get(self._lease_key(lease))
+        if state is not None and (identifier := state.confirmed_ids.get(name.removeprefix("/"))):
+            metadata = data[0] if isinstance(data, list) else data
+            if metadata.get("Id") != identifier:
+                logger.warning(
+                    "Skipping replacement Docker container %s (run_id=%s)",
+                    candidate,
+                    lease.lease_id,
+                )
+                return
+            await self._cleanup_container(lease, identifier, kill=False)
             return
         rc, _stdout, stderr = await self._run_docker(("rm", "-f", candidate))
         if rc != 0 and "no such container" not in stderr.lower():

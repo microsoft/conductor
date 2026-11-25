@@ -19,7 +19,8 @@ Covers:
   finally — and the CancelledError propagates unchanged; external
   cancellation of the whole group cancels+drains children the same way
 
-All MCP interaction is mocked — no real MCP servers are spawned.
+Legacy cases use MCP doubles. Docker placement cases run real SDK peers
+through an executable fake Docker CLI.
 """
 
 from __future__ import annotations
@@ -50,6 +51,44 @@ from conductor.config.schema import (
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ExecutionError
+from tests.test_engine.mcp_placement import placement_config, placement_engine
+
+
+@pytest.fixture
+def realm(tmp_path, monkeypatch):
+    from tests.test_mcp.fixtures.docker_realm import create_realm
+
+    return create_realm(tmp_path, monkeypatch)
+
+
+async def test_same_name_for_each_docker_profiles_and_events(realm) -> None:
+    # Requirement: equal inline names resolve by group; same full keys reuse across item metadata.
+    config = placement_config()
+    async with placement_engine(config, realm) as engine:
+        events = []
+        engine._event_emitter.subscribe(events.append)
+        for group in config.for_each:
+            result = await engine._execute_for_each_group(group)
+            assert result.count == 2 and result.errors == {}
+        assert len(engine._mcp_step_managers) == 2
+        assert len(list(realm.root.glob("*.launcher.json"))) == 2
+        assert engine._execution_session.executed_backends() == {"docker"}
+        assert engine._execution_session._file_consumers["docker"] == {
+            "for_each.first.agent",
+            "for_each.second.agent",
+            "for_each.third.agent",
+        }
+        mcp_events = [event for event in events if event.type.startswith("mcp_")]
+        assert len(mcp_events) == 12
+        assert {
+            (event.type, event.data["group_name"], event.data["item_key"], event.data["index"])
+            for event in mcp_events
+        } == {
+            (kind, group, str(index), index)
+            for kind in ("mcp_started", "mcp_completed")
+            for group in ("first", "second", "third")
+            for index in (0, 1)
+        }
 
 
 def _make_engine(config: WorkflowConfig) -> WorkflowEngine:
@@ -927,10 +966,19 @@ class TestMcpInForEach:
         original_step = engine._run_mcp_step
 
         async def recording_step(
-            agent: AgentDef, agent_context: Any, *, event_fields: Any = None
+            agent: AgentDef,
+            agent_context: Any,
+            *,
+            event_fields: Any = None,
+            for_each_group: str | None = None,
         ) -> Any:
             try:
-                return await original_step(agent, agent_context, event_fields=event_fields)
+                return await original_step(
+                    agent,
+                    agent_context,
+                    event_fields=event_fields,
+                    for_each_group=for_each_group,
+                )
             except asyncio.CancelledError:
                 if event_fields and event_fields.get("item_key") == "1":
                     order.append("sibling-cancelled")
