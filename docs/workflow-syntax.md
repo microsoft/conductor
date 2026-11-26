@@ -461,6 +461,12 @@ The `working_dir` field can be defined globally in `workflow.runtime.working_dir
 3. **Relative Paths:** Relative paths are resolved against the directory containing the workflow YAML file. When the workflow file location is unknown, relative paths resolve against the current process directory.
 4. **Lexical Normalization:** Paths are normalized lexically using `os.path.normpath`. The engine does not resolve symlinks dynamically.
 
+For Docker-backed agents, Docker checks the mapped directory in the live
+workspace rather than on the host. An agent can therefore use a directory
+created by an earlier Docker script step, even when that directory is absent
+from the host and the original bundle. See
+[Docker agent working directories](#docker-agent-working-directories).
+
 #### Symlink Semantics
 
 Because paths are normalized lexically instead of resolving to their real paths:
@@ -3291,6 +3297,28 @@ Remote Copilot also rejects `runtime.max_tokens` because its runner SDK cannot e
 that limit. Remote OpenAI and Claude forward the configured `temperature` and
 `max_tokens` to their in-realm providers. The host does not start a model-provider
 session merely to resolve a remote agent's settings.
+
+#### Docker Agent Working Directories
+
+Relative agent `working_dir` values are resolved against the directory of the
+current workflow YAML, including a child workflow's YAML, before Docker maps
+them to paths in `/workspace`. When a host path matches overlapping declared
+bundle source roots, Docker checks the mapped candidates in stable order, with
+longer matching roots first. It skips missing paths, non-directories, and paths
+that resolve successfully outside `/workspace`. The first usable candidate
+wins; if none is usable, the agent fails with a not-found error. Permission and
+other filesystem I/O errors stop the search instead of trying another candidate.
+
+For a nonempty effective `working_dir` that maps successfully, Docker uses one
+additional time-bounded runner `exec` to check all candidates before provider
+dispatch. It repeats the check on each agent invocation, including resumed
+runs, rather than caching a previous result. No working-directory probe runs
+when neither the agent nor the runtime sets `working_dir`, or when mapping
+fails.
+
+The check reflects the live workspace only at the time of the probe. It does
+not create the directory or sandbox the agent, and it cannot prevent workspace
+changes between the check and use.
 
 #### Environment Inheritance (`inherit_control_environment`)
 

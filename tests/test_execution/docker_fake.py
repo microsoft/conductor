@@ -229,6 +229,15 @@ def main() -> int:
                     release.sendall(b"I")
             print('{"accepted":true}')
             return 0
+        if argv[1:2] == ["-i"] and argv[3:8] == [
+            "python",
+            "-I",
+            "-S",
+            "-c",
+            "import sys;exec(bytes.fromhex(sys.stdin.readline()))",
+        ]:
+            print(os.environ["FAKE_DOCKER_CWD_REPLY"])
+            return int(os.environ["FAKE_DOCKER_CWD_RC"])
         request = json.loads(stdin)
         if scenario == "realm-malformed":
             sys.stdout.buffer.write(b"{not-json}\n")

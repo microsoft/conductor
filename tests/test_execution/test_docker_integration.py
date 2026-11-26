@@ -39,6 +39,7 @@ import os
 import subprocess
 import textwrap
 from collections.abc import Generator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -55,7 +56,7 @@ from conductor.engine.context import WorkflowContext
 from conductor.engine.limits import LimitEnforcer
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
-from conductor.exceptions import ExecutionError
+from conductor.exceptions import ConfigurationError, ExecutionError
 from conductor.execution.docker import _STAGING_COPY_MODE, DockerRunnerBackend
 from conductor.execution.types import (
     AgentSpec,
@@ -725,6 +726,63 @@ async def _assert_realm_resources_gone(run_id: str) -> None:
         rc, stdout, stderr = await _docker(*argv)
         assert rc == 0, stderr
         assert not stdout.strip(), f"orphaned Docker resource for {run_id}: {stdout}"
+
+
+@pytest.mark.asyncio
+async def test_agent_uses_script_created_working_dir(
+    docker_daemon: str, runner_image: str, tmp_path: Path
+) -> None:
+    # Requirement: each dispatch chooses from live volume paths and never falls back on denial.
+    del docker_daemon
+    run_id = _unique("agent-live-cwd")
+    bundle, _skill = _agent_bundle(tmp_path)
+    parent = tmp_path / "child"
+    bundle = replace(bundle, source_roots=(*bundle.source_roots, (str(parent), "roots/00")))
+    backend = DockerRunnerBackend("docker")
+    lease = await backend.prepare_run(RunSpec(run_id=run_id, bundle=bundle))
+    spec = AgentSpec(
+        name="probe",
+        execution_id="live-cwd",
+        model_provider="copilot",
+        model=None,
+        rendered_prompt="read-cwd-marker",
+        working_dir=str(parent / "generated"),
+        execution=ResolvedExecutionSpec(image=runner_image),
+    )
+    first = "/workspace/roots/00/generated"
+    second = "/workspace/main/child/generated"
+    try:
+        for mutation, marker in (
+            (
+                f"mkdir -p {first} {second}; printf 1 > {first}/marker; printf 2 > {second}/marker",
+                "1",
+            ),
+            (f"rm -r {first}; touch {first}", "2"),
+            (f"rm {first}; ln -s /tmp {first}", "2"),
+            (f"rm {first}; mkdir {first}; chmod 000 {first}", None),
+        ):
+            script = await backend.run_command(
+                CommandSpec(
+                    command="sh",
+                    args=("-ec", mutation),
+                    execution=ResolvedExecutionSpec(image=PINNED_BUSYBOX),
+                    inherit_control_environment=False,
+                ),
+                lease,
+            )
+            assert script.outcome == "completed" and script.exit_code == 0, script
+            invocation = replace(spec, execution_id=uuid4().hex)
+            if marker is None:
+                dispatched = asyncio.Event()
+                with pytest.raises(ConfigurationError, match="filesystem error.*EACCES"):
+                    await backend.run_agent(invocation, lease, on_dispatch=dispatched.set)
+                assert not dispatched.is_set()
+            else:
+                result = await backend.run_agent(invocation, lease)
+                assert result.content == {"answer": marker}
+    finally:
+        await backend.finalize_run(lease, "succeeded")
+        await _assert_realm_resources_gone(run_id)
 
 
 @pytest.mark.asyncio
