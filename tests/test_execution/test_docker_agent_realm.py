@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -952,7 +953,7 @@ async def test_interrupt_conflict_drains_the_racing_terminal_result(
 
 
 def test_staged_paths_match_bundle_topology(tmp_path: Path) -> None:
-    # Requirement: skill, plugin skill, and working directory paths must match staged files.
+    # Requirement: skills match staged topology while cwd candidates only require declared roots.
     bundle = _bundle(tmp_path)
     skill = tmp_path / "skills" / "review"
     skill.mkdir(parents=True)
@@ -1008,27 +1009,41 @@ def test_staged_paths_match_bundle_topology(tmp_path: Path) -> None:
         ),
         bundle,
     )
-    assert mapped.skill_directories == (
+    assert mapped.spec.skill_directories == (
         "/workspace/skills/review",
         "/workspace/plugins/plug/skills/lint",
     )
-    assert mapped.working_dir == "/workspace/main"
-    (Path(bundle.store_path) / "tree/main/sub").mkdir()
-    assert (
-        map_agent_paths(replace(spec, working_dir="sub"), bundle).working_dir
-        == "/workspace/main/sub"
-    )
-    with pytest.raises(ConfigurationError, match="escapes the staged bundle"):
-        map_agent_paths(replace(spec, working_dir="../outside"), bundle)
-    assert mapped.mcp_servers == {"server": {"command": "npx", "args": ["mcp-server"]}}
+    assert mapped.working_dir_candidates == ("/workspace/main",)
+    assert map_agent_paths(
+        replace(spec, working_dir="generated/../other"), bundle
+    ).working_dir_candidates == ("/workspace/main/other",)
+    invalid = [("../outside", "escapes the staged bundle"), ("bad\0path", "NUL")]
+    if os.name == "posix":
+        invalid.extend(
+            (path, "escapes the staged bundle")
+            for path in ("/workspace/../shared/job", "/workspace//../shared/job")
+        )
+        declared = replace(bundle, source_roots=(("/workspace", "host"), ("/shared", "shared")))
+        assert map_agent_paths(
+            replace(spec, working_dir="/workspace//generated"), declared
+        ).working_dir_candidates == ("/workspace/generated",)
+        assert map_agent_paths(
+            replace(spec, working_dir="/shared/job"), declared
+        ).working_dir_candidates == ("/workspace/shared/job",)
+        invalid.append(("/shared/job", "outside the staged Docker bundle"))
+    for path, diagnostic in invalid:
+        with pytest.raises(ConfigurationError, match=diagnostic):
+            map_agent_paths(replace(spec, working_dir=path), bundle)
+    assert mapped.spec.mcp_servers == {"server": {"command": "npx", "args": ["mcp-server"]}}
     extra = tmp_path / "external"
-    extra.mkdir()
-    (Path(bundle.store_path) / "tree/roots/00").mkdir(parents=True)
-    extra_bundle = replace(bundle, source_roots=(*bundle.source_roots, (str(extra), "roots/00")))
-    assert (
-        map_agent_paths(replace(spec, working_dir=str(extra)), extra_bundle).working_dir
-        == "/workspace/roots/00"
-    )
+    overlap = (str(extra), "roots/00")
+    extra_bundle = replace(bundle, source_roots=(*bundle.source_roots, overlap, overlap))
+    assert map_agent_paths(
+        replace(spec, working_dir=str(extra / "job")), extra_bundle
+    ).working_dir_candidates == ("/workspace/roots/00/job", "/workspace/main/external/job")
+    assert map_agent_paths(
+        replace(spec, working_dir=str(extra / "../sibling")), extra_bundle
+    ).working_dir_candidates == ("/workspace/main/sibling",)
     with pytest.raises(ConfigurationError, match="staged bundle topology"):
         map_agent_paths(replace(spec, skill_directories=(str(tmp_path / "other"),)), bundle)
     clone = tmp_path / "other" / "review"
@@ -1069,10 +1084,67 @@ def _execute_bodies(log: Path) -> list[dict[str, Any]]:
         json.loads(row["stdin"])
         for row in _rows(log)
         if row["argv"][:2] == ["exec", "-i"]
+        and row["argv"][3:5] == ["python", "-m"]
         and "--health" not in row["argv"]
         and "--interrupt" not in row["argv"]
         and row["stdin"]
     ]
+
+
+@pytest.mark.parametrize(
+    ("reply", "exit_code", "diagnostic"),
+    [
+        pytest.param(
+            {"status": "no_candidate"},
+            0,
+            "not found in the live Docker workspace",
+            id="no_candidate",
+        ),
+        pytest.param(
+            {"status": "filesystem_error", "index": 0, "errno": 13},
+            0,
+            "live Docker workspace filesystem error.*EACCES",
+            id="filesystem_error",
+        ),
+        pytest.param(
+            {"status": "selected", "index": 0},
+            1,
+            "Docker working_dir probe failed",
+            id="transport_failure",
+        ),
+    ],
+)
+async def test_working_dir_preflight_refuses_without_dispatch(
+    fake_realm: tuple[DockerRunnerBackend, Path, Path],
+    tmp_path: Path,
+    reply: dict[str, str | int],
+    exit_code: int,
+    diagnostic: str,
+) -> None:
+    # Requirement: a staged cwd does not bypass live validation or allow dispatch on failure.
+    backend, log, _state = fake_realm
+    backend._cli_env["FAKE_DOCKER_CWD_REPLY"] = json.dumps(reply)
+    backend._cli_env["FAKE_DOCKER_CWD_RC"] = str(exit_code)
+    lease = await backend.prepare_run(RunSpec(run_id="run_ABC-1", bundle=_bundle(tmp_path)))
+    dispatched = asyncio.Event()
+    with pytest.raises(ConfigurationError, match=diagnostic):
+        await backend.run_agent(
+            replace(_spec(), working_dir=str(tmp_path)), lease, on_dispatch=dispatched.set
+        )
+    assert not dispatched.is_set()
+    assert _execute_bodies(log) == []
+    (probe,) = [row for row in _rows(log) if row["argv"][3:5] == ["python", "-I"]]
+    assert probe["argv"][:2] == ["exec", "-i"]
+    assert probe["argv"][3:] == [
+        "python",
+        "-I",
+        "-S",
+        "-c",
+        "import sys;exec(bytes.fromhex(sys.stdin.readline()))",
+    ]
+    program, candidates = probe["stdin"].split("\n", 1)
+    assert bytes.fromhex(program).decode("utf-8").strip()
+    assert json.loads(candidates) == ["/workspace/main"]
 
 
 @pytest.mark.asyncio
@@ -1088,6 +1160,8 @@ async def test_routing_preference_reaches_advertising_runner(
     await backend.run_agent(_spec(), lease)
 
     tiered, plain = _execute_bodies(log)
+    assert plain["agent"]["working_dir"] is None
+    assert not any(row["argv"][3:5] == ["python", "-I"] for row in _rows(log))
     assert tiered["agent"]["fusion_tier"] == "max"
     assert "auto_tier" not in tiered["agent"]
     assert "fusion_tier" not in plain["agent"] and "auto_tier" not in plain["agent"]

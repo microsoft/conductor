@@ -22,15 +22,15 @@ import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePath
-from typing import cast
+from typing import Final, cast
 from uuid import uuid4
 
 from conductor.exceptions import ConfigurationError
 from conductor.execution.agent_wire import RUNNER_ROUTING_FEATURE
 from conductor.execution.docker_agent import InterruptOutcome, stream_agent
-from conductor.execution.docker_paths import map_agent_paths
+from conductor.execution.docker_paths import DockerAgentPathMapping, map_agent_paths
 from conductor.execution.errors import ExecutionSpecError, WorkspaceAttachError
 from conductor.execution.types import (
     AgentEventSink,
@@ -69,6 +69,36 @@ _CONTAINER_NAME = re.compile(r"\A/?conductor-[A-Za-z0-9_-]+\Z")
 # snapshot on every Windows run.
 _ENV_NAME_FORBIDDEN = re.compile(r"[=\n\r\0]")
 _WINDOWS_PATH = re.compile(r"\A([A-Za-z]:|\\\\)")
+
+# Keep shell-sensitive source out of argv for Windows .cmd wrappers. Only this
+# static program is executed; the remaining stdin is JSON data.
+_WORKING_DIR_BOOTSTRAP: Final = "import sys;exec(bytes.fromhex(sys.stdin.readline()))"
+_WORKING_DIR_PROBE: Final = """\
+import errno
+import json
+import os
+import stat
+import sys
+
+def in_workspace(path):
+    return path == "/workspace" or path.startswith("/workspace/")
+
+def select(candidates):
+    for index, candidate in enumerate(candidates):
+        try:
+            target = os.path.realpath(candidate, strict=True)
+            if not in_workspace(target) or not stat.S_ISDIR(os.stat(target).st_mode):
+                continue
+            os.chdir(candidate)
+            if in_workspace(os.getcwd()):
+                return {"status": "selected", "index": index}
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+                return {"status": "filesystem_error", "index": index, "errno": exc.errno}
+    return {"status": "no_candidate"}
+
+print(json.dumps(select(json.load(sys.stdin))))
+"""
 
 # Spike finding (see docs/design/docker-backend.md, "Spike Findings and
 # Ownership Mechanism"): candidate 1 (plain cp) left uid 65532 unable to
@@ -530,6 +560,61 @@ class DockerRunnerBackend:
             raise _runner_rebuild_error(image, "returned invalid health JSON")
         return health
 
+    async def _select_agent_working_dir(
+        self, runner: _RunnerState, mapping: DockerAgentPathMapping
+    ) -> AgentSpec:
+        candidates = mapping.working_dir_candidates
+        if not candidates:
+            return mapping.spec
+        invocation = f"Agent {mapping.spec.name!r} working_dir {mapping.spec.working_dir!r}"
+        stdin_bytes = (
+            _WORKING_DIR_PROBE.encode("utf-8").hex() + "\n" + json.dumps(candidates)
+        ).encode("ascii")
+        try:
+            rc, stdout, stderr = await self._run_docker(
+                ("exec", "-i", runner.name, "python", "-I", "-S", "-c", _WORKING_DIR_BOOTSTRAP),
+                stdin_bytes=stdin_bytes,
+            )
+        except OSError as exc:
+            raise ConfigurationError(
+                f"{invocation}: Docker working_dir probe failed to launch the Docker CLI"
+            ) from exc
+        if rc != 0:
+            raise ConfigurationError(
+                f"{invocation}: Docker working_dir probe failed (exit {rc}): {_bounded(stderr)}"
+            )
+        malformed = f"{invocation}: Docker working_dir probe returned an invalid response"
+        try:
+            pairs = json.loads(stdout, object_pairs_hook=tuple)
+        except (ValueError, RecursionError) as exc:
+            raise ConfigurationError(malformed) from exc
+        if not isinstance(pairs, tuple):
+            raise ConfigurationError(malformed)
+        response = dict(pairs)
+        if len(response) != len(pairs):
+            raise ConfigurationError(malformed)
+        match response:
+            case {"status": "selected", "index": index, **extra} if (
+                not extra and type(index) is int and 0 <= index < len(candidates)
+            ):
+                return replace(mapping.spec, working_dir=candidates[index])
+            case {"status": "no_candidate", **extra} if not extra:
+                raise ConfigurationError(f"{invocation} not found in the live Docker workspace")
+            case {"status": "filesystem_error", "index": index, "errno": code, **extra} if (
+                not extra
+                and type(index) is int
+                and 0 <= index < len(candidates)
+                and (code is None or (type(code) is int and code > 0))
+            ):
+                label = (
+                    errno.errorcode.get(code, str(code)) if code is not None else "unknown errno"
+                )
+                raise ConfigurationError(
+                    f"{invocation}: live Docker workspace filesystem error ({label})"
+                )
+            case _:
+                raise ConfigurationError(malformed)
+
     async def _execute_agent(
         self,
         spec: AgentSpec,
@@ -554,7 +639,9 @@ class DockerRunnerBackend:
                 f"{RUNNER_ROUTING_FEATURE!r}, so it cannot honor fusion_tier/auto_tier. "
                 "Rebuild the runner image from this Conductor version."
             )
-        mapped = map_agent_paths(spec, state.run.bundle)
+        mapped = await self._select_agent_working_dir(
+            runner, map_agent_paths(spec, state.run.bundle)
+        )
 
         async def send_interrupt(execution_id: str) -> InterruptOutcome:
             rc, _stdout, stderr = await self._run_docker(

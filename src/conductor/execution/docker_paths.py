@@ -1,4 +1,4 @@
-"""Translate collected host dependencies to a Docker workspace snapshot."""
+"""Map Docker agent dependencies and lexical working directory candidates."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import posixpath
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,14 @@ _REMEDY = (
     "Declare the path under workflow.bundle.additional_roots or include the skill/plugin "
     "in the workflow bundle before running the agent in Docker."
 )
+
+
+@dataclass(frozen=True, slots=True)
+class DockerAgentPathMapping:
+    """Invocation with bundled skills and ordered candidates for live cwd selection."""
+
+    spec: AgentSpec
+    working_dir_candidates: tuple[str, ...]
 
 
 def _matches_file(source: Path, logical: str, entries: dict[str, str], store_path: str) -> bool:
@@ -71,9 +79,11 @@ def _map_skill(
     )
 
 
-def _map_working_dir(value: str | None, bundle: BundleRef) -> str | None:
+def _working_dir_candidates(value: str | None, bundle: BundleRef) -> tuple[str, ...]:
     if value is None:
-        return None
+        return ()
+    if "\0" in value:
+        raise ConfigurationError(f"Agent working_dir {value!r} contains a NUL character.")
     if not os.path.isabs(value):
         parts = Path(os.path.normpath(value)).parts
         logical = posixpath.normpath(posixpath.join(bundle.root, *parts))
@@ -81,35 +91,30 @@ def _map_working_dir(value: str | None, bundle: BundleRef) -> str | None:
             raise ConfigurationError(
                 f"Agent working_dir {value!r} escapes the staged bundle", suggestion=_REMEDY
             )
-        if (Path(bundle.store_path) / "tree" / logical).is_dir():
-            return "/workspace/" + logical
-        raise ConfigurationError(f"Agent working_dir {value!r} is not staged", suggestion=_REMEDY)
-    source = Path(os.path.abspath(value))
+        return ("/workspace/" + logical,)
     if value.startswith("/workspace/"):
-        logical = posixpath.normpath(value.removeprefix("/workspace/"))
-        if (
-            logical != ".."
-            and not logical.startswith("../")
-            and (Path(bundle.store_path) / "tree" / logical).is_dir()
-        ):
-            return "/workspace/" + logical
+        candidate = posixpath.normpath(value)
+        if candidate == "/workspace" or candidate.startswith("/workspace/"):
+            return (candidate,)
         raise ConfigurationError(
             f"Agent working_dir {value!r} escapes the staged bundle", suggestion=_REMEDY
         )
+    source = Path(os.path.abspath(value))
+    candidates = {}
     for host, namespace in sorted(bundle.source_roots, key=lambda item: -len(item[0])):
         root = Path(os.path.abspath(host))
         if source.is_relative_to(root):
             relative = source.relative_to(root)
-            staged = Path(bundle.store_path) / "tree" / namespace / relative
-            if staged.is_dir():
-                return "/workspace/" + (Path(namespace) / relative).as_posix()
+            candidates["/workspace/" + (Path(namespace) / relative).as_posix()] = None
+    if candidates:
+        return tuple(candidates)
     raise ConfigurationError(
         f"Agent working_dir {value!r} is outside the staged Docker bundle.",
         suggestion=_REMEDY,
     )
 
 
-def map_agent_paths(spec: AgentSpec, bundle: BundleRef | None) -> AgentSpec:
+def map_agent_paths(spec: AgentSpec, bundle: BundleRef | None) -> DockerAgentPathMapping:
     """Map host agent paths onto their published Docker workspace locations.
 
     Args:
@@ -117,7 +122,7 @@ def map_agent_paths(spec: AgentSpec, bundle: BundleRef | None) -> AgentSpec:
         bundle: Published bundle containing the staged files and path mapping.
 
     Returns:
-        A copy of the invocation with staged skill and working directories.
+        The invocation with staged skill directories and candidates to check in the runner.
 
     Raises:
         ConfigurationError: If the bundle topology is unreadable or a required
@@ -134,10 +139,12 @@ def map_agent_paths(spec: AgentSpec, bundle: BundleRef | None) -> AgentSpec:
         entries = {entry["logical_path"]: entry["digest"] for entry in manifest["entries"]}
     except (OSError, KeyError, ValueError, TypeError) as exc:
         raise ConfigurationError("Docker agent bundle has no readable topology") from exc
-    return replace(
-        spec,
-        skill_directories=tuple(
-            _map_skill(path, bundle, manifest, entries) for path in spec.skill_directories
+    return DockerAgentPathMapping(
+        spec=replace(
+            spec,
+            skill_directories=tuple(
+                _map_skill(path, bundle, manifest, entries) for path in spec.skill_directories
+            ),
         ),
-        working_dir=_map_working_dir(spec.working_dir, bundle),
+        working_dir_candidates=_working_dir_candidates(spec.working_dir, bundle),
     )

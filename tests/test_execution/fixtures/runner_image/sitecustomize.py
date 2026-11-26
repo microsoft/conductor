@@ -2,6 +2,8 @@
 
 import asyncio
 import os
+import subprocess
+import sys
 from contextlib import suppress
 from pathlib import Path
 
@@ -16,6 +18,13 @@ class FixtureProvider:
     async def execute(self, agent, context, prompt, **kwargs):
         callback = kwargs["event_callback"]
         callback("agent_message", {"content": "fixture-event"})
+        if prompt == "read-cwd-marker":
+            marker = subprocess.check_output(
+                [sys.executable, "-I", "-S", "-c", "print(open('marker').read(), end='')"],
+                cwd=agent.working_dir,
+                text=True,
+            )
+            return AgentOutput(content={"answer": marker}, raw_response=None)
         if prompt.startswith("overlap:"):
             # A FIFO on the shared volume requires both runner processes to arrive.
             def meet_other_runner():

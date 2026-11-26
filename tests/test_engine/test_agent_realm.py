@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -25,6 +27,7 @@ from conductor.config.schema import (
     ValidatorConfig,
     WorkflowConfig,
     WorkflowDef,
+    WorkflowStepDef,
 )
 from conductor.engine.run_manifest import ManifestExecutionSpec
 from conductor.engine.workflow import AgentRealm, WorkflowEngine
@@ -150,6 +153,70 @@ def _place(
     )
     monkeypatch.setattr(engine, "_agent_realm", lambda *_args, **_kwargs: realm)
     return realm
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("working_dir", "expected_dir"),
+    [
+        pytest.param("generated", "child/generated", id="relative"),
+        pytest.param(
+            "/workspace/../shared/job",
+            "/shared/job",
+            id="posix-lexical",
+            marks=pytest.mark.skipif(os.name == "nt", reason="Requires a POSIX absolute path"),
+        ),
+    ],
+)
+async def test_docker_relative_working_dir_does_not_require_host_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, working_dir: str, expected_dir: str
+) -> None:
+    # Requirement: Docker receives a normalized cwd based on the child YAML without a host check.
+    child_dir = tmp_path / "child"
+    child_dir.mkdir()
+    (child_dir / "child.yaml").write_text(
+        f"""\
+workflow:
+  name: child
+  entry_point: writer
+  runtime:
+    provider: copilot
+agents:
+  - name: writer
+    prompt: Write
+    working_dir: {working_dir}
+    routes:
+      - to: "$end"
+""",
+        encoding="utf-8",
+    )
+    parent_path = tmp_path / "parent.yaml"
+    parent_path.write_text("{}", encoding="utf-8")
+    engine = WorkflowEngine(
+        WorkflowConfig(
+            workflow=WorkflowDef(
+                name="parent",
+                entry_point="child",
+                runtime=RuntimeConfig(),
+            ),
+            agents=[
+                WorkflowStepDef(
+                    name="child", workflow="child/child.yaml", routes=[RouteDef(to="$end")]
+                )
+            ],
+        ),
+        CopilotProvider(mock_handler=lambda *_: pytest.fail("Unexpected host provider call")),
+        workflow_path=parent_path,
+    )
+    backend = RecordingAgentBackend()
+    realm = _place(engine, backend, monkeypatch)
+    monkeypatch.setattr(WorkflowEngine, "_agent_realm", lambda *_args, **_kwargs: realm)
+    assert not (child_dir / "generated").exists()
+
+    await engine.run({})
+
+    expected_cwd = os.path.normpath(tmp_path / expected_dir)
+    assert [spec.working_dir for spec in backend.specs] == [expected_cwd]
 
 
 @pytest.mark.asyncio

@@ -58,12 +58,12 @@ def test_skill_host_case_uses_platform_normcase(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, skill=skill)
     spec = replace(_spec(), skill_directories=(str(skill),))
     exact = replace(bundle, agent_paths=((str(skill), "skills/review"),))
-    assert map_agent_paths(spec, exact).skill_directories == ("/workspace/skills/review",)
+    assert map_agent_paths(spec, exact).spec.skill_directories == ("/workspace/skills/review",)
 
     alias = str(skill).swapcase()
     differently_cased = replace(bundle, agent_paths=((alias, "skills/review"),))
     if os.path.normcase(alias) == os.path.normcase(str(skill)):
-        assert map_agent_paths(spec, differently_cased).skill_directories == (
+        assert map_agent_paths(spec, differently_cased).spec.skill_directories == (
             "/workspace/skills/review",
         )
     else:
@@ -74,15 +74,11 @@ def test_skill_host_case_uses_platform_normcase(tmp_path: Path) -> None:
 def test_relative_working_dir_uses_host_separators(tmp_path: Path) -> None:
     # Requirement: host separators resolve before the path is emitted as a POSIX workspace path.
     bundle = _bundle(tmp_path)
-    staged = Path(bundle.store_path) / "tree/main"
-    (staged / "src/pkg").mkdir(parents=True)
-    assert map_agent_paths(replace(_spec(), working_dir="src/pkg"), bundle).working_dir == (
-        "/workspace/main/src/pkg"
-    )
-
-    authored = r"src\pkg"
-    parts = Path(os.path.normpath(authored)).parts
-    staged.joinpath(*parts).mkdir(parents=True, exist_ok=True)
-    assert map_agent_paths(replace(_spec(), working_dir=authored), bundle).working_dir == (
-        "/workspace/main/" + "/".join(parts)
-    )
+    spellings = ["src/pkg", r"src\pkg"]
+    if not os.path.isabs("/workspace/generated"):
+        spellings.append("/workspace/generated")
+    for authored in spellings:
+        parts = Path(os.path.normpath(authored)).parts
+        assert map_agent_paths(
+            replace(_spec(), working_dir=authored), bundle
+        ).working_dir_candidates == ("/workspace/main/" + "/".join(parts),)

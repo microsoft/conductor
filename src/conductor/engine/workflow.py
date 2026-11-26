@@ -1240,6 +1240,7 @@ class WorkflowEngine:
         field: Literal["working_dir", "settings_dir"],
         raw: str,
         mapper: LocalWorkspacePathMapper | None = None,
+        check_host_directory: bool = True,
     ) -> str:
         """Render and absolutize one authored directory value.
 
@@ -1252,15 +1253,17 @@ class WorkflowEngine:
         normalised with :func:`os.path.normpath` (``resolve()`` is
         deliberately not used so symlink aliases stay distinct).
 
+        Generic Docker working directories are checked by the backend rather
+        than on the host.
+
         Applies to ``working_dir`` as well as ``settings_dir``: a value that
         renders empty previously resolved to the workflow file's own directory
         and ran there, which is the same footgun in a quieter form, so both
         are refused.
 
         Raises:
-            ExecutionError: if the value renders empty, or if the resolved
-                path is not an existing directory — both before any provider
-                call.
+            ExecutionError: if the value renders empty, or if host directory
+                checking is enabled and the resolved path is not a directory.
         """
         rendered = self.renderer.render(raw, agent_context)
         # A template can render empty even when the raw value passed the schema's
@@ -1292,7 +1295,7 @@ class WorkflowEngine:
             path = base / path
         resolved = os.path.normpath(path)
 
-        if not Path(resolved).is_dir():
+        if check_host_directory and not Path(resolved).is_dir():
             raise ExecutionError(
                 f"Agent '{agent.name}': {field} '{resolved}' does not exist or "
                 f"is not a directory (rendered from '{raw}')",
@@ -1339,7 +1342,12 @@ class WorkflowEngine:
             raw = self.config.workflow.runtime.working_dir
         if raw is not None:
             update["working_dir"] = self._resolve_agent_directory(
-                agent, agent_context, field="working_dir", raw=raw, mapper=mapper
+                agent,
+                agent_context,
+                field="working_dir",
+                raw=raw,
+                mapper=mapper,
+                check_host_directory=realm is None or realm.name != "docker",
             )
         elif mapper is not None:
             update["working_dir"] = mapper(None)
