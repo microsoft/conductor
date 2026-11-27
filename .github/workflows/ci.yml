@@ -488,3 +488,6 @@ jobs:
 
       - name: Run Docker integration tests
         run: uv run pytest tests/test_execution/test_docker_integration.py -m docker_integration -v
+
+      - name: Run OCI registry integration test
+        run: uv run pytest -p no:cacheprovider tests/test_registry/test_oci_docker_integration.py -m docker_integration -v

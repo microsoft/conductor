@@ -41,6 +41,7 @@ def write_bundle_archive(
     out: Path,
     *,
     executable_paths: Collection[str],
+    posix_links: bool = False,
 ) -> str:
     """Write the staged bundle tree at ``staged_tree`` as a tar.gz at ``out``.
 
@@ -60,6 +61,7 @@ def write_bundle_archive(
         executable_paths: POSIX relative paths that receive mode ``0o755``.
             All other regular files receive ``0o644``. The store supplies
             this from the bundle manifest rather than host filesystem modes.
+        posix_links: Encode native separators as slashes for verified OCI imports.
 
     Returns:
         ``"sha256:<hex>"`` — the digest of the archive bytes as written.
@@ -76,7 +78,7 @@ def write_bundle_archive(
         tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar,
     ):
         for path in entries:
-            _add_entry(tar, staged_tree, path, executable_paths)
+            _add_entry(tar, staged_tree, path, executable_paths, posix_links=posix_links)
     digest = hashlib.sha256()
     with open(out, "rb") as written:
         for chunk in iter(lambda: written.read(_READ_CHUNK_SIZE), b""):
@@ -89,6 +91,8 @@ def _add_entry(
     staged_tree: Path,
     path: Path,
     executable_paths: Collection[str],
+    *,
+    posix_links: bool,
 ) -> None:
     """Add one staged path to the archive, files as data and symlinks as links."""
     arcname = path.relative_to(staged_tree).as_posix()
@@ -102,6 +106,8 @@ def _add_entry(
     if stat.S_ISLNK(st.st_mode):
         info.type = tarfile.SYMTYPE
         info.linkname = os.readlink(path)
+        if posix_links:
+            info.linkname = info.linkname.replace(os.sep, "/")
         info.mode = 0o777
         info.size = 0
         tar.addfile(info)

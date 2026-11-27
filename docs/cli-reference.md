@@ -17,6 +17,8 @@ Complete command-line reference for Conductor.
 - [`conductor checkpoint list`](#conductor-checkpoint-list)
 - [`conductor validate`](#conductor-validate)
 - [`conductor bundle build`](#conductor-bundle-build)
+- [`conductor bundle push`](#conductor-bundle-push)
+- [`conductor bundle pull`](#conductor-bundle-pull)
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
 - [`conductor mcp serve`](#conductor-mcp-serve)
@@ -1275,6 +1277,93 @@ Bundles are stored under `$CONDUCTOR_HOME/cache/bundles/sha256-<hex>/`:
 ### CI Priming
 
 `conductor bundle build` serves as the CI priming step for workflow dependencies. Unlike `conductor validate` (which runs offline), `conductor bundle build` fetches and caches any remote plugin sources declared in `runtime.plugin_sources`. After running `conductor bundle build` during a CI preparation stage, subsequent workflow runs and validations can execute in isolated, offline environments.
+
+## `conductor bundle push`
+
+Build and verify a run bundle from a workflow file or a Git/path workflow
+registry reference, then publish it to an OCI registry tag.
+
+```bash
+conductor bundle push workflow.yaml --to oci://registry.example.com/team/workflow:v1
+conductor bundle push workflow.yaml --to oci://registry.example.com/team/workflow:v1 --auth basic
+conductor bundle push --help
+```
+
+Use `--environment NAME_OR_PATH` to select an execution environment document;
+the default is the built-in local environment. Push refuses incomplete bundles.
+**Review the collected file closure before pushing:** the upload includes its
+contents (such as includes, templates, skills, plugins, and declared assets).
+Conductor does not scan the closure for secrets.
+
+The `OCI manifest:` line prints a complete, copyable immutable reference of
+the form `oci://HOST/REPO@sha256:<64 lowercase hex digits>`. The `Bundle digest:`
+line is a separate digest for the bundle contents. `Entrypoint:` is the
+bundle-relative path to the root workflow.
+
+## `conductor bundle pull`
+
+Verify an OCI run bundle and import it into the local content-addressed store
+(CAS). Pull does not load the entrypoint as a workflow or execute it.
+
+```bash
+conductor bundle pull oci://registry.example.com/team/workflow:v1
+conductor bundle pull oci://registry.example.com/team/workflow:v1 --auth basic
+conductor bundle pull oci://registry.example.com/team/workflow:v1 --offline
+conductor bundle pull --help
+```
+
+For a pinned pull, replace the tag reference with the full reference copied
+from `OCI manifest:`. Push accepts only a tag; pull accepts a tag or a
+`sha256` digest. Both require an explicit registry host, repository and selector.
+Tags are case-sensitive. Docker shorthand, embedded credentials, query strings
+and fragments are not supported.
+
+Push and offline pull print three lines: the immutable OCI manifest reference,
+bundle digest and entrypoint. Online pull prints those same lines, then adds
+`Store:` with the actual path to the verified bundle in the local
+content-addressed store (CAS). The bundle is stored under
+`$CONDUCTOR_HOME/cache/bundles/sha256-<bundle hex>` (default home: `~/.conductor`).
+
+`--offline` checks an existing local receipt and verifies the corresponding CAS
+entry without loading ORAS, looking up credentials, making HTTP requests, or
+checking for updates. For a tag, it uses the last successfully recorded local
+mapping; it does not check the current remote tag. A missing receipt requires
+an online pull. Offline verification trusts the receipt as part of
+`CONDUCTOR_HOME`; it is not a signature check or a replay of wire verification.
+An online failure does not fall back to stale local data, and OCI pull does not
+repair a corrupt existing CAS entry.
+
+### OCI authentication, trust and limits
+
+Online push and pull start with HTTPS and certificate verification. For a
+private CA, configure a trusted CA bundle for Requests with `REQUESTS_CA_BUNDLE`.
+The default `--auth token` uses the registry token flow; use `--auth basic` for
+a Basic-only registry. ORAS 0.2.44 reads `~/.docker/config.json`, not
+`DOCKER_CONFIG`: inline `auths`, per-registry `credHelpers`, and `credsStore`
+are supported, with helper binaries found on `PATH`. The Basic backend also
+accepts `ORAS_USER` and `ORAS_PASS` together.
+
+ORAS handles credential selection and forwarding, token and storage endpoints,
+redirects, and its built-in request retries; Conductor does not impose a
+separate network policy or retry uploads independently. Conductor sanitizes
+the registry exceptions it translates into CLI errors. ORAS can still emit its
+own diagnostics, including registry-supplied messages or credential-helper
+output; treat those logs as potentially sensitive.
+
+OCI v1 limits the OCI manifest to 4 MiB, the config and the bundle manifest
+inside the archive to 64 MiB each, and the compressed layer and decoded tar to 640 MiB
+each. A bundle may contain up to 10,000 declared entries, 512 MiB of regular
+file payload, and 50,000 nodes including implicit directories. Logical paths
+and symlink targets are limited to 1,024 UTF-8 bytes. A symlink to an empty
+directory not represented in the archive is not supported.
+
+Conductor applies download limits to the final manifest, config and layer
+responses returned by ORAS, counting bytes as it reads rather than trusting
+`Content-Length`. On pull, the manifest and config are buffered within their
+limits and the layer is streamed to disk. On push, ORAS 0.2.44 reads each blob
+into memory for upload, including the compressed layer. These are not
+process-wide memory limits and do not bound token, error or redirect
+responses handled internally by ORAS.
 
 ## `conductor doctor`
 

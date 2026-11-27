@@ -555,8 +555,16 @@ def main(
         # mixed into it even though it is not itself a stdout-protocol risk
         # (E8-T3).
         args = sys.argv[1:]
-        subcommand = next((a for a in args if not a.startswith("-")), None)
-        if subcommand not in ("update", "doctor", "mcp"):
+        first = next((i for i, arg in enumerate(args) if not arg.startswith("-")), len(args))
+        commands = args[first:]
+        if commands[:2] == ["bundle", "--"]:
+            commands = [commands[0], *commands[2:]]
+        pull_args = commands[2:]
+        if "--" in pull_args:
+            pull_args = pull_args[: pull_args.index("--")]
+        # The root callback runs before Typer invokes the pull command.
+        offline_pull = commands[:2] == ["bundle", "pull"] and "--offline" in pull_args
+        if args[first : first + 1] not in (["update"], ["doctor"], ["mcp"]) and not offline_pull:
             from conductor.cli.update import check_for_update_hint
 
             check_for_update_hint(console)
