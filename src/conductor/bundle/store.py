@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -153,36 +154,140 @@ def publish_bundle(
             _quarantine_and_remove(final, key, digest)
 
         entries_by_path = {entry.logical_path: entry for entry in manifest.entries}
-        executable_paths = {
-            entry.logical_path
-            for entry in manifest.entries
-            if entry.kind == "file" and entry.executable
-        }
-        staging = Path(tempfile.mkdtemp(dir=base))
-        # The archive is written next to the staging dir, never inside it: the
-        # archive walk must not see the archive being written.
-        archive_tmp = base / f".{staging.name}.tar.gz"
-        try:
-            _stage_tree(staging, manifest, files, links, entries_by_path)
-            _ = write_bundle_archive(staging, archive_tmp, executable_paths=executable_paths)
-            os.replace(archive_tmp, staging / _ARCHIVE_NAME)
-            # Sentinel last: only a directory whose bundle.json carries the
-            # requested digest is ever handed to a caller. Writing bytes avoids
-            # platform newline translation and matches the archived copy.
-            (staging / _SENTINEL_NAME).write_bytes(_manifest_bytes(manifest))
-            _publish(staging, final, digest)
-        finally:
-            _ = shutil.rmtree(staging, ignore_errors=True)
-            with contextlib.suppress(OSError):
-                archive_tmp.unlink()
+        _stage_and_publish(
+            final, manifest, lambda staging: _stage_tree(staging, files, links, entries_by_path)
+        )
     return final
 
 
-@contextmanager
-def _digest_lock(path: Path) -> Generator[None]:
-    """Hold an exclusive cross-process lock for one bundle digest."""
-    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+def _is_reparse(info: os.stat_result) -> bool:
+    return bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _plain_stat(path: Path) -> os.stat_result:
+    """Inspect a CAS node without opening the target of any reparse point."""
+    if sys.platform == "win32":
+        # lstat skips name surrogates only, not all reparse points.
+        fd = _open_windows_node(path)
+        try:
+            info = os.fstat(fd)
+        finally:
+            os.close(fd)
+    else:
+        info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+        raise OSError(f"Unsafe bundle store node: {path}")
+    return info
+
+
+def _checked_store_base(*, create: bool = False) -> Path:
+    """Resolve the trusted home only; never redirect below it."""
+    configured = bundle_store_base()
+    home = configured.parent.parent.resolve()
+    if create:
+        home.mkdir(parents=True, exist_ok=True)
+    cache = home / configured.parent.name
+    base = cache / configured.name
+    for directory in (cache, base):
+        if create:
+            # Path.mkdir(exist_ok=True) probes is_dir(), which follows links.
+            with contextlib.suppress(FileExistsError):
+                directory.mkdir()
+        if not stat.S_ISDIR(_plain_stat(directory).st_mode):
+            raise OSError(f"Unsafe bundle store directory: {directory}")
+    return base
+
+
+def _publish_import(
+    manifest: BundleManifest, stage: Callable[[Path], None], verify: Callable[[Path], None]
+) -> Path:
+    """Reuse only a verified CAS entry, without the build path's repair policy."""
+    key = bundle_store_key(manifest.bundle_digest)
+    base = _checked_store_base(create=True)
+    final = base / key
+    with _digest_lock(base / f".{key}.lock", checked=True):
+        try:
+            _plain_stat(final)
+        except FileNotFoundError:
+            _stage_and_publish(final, manifest, stage, verify=verify)
+        else:
+            verify(final)
+    return final
+
+
+def _stage_and_publish(
+    final: Path,
+    manifest: BundleManifest,
+    stage: Callable[[Path], None],
+    *,
+    verify: Callable[[Path], None] | None = None,
+) -> None:
+    executable_paths = {
+        entry.logical_path
+        for entry in manifest.entries
+        if entry.kind == "file" and entry.executable
+    }
+    staging = Path(tempfile.mkdtemp(dir=final.parent))
+    # The archive walk must not see the archive being written.
+    archive_tmp = final.parent / f".{staging.name}.tar.gz"
     try:
+        stage(staging)
+        manifest_copy = staging / _STORE_MANIFEST_COPY
+        manifest_copy.parent.mkdir(exist_ok=True)
+        content = _manifest_bytes(manifest)
+        manifest_copy.write_bytes(content)
+        if verify is None:
+            _ = write_bundle_archive(staging, archive_tmp, executable_paths=executable_paths)
+        else:
+            _ = write_bundle_archive(
+                staging, archive_tmp, executable_paths=executable_paths, posix_links=True
+            )
+        os.replace(archive_tmp, staging / _ARCHIVE_NAME)
+        (staging / _SENTINEL_NAME).write_bytes(content)
+        if verify is not None:
+            verify(staging)
+        _publish(staging, final, manifest.bundle_digest, verify=verify)
+    finally:
+        _ = shutil.rmtree(staging, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            archive_tmp.unlink()
+
+
+if sys.platform == "win32":
+
+    def _open_windows_node(path: Path, *, lock: bool = False) -> int:
+        """Open the node itself for metadata or for the existing CAS lock."""
+        import _winapi
+        import msvcrt
+
+        access = 0xC0000000 if lock else 0x80  # GENERIC_READ | GENERIC_WRITE; FILE_READ_ATTRIBUTES
+        share = 3 if lock else 7  # FILE_SHARE_READ | FILE_SHARE_WRITE [| FILE_SHARE_DELETE]
+        disposition = 4 if lock else 3  # OPEN_ALWAYS; OPEN_EXISTING
+        flags = 0x00200000 | 0x02000000  # OPEN_REPARSE_POINT | BACKUP_SEMANTICS (directories)
+        handle = _winapi.CreateFile(str(path), access, share, 0, disposition, flags, 0)
+        try:
+            mode = os.O_RDWR if lock else os.O_RDONLY
+            return msvcrt.open_osfhandle(handle, mode | os.O_BINARY)
+        except OSError:
+            _winapi.CloseHandle(handle)
+            raise
+
+
+@contextmanager
+def _digest_lock(path: Path, *, checked: bool = False) -> Generator[None]:
+    """Hold an exclusive cross-process lock for one bundle digest."""
+    if checked and sys.platform == "win32":
+        fd = _open_windows_node(path, lock=True)
+    else:
+        flags = os.O_CREAT | os.O_RDWR
+        if checked:
+            flags |= os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(path, flags)
+    try:
+        if checked:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or _is_reparse(info) or info.st_nlink != 1:
+                raise OSError(f"Unsafe bundle store lock: {path}")
         if sys.platform == "win32":
             import msvcrt
 
@@ -193,7 +298,9 @@ def _digest_lock(path: Path) -> Generator[None]:
                     os.lseek(fd, 0, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
                     break
-                except OSError:
+                except OSError as exc:
+                    if checked and exc.errno != errno.EACCES:
+                        raise
                     time.sleep(0.05)
         else:
             import fcntl
@@ -262,12 +369,11 @@ def _contained_target(staging_root: Path, logical_path: str) -> Path:
 
 def _stage_tree(
     staging: Path,
-    manifest: BundleManifest,
     files: Mapping[str, bytes],
     links: Mapping[str, str],
     entries_by_path: Mapping[str, BundleEntry],
 ) -> None:
-    """Materialize the entry tree plus the in-archive manifest copy in staging."""
+    """Materialize ordinary build payloads in staging."""
     staging_root = staging.resolve()
     for logical_path, data in files.items():
         entry = entries_by_path.get(logical_path)
@@ -288,11 +394,6 @@ def _stage_tree(
         target = _contained_target(staging_root, logical_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         _ = os.symlink(link_target, target)
-    manifest_copy = staging / _STORE_MANIFEST_COPY
-    manifest_copy.parent.mkdir(parents=True, exist_ok=True)
-    # Byte-identical to the bundle.json sentinel written after the archive,
-    # so the archived .bundle/manifest.json matches the stored manifest.
-    manifest_copy.write_bytes(_manifest_bytes(manifest))
 
 
 def _is_valid_store_dir(final: Path, digest: str) -> bool:
@@ -313,7 +414,9 @@ def _is_valid_store_dir(final: Path, digest: str) -> bool:
     return isinstance(stored_digest, str) and stored_digest == digest
 
 
-def _publish(staging: Path, final: Path, digest: str) -> None:
+def _publish(
+    staging: Path, final: Path, digest: str, *, verify: Callable[[Path], None] | None = None
+) -> None:
     """Move the completed staging tree into place, tolerating a lost race.
 
     Two publishers of the same digest may finish staging concurrently. The
@@ -332,6 +435,14 @@ def _publish(staging: Path, final: Path, digest: str) -> None:
         lost_race = exc.errno in _LOST_RACE_ERRNOS or (
             sys.platform == "win32" and getattr(exc, "winerror", None) == 5
         )
-        if lost_race and final.is_dir() and _is_valid_store_dir(final, digest):
-            return
+        if lost_race:
+            if verify is not None:
+                try:
+                    _plain_stat(final)
+                except FileNotFoundError:
+                    raise exc from None
+                verify(final)
+                return
+            if final.is_dir() and _is_valid_store_dir(final, digest):
+                return
         raise
