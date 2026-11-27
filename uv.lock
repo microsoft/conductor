@@ -447,6 +447,7 @@ dependencies = [
     { name = "microsoft-copilot-sdk" },
     { name = "openai" },
     { name = "opentelemetry-api" },
+    { name = "oras" },
     { name = "packaging" },
     { name = "psutil" },
     { name = "pydantic" },
@@ -511,6 +512,7 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'telemetry'", specifier = ">=1.20" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'telemetry'", specifier = ">=1.20" },
     { name = "opentelemetry-sdk", marker = "extra == 'telemetry'", specifier = ">=1.20" },
+    { name = "oras", specifier = "==0.2.44" },
     { name = "packaging", specifier = ">=21.0" },
     { name = "psutil", specifier = ">=6.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
@@ -1561,6 +1563,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/37/3f/50f95972b50e8e353f5b9342034c9cd17730f1956f009ce6a3fbbd89f9ce/opentelemetry_semantic_conventions-0.66b2.tar.gz", hash = "sha256:7da5f1a5dc4383eb66711d4d3d3e71824d9403ac1559fea021cc103c1a4c4976", size = 150246, upload-time = "2026-10-29T17:29:55.682Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/67/bd/6bf33ed31521c565931c037e9e81bac47c1acb000e850c6e24220e2a0c00/opentelemetry_semantic_conventions-0.66b2-py3-none-any.whl", hash = "sha256:4cbe61e5f9275d57ab31708446e7938ef4291ebbe6a7fca6f7a629c5acae87d8", size = 206280, upload-time = "2026-10-29T17:29:35.062Z" },
+]
+
+[[package]]
+name = "oras"
+version = "0.2.44"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jsonschema" },
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c0/92/45719088d695714259d768a286639b3563e931db8e46e3820427ca6040e8/oras-0.2.44.tar.gz", hash = "sha256:4bc8ebf56f324f5ca8e2278e4ceaa906ffb5e5030d198b80c073e8338e54acf5", size = 61918, upload-time = "2026-11-18T05:08:08.804Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/99/fb7c16f35fc9085335edf996e7a57d33d79425d42011ad6201152f7306bb/oras-0.2.44-py3-none-any.whl", hash = "sha256:7bfbfa166d2874a26b2ff87d5a95262686ba12e0ae8623f20dc0cdc1bd20d26b", size = 74863, upload-time = "2026-11-18T05:08:07.507Z" },
 ]
 
 [[package]]
