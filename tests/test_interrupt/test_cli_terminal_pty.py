@@ -16,6 +16,7 @@ import contextlib  # noqa: E402
 import os  # noqa: E402
 import pty  # noqa: E402
 import signal  # noqa: E402
+import sysconfig  # noqa: E402
 import termios  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -179,18 +180,17 @@ def test_cli_run_restores_terminal(tmp_path: Path, interrupt: bool) -> None:
     tmp_dir = tmp_path / "tmp"
     home_dir.mkdir()
     tmp_dir.mkdir()
-    env = dict(
-        os.environ,
-        HOME=str(home_dir),
-        TMPDIR=str(tmp_dir),
-        TMP=str(tmp_dir),
-        TEMP=str(tmp_dir),
-        CONDUCTOR_HOME=str(tmp_path / "conductor-home"),
-    )
+    # Do not pass through provider credentials or user configuration overrides.
+    env = {
+        "HOME": str(home_dir),
+        "USERPROFILE": str(home_dir),
+        "TMPDIR": str(tmp_dir),
+        "TMP": str(tmp_dir),
+        "TEMP": str(tmp_dir),
+        "CONDUCTOR_HOME": str(tmp_path / "conductor-home"),
+    }
     command = [
-        sys.executable,
-        "-m",
-        "conductor.cli.app",
+        str(Path(sysconfig.get_path("scripts")) / "conductor"),
         "--silent",
         "run",
         str(Path("examples/wait-smoke.yaml").resolve()),
@@ -198,33 +198,53 @@ def test_cli_run_restores_terminal(tmp_path: Path, interrupt: bool) -> None:
     if interrupt:
         command.extend(["--input", "middle_duration_ms=30000"])
 
-    pid, master_fd = pty.fork()
-    if pid == 0:
-        os.execve(command[0], command, env)
-        os._exit(127)
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as start, os.fdopen(write_fd, "wb") as release:
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            try:
+                release.close()
+                if start.read(1) == b"1":
+                    start.close()
+                    os.execve(command[0], command, env)
+            finally:
+                os._exit(127)
 
-    baseline = termios.tcgetattr(master_fd)
-    interrupted = False
-    deadline = time.monotonic() + 20
-    try:
-        while time.monotonic() < deadline:
-            if interrupt and not interrupted and time.monotonic() > deadline - 19:
-                os.write(master_fd, b"\x03")
-                interrupted = True
-            completed_pid, status = os.waitpid(pid, os.WNOHANG)
-            if completed_pid:
-                assert os.waitstatus_to_exitcode(status) == 0
-                break
-            time.sleep(0.02)
-        else:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
-            pytest.fail("conductor run did not exit before the PTY test deadline")
+        try:
+            # Capture the original mode before the child can enter cbreak.
+            baseline = termios.tcgetattr(master_fd)
+            assert baseline[3] & termios.ICANON
+            release.write(b"1")
+            release.close()
 
-        assert termios.tcgetattr(master_fd) == baseline
-    finally:
-        with contextlib.suppress(OSError, ChildProcessError):
-            os.kill(pid, signal.SIGKILL)
-        with contextlib.suppress(ChildProcessError):
-            os.waitpid(pid, 0)
-        os.close(master_fd)
+            interrupted = False
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                completed_pid, status = os.waitpid(pid, os.WNOHANG)
+                if completed_pid:
+                    exit_code = os.waitstatus_to_exitcode(status)
+                    assert not interrupt or interrupted, f"CLI exited before cbreak: {exit_code}"
+                    assert exit_code == (130 if interrupt else 0)
+                    break
+                if interrupt and not interrupted:
+                    lflag = termios.tcgetattr(master_fd)[3]
+                    if lflag & termios.ISIG and not lflag & (termios.ICANON | termios.ECHO):
+                        os.write(master_fd, b"\x03")
+                        interrupted = True
+                time.sleep(0.02)
+            else:
+                if interrupt and not interrupted:
+                    pytest.fail("conductor run did not enter cbreak before the PTY test deadline")
+                pytest.fail("conductor run did not exit before the PTY test deadline")
+
+            assert termios.tcgetattr(master_fd) == baseline
+        finally:
+            try:
+                # Signal only a still-owned child, never an already reaped PID.
+                with contextlib.suppress(ChildProcessError):
+                    if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+            finally:
+                os.close(master_fd)
