@@ -20,53 +20,64 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn
 
 import typer
 
 from conductor.console import make_console, styled
 
 if TYPE_CHECKING:
+    from conductor.bundle.collector import CollectedBundle
     from conductor.bundle.model import BundleDescriptor, BundleEntry
+    from conductor.bundle.oci_receipts import OciReceipt
+    from conductor.config.environment import ResolvedEnvironment
+    from conductor.config.schema import WorkflowConfig
     from conductor.registry.resolver import ResolvedRef
+
+BundleWorkflow = Annotated[
+    str,
+    typer.Argument(
+        help=(
+            "Workflow YAML file path or registry reference "
+            "(name, name@registry, name@registry#ref)."
+        ),
+    ),
+]
+BundleEnvironment = Annotated[
+    str | None,
+    typer.Option(
+        "--environment",
+        help=(
+            "Execution environment name or path to an environment document. "
+            "Default: the built-in local environment."
+        ),
+    ),
+]
+BundleAuth = Annotated[
+    Literal["token", "basic"],
+    typer.Option("--auth", help="Registry authentication backend (online only)."),
+]
 
 console = make_console(stderr=True)
 output_console = make_console()
 
 bundle_app = typer.Typer(
     name="bundle",
-    help="Build content-addressed run bundles for workflows.",
+    help="Build and transfer content-addressed run bundles for workflows.",
     no_args_is_help=True,
 )
 
 
-def _fail(exc: Exception) -> NoReturn:
+def _fail(exc: Exception, *, copyable: bool = False) -> NoReturn:
     """Print a hard error the markup-safe way and exit with code 1."""
-    console.print(styled("[bold red]Error:[/bold red] {}", exc))
+    console.print(styled("[bold red]Error:[/bold red] {}", exc), soft_wrap=copyable)
     raise typer.Exit(code=1) from None
 
 
 @bundle_app.command("build")
 def build_bundle(
-    workflow: Annotated[
-        str,
-        typer.Argument(
-            help=(
-                "Workflow YAML file path or registry reference "
-                "(name, name@registry, name@registry#ref)."
-            ),
-        ),
-    ],
-    environment: Annotated[
-        str | None,
-        typer.Option(
-            "--environment",
-            help=(
-                "Execution environment name or path to an environment document. "
-                "Default: the built-in local environment."
-            ),
-        ),
-    ] = None,
+    workflow: BundleWorkflow,
+    environment: BundleEnvironment = None,
 ) -> None:
     """Build a content-addressed run bundle for a workflow.
 
@@ -90,22 +101,57 @@ def build_bundle(
         conductor bundle build workflow.yaml --environment demo
         conductor bundle build 'qa-bot@official#v1.2.3'
     """
-    from conductor.registry.cache import resolve_and_fetch
-    from conductor.registry.errors import RegistryError
-    from conductor.registry.resolver import resolve_ref
-
-    try:
-        resolved_ref = resolve_ref(workflow)
-        workflow_path = Path(resolve_and_fetch(resolved_ref))
-    except RegistryError as exc:
-        _fail(exc)
-
+    workflow_path, resolved_ref = _resolve_workflow(workflow)
     _build_impl(
         workflow_path,
         authored_ref=workflow,
         resolved_ref=resolved_ref,
         environment_name=environment,
     )
+
+
+def _resolve_workflow(workflow: str) -> tuple[Path, ResolvedRef]:
+    """Resolve and acquire a file or registry workflow for build or push."""
+    from conductor.registry.cache import resolve_and_fetch
+    from conductor.registry.errors import RegistryError
+    from conductor.registry.resolver import resolve_ref
+
+    try:
+        resolved_ref = resolve_ref(workflow)
+        return Path(resolve_and_fetch(resolved_ref)), resolved_ref
+    except RegistryError as exc:
+        _fail(exc)
+
+
+def _collect(
+    workflow_path: Path, environment_name: str | None, warnings: list[str]
+) -> tuple[CollectedBundle, WorkflowConfig, ResolvedEnvironment]:
+    """Acquire dependencies and collect a fresh closure, without publishing it."""
+    from conductor.bundle import collect_bundle
+    from conductor.config.environment import builtin_local_environment, resolve_environment
+    from conductor.config.loader import load_config
+    from conductor.plugins.resolution import resolve_plugin_sources
+
+    config = load_config(workflow_path)
+    resolved_env = (
+        resolve_environment(environment_name, workflow_dir=workflow_path.parent)
+        if environment_name is not None
+        else builtin_local_environment()
+    )
+    if declared := config.workflow.runtime.plugin_sources:
+        resolve_plugin_sources(
+            declared,
+            base_dir=workflow_path.resolve().parent,
+            allow_network=True,
+            on_warning=warnings.append,
+        )
+    collected = collect_bundle(
+        workflow_path,
+        environment=resolved_env,
+        allow_network=True,
+        on_warning=warnings.append,
+    )
+    return collected, config, resolved_env
 
 
 def _build_impl(
@@ -116,49 +162,18 @@ def _build_impl(
     environment_name: str | None,
 ) -> None:
     """Execute the build after the workflow reference has been resolved."""
-    from conductor.bundle import collect_bundle, publish_bundle
+    from conductor.bundle import publish_bundle
     from conductor.bundle.errors import BundleError
     from conductor.bundle.store import bundle_store_path
-    from conductor.config.environment import builtin_local_environment, resolve_environment
-    from conductor.config.loader import load_config
     from conductor.digest import canonical_json_digest
     from conductor.engine.run_manifest import compile_run_manifest
     from conductor.exceptions import ConfigurationError
     from conductor.plugins.errors import PluginError
-    from conductor.plugins.resolution import resolve_plugin_sources
 
     warnings: list[str] = []
     publish_warnings: list[str] = []
     try:
-        # Explicit root-config load (rather than ``load_workflow``): the
-        # config object feeds both the plugin-source prefetch and the
-        # run-manifest compilation below.
-        config = load_config(workflow_path)
-
-        resolved_env = (
-            resolve_environment(environment_name, workflow_dir=workflow_path.parent)
-            if environment_name is not None
-            else builtin_local_environment()
-        )
-
-        declared = config.workflow.runtime.plugin_sources
-        if declared:
-            # Network acquisition is legal here: build is the CI priming
-            # verb, mirroring ``cli/run.py::_prefetch_plugin_sources``.
-            resolve_plugin_sources(
-                declared,
-                base_dir=workflow_path.resolve().parent,
-                allow_network=True,
-                on_warning=warnings.append,
-            )
-
-        collected = collect_bundle(
-            workflow_path,
-            environment=resolved_env,
-            allow_network=True,
-            on_warning=warnings.append,
-        )
-
+        collected, config, resolved_env = _collect(workflow_path, environment_name, warnings)
         run_manifest = compile_run_manifest(
             config,
             workflow_path=workflow_path,
@@ -203,6 +218,107 @@ def _build_impl(
         final_dir=final_dir,
         reused=reused,
         warnings=publish_warnings + warnings,
+    )
+
+
+@bundle_app.command("push")
+def push_bundle(
+    workflow: BundleWorkflow,
+    to: Annotated[str, typer.Option("--to", help="Destination OCI tag.")],
+    environment: BundleEnvironment = None,
+    auth: BundleAuth = "token",
+) -> None:
+    """Build, verify and publish a workflow's run bundle to an OCI tag."""
+    from tempfile import TemporaryDirectory
+
+    from conductor.bundle import store
+    from conductor.bundle.importer import import_bundle
+    from conductor.bundle.oci import (
+        OciFormatError,
+        encode_oci_config,
+        parse_oci_config,
+        parse_oci_reference,
+    )
+    from conductor.bundle.oci_receipts import record_receipt
+    from conductor.bundle.oci_remote import OciRemote
+    from conductor.exceptions import ConfigurationError
+    from conductor.plugins.errors import PluginError
+
+    warnings: list[str] = []
+    try:
+        reference = parse_oci_reference(to)
+        if reference.is_digest:
+            raise OciFormatError("OCI push requires a tag")
+        workflow_path, _ = _resolve_workflow(workflow)
+        collected, _, _ = _collect(workflow_path, environment, warnings)
+        if collected.descriptor.incomplete:
+            incomplete = ", ".join(collected.descriptor.incomplete)
+            raise OciFormatError(f"Cannot push an incomplete bundle: {incomplete}")
+        config = parse_oci_config(encode_oci_config(collected.manifest))
+        with TemporaryDirectory() as directory:
+            # Use the ordinary writer in private staging, never a parse-only CAS hit.
+            artifact = Path(directory) / "artifact"
+            entries = {entry.logical_path: entry for entry in config.manifest.entries}
+            store._stage_and_publish(
+                artifact,
+                config.manifest,
+                lambda root: store._stage_tree(root, collected.files, collected.links, entries),
+            )
+            layer = artifact / "bundle.tar.gz"
+            import_bundle(layer, config)
+            digest = OciRemote(reference, auth).push(config.manifest, layer)
+        receipt = record_receipt(reference, digest, config)
+    except (OciFormatError, ConfigurationError, PluginError, OSError) as exc:
+        _fail(exc, copyable=True)
+    for warning in warnings:
+        console.print(styled("[yellow]Warning:[/yellow] {}", warning))
+    _print_oci_result(receipt)
+
+
+@bundle_app.command("pull")
+def pull_bundle(
+    ref: Annotated[str, typer.Argument(help="OCI tag or immutable digest reference.")],
+    offline: Annotated[
+        bool, typer.Option("--offline", help="Verify a local receipt only.")
+    ] = False,
+    auth: BundleAuth = "token",
+) -> None:
+    """Verify and import an OCI run bundle, or check a previously verified local copy."""
+    from conductor.bundle.errors import BundleError
+    from conductor.bundle.oci import OciFormatError, parse_oci_reference
+    from conductor.bundle.oci_receipts import resolve_receipt
+
+    store_path: Path | None = None
+    try:
+        reference = parse_oci_reference(ref)
+        if offline:
+            receipt = resolve_receipt(reference)
+        else:
+            from conductor.bundle.importer import import_bundle
+            from conductor.bundle.oci_receipts import record_receipt
+            from conductor.bundle.oci_remote import OciRemote
+
+            with OciRemote(reference, auth).pull() as pulled:
+                store_path = import_bundle(pulled.layer_path, pulled.config)
+            receipt = record_receipt(reference, pulled.manifest_digest, pulled.config)
+    except (BundleError, OciFormatError, OSError) as exc:
+        _fail(exc, copyable=True)
+    _print_oci_result(receipt)
+    if store_path is not None:
+        output_console.print(styled("[bold]Store:[/bold] {}", store_path), soft_wrap=True)
+
+
+def _print_oci_result(receipt: OciReceipt) -> None:
+    """Print the immutable OCI reference and the verified local identity."""
+    output_console.print(
+        styled(
+            "[bold]OCI manifest:[/bold] {}\n[bold]Bundle digest:[/bold] {}\n"
+            "[bold]Entrypoint:[/bold] {}",
+            receipt.ref,
+            receipt.bundle_digest,
+            receipt.entrypoint,
+        ),
+        soft_wrap=True,
     )
 
 
